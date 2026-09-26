@@ -143,7 +143,7 @@ export function Score({
       <strong>{label(band)}</strong>
       <span>{lowerBound.toFixed(1)} conservative lower bound</span>
       {uncertainty !== undefined && uncertainty !== null ? (
-        <small>± {uncertainty.toFixed(1)} uncertainty</small>
+        <small>{Math.round(uncertainty * 100)}% policy uncertainty</small>
       ) : null}
     </div>
   );

@@ -77,7 +77,11 @@ function bandFor(lowerBound: number, coverage: number): ConsiderationResult['ban
 export function calculateConsiderationV1(inputs: DimensionInput[]): ConsiderationResult {
   const byKey = new Map(inputs.map((input) => [input.key, input]));
   const orderedKeys = Object.keys(considerationPolicyV1.dimensions) as DimensionKey[];
-  if (byKey.size !== orderedKeys.length || orderedKeys.some((key) => !byKey.has(key))) {
+  if (
+    inputs.length !== orderedKeys.length ||
+    byKey.size !== orderedKeys.length ||
+    orderedKeys.some((key) => !byKey.has(key))
+  ) {
     throw new Error('Every v1 dimension must be provided exactly once.');
   }
 
@@ -87,13 +91,25 @@ export function calculateConsiderationV1(inputs: DimensionInput[]): Consideratio
     assertBounded(input.coverage, 0, 1, `${key}.coverage`);
     if (input.raw !== null) assertBounded(input.raw, 0, 100, `${key}.raw`);
     if (input.applicability === 'not_applicable') {
-      if (input.state !== 'not_applicable') {
-        throw new Error(`${key} must preserve an explicit not_applicable state.`);
+      if (input.state !== 'not_applicable' || input.raw !== null) {
+        throw new Error(`${key} must preserve an explicit not_applicable state without a value.`);
       }
       return { ...input, weight: 0, prior: 0, adjusted: null };
     }
+    if (input.state === 'not_applicable') {
+      throw new Error(`${key} cannot be not_applicable when the dimension is applicable.`);
+    }
     if (input.raw === null && input.confidence !== 0) {
       throw new Error(`${key} cannot have confidence without a defensible raw value.`);
+    }
+    if (input.state === 'missing' && (input.raw !== null || input.confidence !== 0)) {
+      throw new Error(`${key} missing state requires a null raw value and zero confidence.`);
+    }
+    if (input.state === 'zero' && input.raw !== 0) {
+      throw new Error(`${key} zero state requires a raw value of zero.`);
+    }
+    if (['present', 'stale', 'contradicted'].includes(input.state) && input.raw === null) {
+      throw new Error(`${key} ${input.state} state requires a defensible raw value.`);
     }
     const policy = considerationPolicyV1.dimensions[key];
     const prior =

@@ -29,6 +29,29 @@ function parseIdentity(identity: string): { owner: string; repository: string } 
   return { owner: match[1]!, repository: match[2]! };
 }
 
+async function readBoundedBody(response: Response, maximumBytes: number): Promise<string | null> {
+  if (!response.body) {
+    const body = await response.text();
+    return Buffer.byteLength(body, 'utf8') <= maximumBytes ? body : null;
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const parts: string[] = [];
+  let bytes = 0;
+  while (true) {
+    const chunk = await reader.read();
+    if (chunk.done) break;
+    bytes += chunk.value.byteLength;
+    if (bytes > maximumBytes) {
+      await reader.cancel().catch(() => undefined);
+      return null;
+    }
+    parts.push(decoder.decode(chunk.value, { stream: true }));
+  }
+  parts.push(decoder.decode());
+  return parts.join('');
+}
+
 export function createGitHubMetadataAdapter(
   options: GitHubMetadataAdapterOptions = {},
 ): GitHubMetadataAdapter {
@@ -83,10 +106,8 @@ export function createGitHubMetadataAdapter(
         }
         const declaredLength = Number(response.headers.get('content-length') ?? '0');
         if (declaredLength > maximumBytes) return { kind: 'terminal_failure', code: 'too_large' };
-        const body = await response.text();
-        if (Buffer.byteLength(body, 'utf8') > maximumBytes) {
-          return { kind: 'terminal_failure', code: 'too_large' };
-        }
+        const body = await readBoundedBody(response, maximumBytes);
+        if (body === null) return { kind: 'terminal_failure', code: 'too_large' };
         let raw: unknown;
         try {
           raw = JSON.parse(body);

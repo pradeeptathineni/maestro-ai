@@ -2,7 +2,7 @@
 
 import { cleanup, render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it } from 'vitest';
-import { StateBadge } from './ui.js';
+import { Score, StateBadge } from './ui.js';
 
 afterEach(cleanup);
 
@@ -18,5 +18,12 @@ describe('evidence-state presentation', () => {
     for (const name of ['Missing', 'Zero', 'Not Applicable', 'Stale', 'Contradicted']) {
       expect(screen.getByText(name)).toBeDefined();
     }
+  });
+});
+
+describe('score presentation', () => {
+  it('renders fractional uncertainty as a percentage', () => {
+    render(<Score band="Mixed / investigate" lowerBound={49.25} uncertainty={0.415} />);
+    expect(screen.getByText('42% policy uncertainty')).toBeDefined();
   });
 });

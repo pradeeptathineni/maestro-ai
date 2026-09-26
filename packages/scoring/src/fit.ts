@@ -58,8 +58,20 @@ export function calculateProjectFitV1(inputs: PreferenceInput[]): ProjectFitResu
     bounded(input.weight, 0, 1, `${input.key}.weight`);
     bounded(input.confidence, 0, 1, `${input.key}.confidence`);
     if (input.raw !== null) bounded(input.raw, 0, 100, `${input.key}.raw`);
+    if (input.state === 'not_applicable' && input.raw !== null) {
+      throw new Error(`${input.key} not_applicable state cannot carry a raw value.`);
+    }
     if (input.raw === null && input.confidence !== 0) {
       throw new Error(`${input.key} cannot have confidence without a raw value.`);
+    }
+    if (input.state === 'missing' && (input.raw !== null || input.confidence !== 0)) {
+      throw new Error(`${input.key} missing state requires a null raw value and zero confidence.`);
+    }
+    if (input.state === 'zero' && input.raw !== 0) {
+      throw new Error(`${input.key} zero state requires a raw value of zero.`);
+    }
+    if (['present', 'stale', 'contradicted'].includes(input.state) && input.raw === null) {
+      throw new Error(`${input.key} ${input.state} state requires a raw value.`);
     }
   }
   const applicable = inputs.filter((input) => input.state !== 'not_applicable');

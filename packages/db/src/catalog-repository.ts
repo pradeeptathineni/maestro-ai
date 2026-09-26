@@ -1,5 +1,10 @@
 import type { Pool } from 'pg';
-import { calculateConsiderationV1, type DimensionInput } from '../../scoring/src/index.js';
+import { hashCanonical } from '../../domain/src/index.js';
+import {
+  calculateConsiderationV1,
+  considerationPolicyV1,
+  type DimensionInput,
+} from '../../scoring/src/index.js';
 
 export type CatalogSort = 'consideration' | 'evidence' | 'freshness' | 'verification' | 'name';
 
@@ -360,16 +365,29 @@ export async function replayStoredScores(pool: Pool): Promise<{
 }> {
   const runs = await pool.query<{
     id: string;
+    providerId: string;
+    versionId: string | null;
+    inputHash: string;
+    policyVersion: string;
+    policyDocument: { consideration?: unknown };
+    codeRevision: string;
     central: number;
     uncertainty: number;
     evidenceCoverage: number;
     lowerBound: number;
     band: string;
+    evidenceIds: string[];
   }>(`
-    SELECT id, central::float8, uncertainty::float8,
-           evidence_coverage::float8 AS "evidenceCoverage",
-           lower_bound::float8 AS "lowerBound", band
-    FROM catalog.score_runs ORDER BY id
+    SELECT sr.id, sr.provider_id AS "providerId", sr.provider_version_id AS "versionId",
+           sr.input_hash AS "inputHash", sp.version AS "policyVersion",
+           sp.policy_document AS "policyDocument", sp.code_revision AS "codeRevision",
+           sr.central::float8, sr.uncertainty::float8,
+           sr.evidence_coverage::float8 AS "evidenceCoverage",
+           sr.lower_bound::float8 AS "lowerBound", sr.band,
+           sr.evidence_ids AS "evidenceIds"
+    FROM catalog.score_runs sr
+    JOIN catalog.score_policies sp ON sp.id = sr.policy_id
+    ORDER BY sr.id
   `);
   const mismatches: Array<{ scoreRunId: string; reason: string }> = [];
   for (const run of runs.rows) {
@@ -379,35 +397,96 @@ export async function replayStoredScores(pool: Pool): Promise<{
       confidence: number;
       coverage: number;
       prior: number;
+      adjusted: number | null;
       state: DimensionInput['state'];
       reasons: string[];
       missing: string[];
       evidenceIds: string[];
     }>(
       `SELECT dimension_key AS key, raw::float8, confidence::float8, coverage::float8,
-              prior::float8, state, reasons, missing, evidence_ids AS "evidenceIds"
-       FROM catalog.dimension_scores WHERE score_run_id = $1 ORDER BY dimension_key`,
+              prior::float8, adjusted::float8, state, reasons, missing,
+              evidence_ids AS "evidenceIds"
+       FROM catalog.dimension_scores WHERE score_run_id = $1`,
       [run.id],
     );
-    const inputs: DimensionInput[] = dimensions.rows.map((dimension) => ({
-      key: dimension.key,
-      raw: dimension.raw,
-      confidence: dimension.confidence,
-      coverage: dimension.coverage,
-      applicability: dimension.state === 'not_applicable' ? 'not_applicable' : 'applicable',
-      highPrivilege: dimension.key === 'security_provenance' && dimension.prior === 25,
-      state: dimension.state,
-      reasons: dimension.reasons,
-      missing: dimension.missing,
-      evidenceIds: dimension.evidenceIds,
-    }));
-    const replay = calculateConsiderationV1(inputs);
+    if (
+      run.policyVersion !== considerationPolicyV1.version ||
+      !run.policyDocument?.consideration ||
+      hashCanonical(run.policyDocument.consideration) !== hashCanonical(considerationPolicyV1)
+    ) {
+      mismatches.push({ scoreRunId: run.id, reason: 'Unsupported or changed score policy.' });
+      continue;
+    }
+    const dimensionByKey = new Map(dimensions.rows.map((dimension) => [dimension.key, dimension]));
+    const orderedKeys = Object.keys(considerationPolicyV1.dimensions) as DimensionInput['key'][];
+    const missingKeys = orderedKeys.filter((key) => !dimensionByKey.has(key));
+    if (missingKeys.length || dimensions.rows.length !== orderedKeys.length) {
+      mismatches.push({
+        scoreRunId: run.id,
+        reason: 'Stored score does not contain every policy dimension exactly once.',
+      });
+      continue;
+    }
+    const inputs: DimensionInput[] = orderedKeys.map((key) => {
+      const dimension = dimensionByKey.get(key)!;
+      return {
+        key: dimension.key,
+        raw: dimension.raw,
+        confidence: dimension.confidence,
+        coverage: dimension.coverage,
+        applicability: dimension.state === 'not_applicable' ? 'not_applicable' : 'applicable',
+        ...(dimension.key === 'security_provenance' && dimension.prior === 25
+          ? { highPrivilege: true }
+          : {}),
+        state: dimension.state,
+        reasons: dimension.reasons,
+        missing: dimension.missing,
+        evidenceIds: dimension.evidenceIds,
+      };
+    });
+    const hashInput = (candidateInputs: DimensionInput[]): string =>
+      hashCanonical({
+        providerId: run.providerId,
+        versionId: run.versionId,
+        policy: considerationPolicyV1,
+        dimensions: candidateInputs,
+      });
+    let inputHashMatches = hashInput(inputs) === run.inputHash;
+    if (!inputHashMatches && run.codeRevision === 'prompt-02-v0') {
+      // Prompt 02 persisted evidence identifiers as sets but hashed their insertion order.
+      // The shipped seed has at most two per dimension, so accept the only alternate
+      // representation while all future imports hash a sorted representation.
+      inputHashMatches =
+        hashInput(
+          inputs.map((input) => ({ ...input, evidenceIds: [...input.evidenceIds].reverse() })),
+        ) === run.inputHash;
+    }
+    if (!inputHashMatches) {
+      mismatches.push({ scoreRunId: run.id, reason: 'Stored input hash cannot be reproduced.' });
+      continue;
+    }
+    let replay: ReturnType<typeof calculateConsiderationV1>;
+    try {
+      replay = calculateConsiderationV1(inputs);
+    } catch {
+      mismatches.push({
+        scoreRunId: run.id,
+        reason: 'Stored score inputs fail policy validation.',
+      });
+      continue;
+    }
+    const dimensionMismatch = replay.dimensions.some((dimension) => {
+      const stored = dimensionByKey.get(dimension.key)!;
+      return dimension.adjusted !== stored.adjusted || dimension.prior !== stored.prior;
+    });
     if (
       replay.central !== run.central ||
       replay.uncertainty !== run.uncertainty ||
       replay.evidenceCoverage !== run.evidenceCoverage ||
       replay.lowerBound !== run.lowerBound ||
-      replay.band !== run.band
+      replay.band !== run.band ||
+      JSON.stringify(replay.inputEvidenceIds) !== JSON.stringify(run.evidenceIds) ||
+      dimensionMismatch
     ) {
       mismatches.push({ scoreRunId: run.id, reason: 'Stored result differs from policy replay.' });
     }

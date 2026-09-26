@@ -46,7 +46,7 @@ async function appendEvent(
 async function existingReceipt(
   client: PoolClient | Pool,
   workspaceId: string,
-  where: 'normalized_url' | 'idempotency_key',
+  where: 'normalized_url' | 'idempotency_key' | 'strong_identity',
   value: string,
 ): Promise<IntakeReceipt | null> {
   const result = await client.query<{
@@ -69,7 +69,11 @@ async function existingReceipt(
             source.resolved_provider_id AS "resolvedProviderId"
      FROM ops.intakes i
      LEFT JOIN ops.intake_sources source ON source.intake_id = i.id
-     WHERE i.workspace_id = $1 AND i.${where} = $2`,
+     WHERE i.workspace_id = $1 AND ${
+       where === 'strong_identity'
+         ? "i.strong_identity_scheme || ':' || i.strong_identity_value"
+         : `i.${where}`
+     } = $2`,
     [workspaceId, value],
   );
   const row = result.rows[0];
@@ -130,30 +134,42 @@ export async function createIntake(
       else throw error;
     }
 
-    if (normalized) {
-      const duplicate = await existingReceipt(
+    const originalUrl = input.url.trim();
+    const normalizedUrl =
+      normalized?.normalizedUrl ?? `rejected:${hashCanonical({ originalUrl }).slice(0, 48)}`;
+    const duplicate = await existingReceipt(client, workspaceId, 'normalized_url', normalizedUrl);
+    if (duplicate) {
+      await appendEvent(
+        client,
+        duplicate.id,
+        'duplicate',
+        'Exact normalized URL match.',
+        correlationId,
+      );
+      await client.query('COMMIT');
+      return { ...duplicate, duplicateReason: 'normalized_url' };
+    }
+    if (normalized?.strongIdentity) {
+      const duplicateIdentity = await existingReceipt(
         client,
         workspaceId,
-        'normalized_url',
-        normalized.normalizedUrl,
+        'strong_identity',
+        `${normalized.strongIdentity.scheme}:${normalized.strongIdentity.value}`,
       );
-      if (duplicate) {
+      if (duplicateIdentity) {
         await appendEvent(
           client,
-          duplicate.id,
+          duplicateIdentity.id,
           'duplicate',
-          'Exact normalized URL match.',
+          'Strong identity matches an existing intake.',
           correlationId,
         );
         await client.query('COMMIT');
-        return { ...duplicate, duplicateReason: 'normalized_url' };
+        return { ...duplicateIdentity, duplicateReason: 'strong_identity' };
       }
     }
 
     const intakeId = newOpaqueId();
-    const originalUrl = input.url.trim();
-    const normalizedUrl =
-      normalized?.normalizedUrl ?? `rejected:${hashCanonical({ originalUrl }).slice(0, 48)}`;
     const hostname = normalized?.hostname ?? '';
     let duplicateProviderId: string | undefined;
     if (normalized?.strongIdentity) {
@@ -260,14 +276,39 @@ export async function createIntake(
     };
   } catch (error) {
     await client.query('ROLLBACK').catch(() => undefined);
-    if ((error as { code?: string }).code === '23505' && normalizedUrlFromInput(input.url)) {
+    if ((error as { code?: string }).code === '23505') {
+      if (input.idempotencyKey) {
+        const idempotent = await existingReceipt(
+          pool,
+          workspaceId,
+          'idempotency_key',
+          input.idempotencyKey,
+        );
+        if (idempotent) return { ...idempotent, duplicateReason: 'idempotency_key' };
+      }
       const duplicate = await existingReceipt(
         pool,
         workspaceId,
         'normalized_url',
-        normalizedUrlFromInput(input.url)!,
+        intakeStorageKey(input.url),
       );
       if (duplicate) return duplicate;
+      try {
+        const identity = normalizeConsiderUrl(input.url).strongIdentity;
+        if (identity) {
+          const duplicateIdentity = await existingReceipt(
+            pool,
+            workspaceId,
+            'strong_identity',
+            `${identity.scheme}:${identity.value}`,
+          );
+          if (duplicateIdentity) {
+            return { ...duplicateIdentity, duplicateReason: 'strong_identity' };
+          }
+        }
+      } catch {
+        // Invalid URLs have already been checked through their rejected storage key.
+      }
     }
     throw error;
   } finally {
@@ -275,11 +316,12 @@ export async function createIntake(
   }
 }
 
-function normalizedUrlFromInput(input: string): string | null {
+function intakeStorageKey(input: string): string {
   try {
     return normalizeConsiderUrl(input).normalizedUrl;
   } catch {
-    return null;
+    const originalUrl = input.trim();
+    return `rejected:${hashCanonical({ originalUrl }).slice(0, 48)}`;
   }
 }
 
@@ -342,6 +384,32 @@ export async function processIntakeMetadata(
   intakeId: string,
   adapter: GitHubMetadataAdapter,
   correlationId = newOpaqueId(),
+): Promise<ProcessIntakeResult> {
+  const lockClient = await pool.connect();
+  const operationKey = `intake:${intakeId}:metadata:v1`;
+  const lock = await lockClient.query<{ acquired: boolean }>(
+    'SELECT pg_try_advisory_lock(hashtextextended($1, 0)) AS acquired',
+    [operationKey],
+  );
+  if (!lock.rows[0]!.acquired) {
+    lockClient.release();
+    throw new ConflictError('This intake is already being processed.');
+  }
+  try {
+    return await processIntakeMetadataLocked(pool, intakeId, adapter, correlationId);
+  } finally {
+    await lockClient
+      .query('SELECT pg_advisory_unlock(hashtextextended($1, 0))', [operationKey])
+      .catch(() => undefined);
+    lockClient.release();
+  }
+}
+
+async function processIntakeMetadataLocked(
+  pool: Pool,
+  intakeId: string,
+  adapter: GitHubMetadataAdapter,
+  correlationId: string,
 ): Promise<ProcessIntakeResult> {
   const startClient = await pool.connect();
   let identity: string;
@@ -413,7 +481,12 @@ export async function processIntakeMetadata(
     startClient.release();
   }
 
-  const adapterResult = await adapter.fetch(identity);
+  let adapterResult: MetadataAdapterResult;
+  try {
+    adapterResult = await adapter.fetch(identity);
+  } catch {
+    adapterResult = { kind: 'transient_failure', code: 'upstream' };
+  }
   const finishClient = await pool.connect();
   try {
     await finishClient.query('BEGIN');
@@ -559,14 +632,22 @@ export async function curateIntake(
   try {
     await client.query('BEGIN');
     const [intake, provider] = await Promise.all([
-      client.query('SELECT id FROM ops.intakes WHERE id = $1 AND workspace_id = $2 FOR UPDATE', [
-        intakeId,
-        workspaceId,
-      ]),
+      client.query<{ state: string }>(
+        'SELECT state FROM ops.intakes WHERE id = $1 AND workspace_id = $2 FOR UPDATE',
+        [intakeId, workspaceId],
+      ),
       client.query('SELECT id FROM catalog.providers WHERE id = $1', [providerId]),
     ]);
     if (!intake.rowCount) throw new NotFoundError('Intake not found.');
     if (!provider.rowCount) throw new NotFoundError('Provider not found.');
+    const currentState = intake.rows[0]!.state;
+    if (
+      !['manual_review_required', 'identity_candidates_ready', 'fetch_failed'].includes(
+        currentState,
+      )
+    ) {
+      throw new ConflictError(`Intake in state ${currentState} cannot be curated.`);
+    }
     const state = action === 'merge_duplicate' ? 'merged_duplicate' : 'curated';
     await client.query(
       `UPDATE ops.intakes SET state = $2, revision = revision + 1, updated_at = now(),

@@ -158,6 +158,19 @@ describe('local HTTP boundary and critical flows', () => {
     expect(invalidBody.statusCode).toBe(400);
     expect(invalidBody.json()).toMatchObject({ code: 'request_validation_failed' });
 
+    const missingProvider = await app.inject({
+      method: 'GET',
+      url: `/api/v1/providers/${randomUUID()}`,
+      headers: hostHeaders,
+    });
+    expect(missingProvider.statusCode).toBe(404);
+    expect(missingProvider.json()).toMatchObject({
+      type: 'about:blank',
+      status: 404,
+      code: 'not_found',
+      correlationId: expect.any(String),
+    });
+
     for (const payload of [
       { url: `https://example.com/${'a'.repeat(2049)}`, foundBy: 'integration' },
       { url: 'https://example.com/tool', note: 'n'.repeat(2001), foundBy: 'integration' },
@@ -186,6 +199,17 @@ describe('local HTTP boundary and critical flows', () => {
     expect(first.statusCode).toBe(201);
     expect(first.json()).toMatchObject({ state: 'queued', duplicate: false });
     expect(first.json<{ normalizedUrl: string }>().normalizedUrl).not.toContain('utm_source');
+
+    const providerBeforeFetch = await pool.query<{ id: string }>(
+      'SELECT id FROM catalog.providers LIMIT 1',
+    );
+    const prematureCuration = await app.inject({
+      method: 'POST',
+      url: `/api/v1/intakes/${first.json<{ id: string }>().id}/curate`,
+      headers: mutationHeaders,
+      payload: { providerId: providerBeforeFetch.rows[0]!.id, action: 'attach' },
+    });
+    expect(prematureCuration.statusCode).toBe(409);
 
     const duplicate = await app.inject({
       method: 'POST',
@@ -253,6 +277,18 @@ describe('local HTTP boundary and critical flows', () => {
       retryDisposition: 'terminal',
     });
     expect(blocked.json<{ normalizedUrl: string }>().normalizedUrl).toMatch(/^rejected:[a-f0-9]+$/);
+    const blockedDuplicate = await app.inject({
+      method: 'POST',
+      url: '/api/v1/intakes',
+      headers: mutationHeaders,
+      payload: { url: 'https://127.0.0.1/admin', foundBy: 'integration-repeat' },
+    });
+    expect(blockedDuplicate.statusCode).toBe(201);
+    expect(blockedDuplicate.json()).toMatchObject({
+      id: blocked.json<{ id: string }>().id,
+      duplicate: true,
+      duplicateReason: 'normalized_url',
+    });
 
     const unsupportedScheme = await app.inject({
       method: 'POST',
@@ -305,6 +341,54 @@ describe('local HTTP boundary and critical flows', () => {
       [first.normalizedUrl],
     );
     expect(count.rows[0]!.count).toBe(1);
+  });
+
+  it('collapses a concurrent idempotency-key race even when URLs differ', async () => {
+    const idempotencyKey = `integration-${randomUUID()}`;
+    const [first, second] = await Promise.all([
+      createIntake(
+        pool,
+        localWorkspaceId,
+        {
+          url: `https://github.com/maestro-idempotency-a/${randomUUID()}`,
+          foundBy: 'race-a',
+          idempotencyKey,
+        },
+        randomUUID(),
+      ),
+      createIntake(
+        pool,
+        localWorkspaceId,
+        {
+          url: `https://github.com/maestro-idempotency-b/${randomUUID()}`,
+          foundBy: 'race-b',
+          idempotencyKey,
+        },
+        randomUUID(),
+      ),
+    ]);
+    expect(first.id).toBe(second.id);
+    expect([first.duplicateReason, second.duplicateReason]).toContain('idempotency_key');
+  });
+
+  it('collapses concurrent URL variants that resolve to the same strong identity', async () => {
+    const repository = randomUUID();
+    const [first, second] = await Promise.all([
+      createIntake(
+        pool,
+        localWorkspaceId,
+        { url: `https://github.com/Maestro-Identity/${repository}`, foundBy: 'identity-a' },
+        randomUUID(),
+      ),
+      createIntake(
+        pool,
+        localWorkspaceId,
+        { url: `https://github.com/maestro-identity/${repository}`, foundBy: 'identity-b' },
+        randomUUID(),
+      ),
+    ]);
+    expect(first.id).toBe(second.id);
+    expect([first.duplicateReason, second.duplicateReason]).toContain('strong_identity');
   });
 
   it('records bounded transient and terminal adapter failures and supports deliberate retry', async () => {
@@ -360,6 +444,35 @@ describe('local HTTP boundary and critical flows', () => {
     await expect(
       retryIntake(pool, localWorkspaceId, terminalReceipt.id, randomUUID()),
     ).rejects.toThrow(/Only transient/);
+
+    const throwingReceipt = await createIntake(
+      pool,
+      localWorkspaceId,
+      { url: `https://github.com/maestro-throws/${randomUUID()}`, foundBy: 'integration' },
+      randomUUID(),
+    );
+    const throwingAdapter: GitHubMetadataAdapter = {
+      key: 'github-metadata',
+      version: 'github-metadata-v1',
+      async fetch() {
+        throw new Error('simulated adapter crash');
+      },
+    };
+    await expect(
+      processIntakeMetadata(pool, throwingReceipt.id, throwingAdapter),
+    ).resolves.toMatchObject({
+      state: 'fetch_failed',
+      failureCode: 'upstream',
+      retryDisposition: 'transient',
+    });
+    const throwingAttempts = await pool.query<{ state: string; finishedAt: string | null }>(
+      `SELECT state, finished_at AS "finishedAt" FROM ops.job_attempts
+       WHERE operation_key = $1`,
+      [`intake:${throwingReceipt.id}:metadata:v1`],
+    );
+    expect(throwingAttempts.rows).toEqual([
+      expect.objectContaining({ state: 'transient_failure', finishedAt: expect.any(Date) }),
+    ]);
   });
 
   it('finalizes an interrupted worker attempt before starting its bounded replacement', async () => {
@@ -400,6 +513,52 @@ describe('local HTTP boundary and critical flows', () => {
       { attempt: 1, state: 'transient_failure', errorCode: 'interrupted_before_finalize' },
       { attempt: 2, state: 'succeeded', errorCode: null },
     ]);
+  });
+
+  it('rejects concurrent processing without interrupting the live attempt', async () => {
+    const receipt = await createIntake(
+      pool,
+      localWorkspaceId,
+      { url: `https://github.com/maestro-concurrent/${randomUUID()}`, foundBy: 'integration' },
+      randomUUID(),
+    );
+    let announceEntry!: () => void;
+    let releaseFetch!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      announceEntry = resolve;
+    });
+    const released = new Promise<void>((resolve) => {
+      releaseFetch = resolve;
+    });
+    const adapter: GitHubMetadataAdapter = {
+      key: 'github-metadata',
+      version: 'github-metadata-v1',
+      async fetch() {
+        announceEntry();
+        await released;
+        return {
+          kind: 'success',
+          metadata: { bounded: true },
+          digest: 'c'.repeat(64),
+          retrieval: 'offline_identity',
+        };
+      },
+    };
+    const first = processIntakeMetadata(pool, receipt.id, adapter);
+    await entered;
+    try {
+      await expect(processIntakeMetadata(pool, receipt.id, adapter)).rejects.toThrow(
+        /already being processed/i,
+      );
+    } finally {
+      releaseFetch();
+    }
+    await expect(first).resolves.toMatchObject({ state: 'identity_candidates_ready' });
+    const attempts = await pool.query<{ state: string }>(
+      'SELECT state FROM ops.job_attempts WHERE operation_key = $1 ORDER BY attempt',
+      [`intake:${receipt.id}:metadata:v1`],
+    );
+    expect(attempts.rows).toEqual([{ state: 'succeeded' }]);
   });
 
   it('publishes no install, execution, model-routing, or orchestration route', async () => {

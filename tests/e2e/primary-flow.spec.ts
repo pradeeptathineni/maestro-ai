@@ -88,6 +88,17 @@ test('primary evidence-to-decision path is inspectable and replayable', async ({
   await page.goto(receiptUrl);
   await expect(page.locator('code').filter({ hasText: hash! }).last()).toBeVisible();
   await expectNoSeriousAccessibilityViolations(page);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.locator('.receipt')).toBeVisible();
+  expect(
+    await page.evaluate(() => ({
+      bodyFits: document.body.scrollWidth <= window.innerWidth,
+      receiptFits: (() => {
+        const receipt = document.querySelector<HTMLElement>('.receipt');
+        return Boolean(receipt && receipt.scrollWidth <= receipt.clientWidth);
+      })(),
+    })),
+  ).toEqual({ bodyFits: true, receiptFits: true });
 });
 
 test('catalog browse explains ranking and provenance', async ({ page }) => {

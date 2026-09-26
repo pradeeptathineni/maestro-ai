@@ -1,11 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Pool } from 'pg';
+import type { GitHubMetadataAdapter } from '../../../packages/adapters/src/index.js';
 import type { JobQueue } from '../../../packages/domain/src/index.js';
-import { createIntake, createPool } from '../../../packages/db/src/index.js';
+import { createIntake, createPool, getIntake } from '../../../packages/db/src/index.js';
 import { localWorkspaceId } from '../../../packages/seed/src/import.js';
 import { testDatabaseUrl } from '../../../packages/test-fixtures/src/database.js';
 import { dispatchOutbox } from './outbox.js';
+import { createTaskList } from './tasks.js';
 
 describe('transactional outbox seam', () => {
   let pool: Pool;
@@ -71,6 +73,33 @@ describe('transactional outbox seam', () => {
       state: 'failed',
       attempts: 3,
       lastErrorCode: 'queue_unavailable',
+    });
+  });
+
+  it('leaves expected transient metadata retry under deliberate intake control', async () => {
+    const receipt = await createIntake(
+      pool,
+      localWorkspaceId,
+      { url: `https://github.com/maestro-task/${randomUUID()}`, foundBy: 'integration' },
+      randomUUID(),
+    );
+    const adapter: GitHubMetadataAdapter = {
+      key: 'github-metadata',
+      version: 'github-metadata-v1',
+      async fetch() {
+        return { kind: 'transient_failure', code: 'timeout' };
+      },
+    };
+    const task = createTaskList(pool, adapter).consider_url_metadata_v1;
+    if (typeof task !== 'function') throw new Error('Expected a task function.');
+    await expect(
+      task({ intakeId: receipt.id, workspaceId: localWorkspaceId }, {
+        job: { id: randomUUID() },
+      } as never),
+    ).resolves.toBeUndefined();
+    expect(await getIntake(pool, localWorkspaceId, receipt.id)).toMatchObject({
+      state: 'fetch_failed',
+      retryDisposition: 'transient',
     });
   });
 });

@@ -44,7 +44,11 @@ export function calculateVerificationPriorityV1(
 ): VerificationPriorityResult {
   const byKey = new Map(factors.map((factor) => [factor.key, factor]));
   const orderedKeys = Object.keys(verificationPolicyV1.factors) as VerificationFactorKey[];
-  if (byKey.size !== orderedKeys.length || orderedKeys.some((key) => !byKey.has(key))) {
+  if (
+    factors.length !== orderedKeys.length ||
+    byKey.size !== orderedKeys.length ||
+    orderedKeys.some((key) => !byKey.has(key))
+  ) {
     throw new Error('Every v1 verification factor must be provided exactly once.');
   }
   const detailed = orderedKeys.map((key) => {

@@ -135,18 +135,22 @@ export function ProviderPage() {
                     <h3>{label(dimension.key)}</h3>
                     <StateBadge state={dimension.state} />
                   </div>
-                  <strong>{dimension.adjusted.toFixed(1)}</strong>
+                  <strong>
+                    {dimension.adjusted === null ? 'Not applicable' : dimension.adjusted.toFixed(1)}
+                  </strong>
                 </div>
-                <div
-                  className="meter"
-                  role="progressbar"
-                  aria-label={label(dimension.key)}
-                  aria-valuemin={0}
-                  aria-valuemax={100}
-                  aria-valuenow={dimension.adjusted}
-                >
-                  <span style={{ width: `${dimension.adjusted}%` }} />
-                </div>
+                {dimension.adjusted === null ? null : (
+                  <div
+                    className="meter"
+                    role="progressbar"
+                    aria-label={label(dimension.key)}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={dimension.adjusted}
+                  >
+                    <span style={{ width: `${dimension.adjusted}%` }} />
+                  </div>
+                )}
                 <p>{dimension.reasons.join(' ')}</p>
                 {dimension.missing.length ? (
                   <p className="missing-text">

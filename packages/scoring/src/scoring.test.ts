@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { canonicalJson } from '../../domain/src/index.js';
 import { dimensionFixture, verificationFixture } from '../../test-fixtures/src/scoring.js';
 import { calculateConsiderationV1 } from './consideration.js';
+import { calculateProjectFitV1 } from './fit.js';
 import { calculateVerificationPriorityV1 } from './verification.js';
 
 describe('consideration-v1', () => {
@@ -77,6 +78,39 @@ describe('consideration-v1', () => {
       ),
     );
   });
+
+  it('rejects duplicate dimensions and incoherent state/value pairs', () => {
+    expect(() => calculateConsiderationV1([...dimensionFixture(), dimensionFixture()[0]!])).toThrow(
+      /exactly once/,
+    );
+    expect(() =>
+      calculateConsiderationV1(
+        dimensionFixture({ maturity: { state: 'missing', raw: 80, confidence: 0 } }),
+      ),
+    ).toThrow(/missing state/);
+    expect(() =>
+      calculateConsiderationV1(dimensionFixture({ maturity: { state: 'zero', raw: 10 } })),
+    ).toThrow(/zero state/);
+  });
+});
+
+describe('project-fit-v1', () => {
+  it('rejects incoherent state/value pairs', () => {
+    expect(() =>
+      calculateProjectFitV1([
+        {
+          key: 'security',
+          label: 'Security',
+          weight: 1,
+          raw: 80,
+          confidence: 0,
+          state: 'missing',
+          reasons: [],
+          evidenceIds: [],
+        },
+      ]),
+    ).toThrow(/missing state/);
+  });
 });
 
 describe('verification-priority-v1', () => {
@@ -100,5 +134,11 @@ describe('verification-priority-v1', () => {
         highPrivilegeWithUnknownSecurity: true,
       }).priority,
     ).toBe(80);
+  });
+
+  it('rejects duplicate factors even when every required key is represented', () => {
+    expect(() =>
+      calculateVerificationPriorityV1([...verificationFixture(), verificationFixture()[0]!]),
+    ).toThrow(/exactly once/);
   });
 });

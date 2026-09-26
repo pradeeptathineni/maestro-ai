@@ -304,7 +304,9 @@ async function importProvider(
   const dimensions = provider.scoreDimensions.map((dimension) => ({
     ...dimension,
     evidenceIds:
-      dimension.state === 'missing' || dimension.state === 'not_applicable' ? [] : [...evidenceIds],
+      dimension.state === 'missing' || dimension.state === 'not_applicable'
+        ? []
+        : [...evidenceIds].sort(),
   }));
   const consideration = calculateConsiderationV1(dimensions);
   const scoreInputHash = hashCanonical({

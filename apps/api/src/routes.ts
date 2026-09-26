@@ -32,6 +32,7 @@ import {
   listProjects,
   listProviders,
   listVerificationQueue,
+  NotFoundError,
   recordDecision,
   replayStoredScores,
   retryIntake,
@@ -76,7 +77,7 @@ export function registerRoutes(app: FastifyInstance, pool: Pool): void {
     `);
     const state = result.rows[0]!;
     const ready =
-      state.migrations >= 6 &&
+      state.migrations >= 8 &&
       state.providers === 12 &&
       state.workerSchemaReady &&
       state.workerActive;
@@ -98,9 +99,10 @@ export function registerRoutes(app: FastifyInstance, pool: Pool): void {
   routes.get<{ Params: IdParams }>(
     '/api/v1/providers/:id',
     { schema: { tags: ['catalog'], params: IdParamsSchema } },
-    async (request, reply) => {
+    async (request) => {
       const provider = await getProviderDetail(pool, request.params.id);
-      return provider ?? reply.code(404).send({ code: 'provider_not_found' });
+      if (!provider) throw new NotFoundError('Provider not found.');
+      return provider;
     },
   );
 
@@ -144,9 +146,10 @@ export function registerRoutes(app: FastifyInstance, pool: Pool): void {
   routes.get<{ Params: NeedParams }>(
     '/api/v1/needs/:id',
     { schema: { tags: ['decisions'], params: IdParamsSchema } },
-    async (request, reply) => {
+    async (request) => {
       const need = await getNeedComparison(pool, localWorkspaceId, request.params.id);
-      return need ?? reply.code(404).send({ code: 'need_not_found' });
+      if (!need) throw new NotFoundError('Need not found.');
+      return need;
     },
   );
 
@@ -171,9 +174,10 @@ export function registerRoutes(app: FastifyInstance, pool: Pool): void {
   routes.get<{ Params: IdParams }>(
     '/api/v1/decisions/:id',
     { schema: { tags: ['decisions'], params: IdParamsSchema } },
-    async (request, reply) => {
+    async (request) => {
       const decision = await getDecision(pool, localWorkspaceId, request.params.id);
-      return decision ?? reply.code(404).send({ code: 'decision_not_found' });
+      if (!decision) throw new NotFoundError('Decision not found.');
+      return decision;
     },
   );
 
@@ -195,9 +199,10 @@ export function registerRoutes(app: FastifyInstance, pool: Pool): void {
   routes.get<{ Params: IdParams }>(
     '/api/v1/intakes/:id',
     { schema: { tags: ['intake'], params: IdParamsSchema } },
-    async (request, reply) => {
+    async (request) => {
       const intake = await getIntake(pool, localWorkspaceId, request.params.id);
-      return intake ?? reply.code(404).send({ code: 'intake_not_found' });
+      if (!intake) throw new NotFoundError('Intake not found.');
+      return intake;
     },
   );
 

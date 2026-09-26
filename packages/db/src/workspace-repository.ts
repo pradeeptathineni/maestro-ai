@@ -10,6 +10,8 @@ import {
   evaluateHardGates,
   hashCanonical,
   newOpaqueId,
+  replayDecisionReceipt,
+  type DecisionReceipt,
   type GateResult,
 } from '../../domain/src/index.js';
 import { calculateProjectFitV1, type PreferenceInput } from '../../scoring/src/index.js';
@@ -391,10 +393,10 @@ async function assessCandidate(
         return {
           constraintId: constraint.id,
           label: constraint.label,
-          state: 'pass' as const,
+          state: 'unknown' as const,
           unknownHandling: constraint.unknownHandling,
           evidenceIds: [],
-          explanation: `${optionKind} introduces no catalog-provider effect for this gate.`,
+          explanation: `No reviewed evidence establishes how this ${optionKind} option satisfies the gate.`,
         };
       }
       const fact = compatibilityByKey.get(compatibilityMap[constraint.key] ?? constraint.key);
@@ -731,5 +733,11 @@ export async function getDecision(
      WHERE d.id = $1 AND d.workspace_id = $2`,
     [decisionId, workspaceId],
   );
-  return result.rows[0] ?? null;
+  const row = result.rows[0];
+  if (!row) return null;
+  const receipt = row.receipt as DecisionReceipt;
+  return {
+    ...row,
+    receiptVerified: replayDecisionReceipt(receipt) && row.inputHash === receipt.inputHash,
+  };
 }

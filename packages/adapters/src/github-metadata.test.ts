@@ -50,6 +50,19 @@ describe('allowlisted GitHub metadata adapter', () => {
       code: 'too_large',
     });
 
+    const streamedTooLarge = createGitHubMetadataAdapter({
+      allowNetwork: true,
+      maximumBytes: 5,
+      fetchImpl: async () =>
+        new Response('{"larger":true}', {
+          headers: { 'content-type': 'application/json' },
+        }),
+    });
+    await expect(streamedTooLarge.fetch('owner/repository')).resolves.toEqual({
+      kind: 'terminal_failure',
+      code: 'too_large',
+    });
+
     const wrongType = createGitHubMetadataAdapter({
       allowNetwork: true,
       fetchImpl: async () => new Response('<html>', { headers: { 'content-type': 'text/html' } }),

@@ -33,9 +33,21 @@ export function DecisionPage() {
         eyebrow={`${item.projectName} · ${formatDate(item.decidedAt)}`}
         title={`${label(item.outcome)}: ${item.needTitle}`}
         description="This receipt is an immutable historical input snapshot. Recomputing current scores does not rewrite it."
-        action={<Badge tone="positive">Receipt verified by hash</Badge>}
+        action={
+          item.receiptVerified ? (
+            <Badge tone="positive">Receipt verified by hash</Badge>
+          ) : (
+            <Badge tone="negative">Receipt hash mismatch</Badge>
+          )
+        }
       />
       <section className="panel receipt" aria-labelledby="receipt-heading">
+        {!item.receiptVerified ? (
+          <div className="state-panel error" role="alert">
+            <strong>Historical receipt integrity check failed.</strong>
+            <p>Do not rely on this decision until its stored receipt is recovered.</p>
+          </div>
+        ) : null}
         <div className="receipt-seal" aria-hidden="true">
           M
         </div>

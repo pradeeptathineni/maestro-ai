@@ -35,7 +35,8 @@ The default configuration is already safe and local. Copy `.env.example` to `.en
 need to change a documented port. `MAESTRO_ALLOW_NETWORK_FETCH` defaults to `false`; in that mode,
 the allowlisted GitHub adapter derives identity metadata without making a network request. Unknown
 public hosts enter the supported manual-review path. Local, private, credential-bearing, non-HTTPS,
-and nonstandard-port URLs are rejected and retained as safe failure receipts.
+and nonstandard-port URLs are rejected and retained as safe failure receipts. Both the API bind and
+configured browser origin must remain loopback-only in v0.
 
 ## Primary demonstration
 
@@ -45,7 +46,7 @@ and nonstandard-port URLs are rejected and retained as safe failure receipts.
 4. Open Context Mode and trace the 96% claim to its publisher source, scope, and limitations.
 5. Open **Evidence** to inspect its bounded verification plan.
 6. In **Consider**, submit a new GitHub repository URL twice, then submit an unknown public host.
-7. Record a `trial` or `no decision` outcome and reopen its immutable receipt.
+7. Record a `trial` or `no decision` outcome and reopen its immutable, hash-verified receipt.
 8. Replay current score runs with `POST /api/v1/score-runs/replay`; the historical receipt remains
    unchanged.
 

@@ -12,11 +12,11 @@ export interface Domain {
 export interface Dimension {
   key: string;
   raw: number | null;
-  adjusted: number;
+  adjusted: number | null;
   confidence: number;
   coverage: number;
   prior: number;
-  state: 'present' | 'missing' | 'not_applicable' | 'contradicted' | 'stale';
+  state: 'present' | 'missing' | 'zero' | 'not_applicable' | 'contradicted' | 'stale';
   reasons: string[];
   missing: string[];
   evidenceIds: string[];
@@ -223,6 +223,7 @@ export interface DecisionDetail extends DecisionSummary {
   needTitle: string;
   projectName: string;
   selectedCandidateLabel: string | null;
+  receiptVerified: boolean;
   receipt: {
     receiptVersion: string;
     project: {

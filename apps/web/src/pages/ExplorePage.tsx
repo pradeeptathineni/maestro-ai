@@ -168,14 +168,22 @@ export function ExplorePage() {
                       </div>
                       <div>
                         <dt>Freshness support</dt>
-                        <dd>{freshness ? `${Math.round(freshness.adjusted)}/100` : 'Missing'}</dd>
+                        <dd>
+                          {freshness?.adjusted === null
+                            ? 'Not applicable'
+                            : freshness
+                              ? `${Math.round(freshness.adjusted)}/100`
+                              : 'Missing'}
+                        </dd>
                       </div>
                       <div>
                         <dt>Security provenance</dt>
                         <dd>
-                          {security?.state === 'missing' || !security
-                            ? 'Missing'
-                            : `${Math.round(security.adjusted)}/100`}
+                          {security?.adjusted === null
+                            ? 'Not applicable'
+                            : security?.state === 'missing' || !security
+                              ? 'Missing'
+                              : `${Math.round(security.adjusted)}/100`}
                         </dd>
                       </div>
                     </dl>

@@ -26,10 +26,7 @@ export function createTaskList(
   return {
     consider_url_metadata_v1: async (payload, helpers) => {
       if (!isIntakePayload(payload)) throw new Error('invalid_intake_job_payload');
-      const result = await processIntakeMetadata(pool, payload.intakeId, adapter, helpers.job.id);
-      if (result.retryDisposition === 'transient') {
-        throw new Error(`transient_metadata_failure:${result.failureCode}`);
-      }
+      await processIntakeMetadata(pool, payload.intakeId, adapter, helpers.job.id);
     },
   };
 }

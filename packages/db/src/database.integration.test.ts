@@ -46,6 +46,8 @@ describe('reviewed PostgreSQL contract', () => {
       '0004_worker_readiness.sql',
       '0005_finalize_job_attempts.sql',
       '0006_guard_job_attempt_finalization.sql',
+      '0007_independent_review_hardening.sql',
+      '0008_strong_identity_intake_deduplication.sql',
     ]);
     expect(migrations.rows.every((row) => /^[a-f0-9]{64}$/.test(row.sha256))).toBe(true);
   });
@@ -68,6 +70,55 @@ describe('reviewed PostgreSQL contract', () => {
 
   it('replays every stored score without a mismatch', async () => {
     expect(await replayStoredScores(pool)).toEqual({ checked: 12, mismatches: [] });
+  });
+
+  it('detects a stored score whose input hash cannot be reproduced', async () => {
+    const client = await pool.connect();
+    const scoreRunId = randomUUID();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `INSERT INTO catalog.score_runs
+           (id, provider_id, provider_version_id, domain_node_id, policy_id, input_hash,
+            central, uncertainty, evidence_coverage, lower_bound, band, evidence_ids, generated_at)
+         SELECT $1, provider_id, provider_version_id, domain_node_id, policy_id, $2,
+                central, uncertainty, evidence_coverage, lower_bound, band, evidence_ids,
+                generated_at + interval '1 second'
+         FROM catalog.score_runs ORDER BY id LIMIT 1`,
+        [scoreRunId, '0'.repeat(64)],
+      );
+      const dimensions = await client.query<{ id: string }>(
+        'SELECT id FROM catalog.dimension_scores ORDER BY id LIMIT 5',
+      );
+      const sourceRun = await client.query<{ id: string }>(
+        'SELECT id FROM catalog.score_runs WHERE id <> $1 ORDER BY id LIMIT 1',
+        [scoreRunId],
+      );
+      const sourceDimensions = await client.query<{ id: string }>(
+        'SELECT id FROM catalog.dimension_scores WHERE score_run_id = $1 ORDER BY id',
+        [sourceRun.rows[0]!.id],
+      );
+      expect(dimensions.rowCount).toBeGreaterThanOrEqual(5);
+      for (const dimension of sourceDimensions.rows) {
+        await client.query(
+          `INSERT INTO catalog.dimension_scores
+             (id, score_run_id, dimension_key, raw, adjusted, confidence, coverage, prior,
+              state, reasons, missing, evidence_ids)
+           SELECT $1, $2, dimension_key, raw, adjusted, confidence, coverage, prior,
+                  state, reasons, missing, evidence_ids
+           FROM catalog.dimension_scores WHERE id = $3`,
+          [randomUUID(), scoreRunId, dimension.id],
+        );
+      }
+      const replay = await replayStoredScores(client as unknown as Pool);
+      expect(replay.mismatches).toContainEqual({
+        scoreRunId,
+        reason: 'Stored input hash cannot be reproduced.',
+      });
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release();
+    }
   });
 
   it('keeps reviewed SQL and Drizzle table/column declarations aligned', async () => {
@@ -263,11 +314,29 @@ describe('reviewed PostgreSQL contract', () => {
     expect(await getDecision(pool, localWorkspaceId, recorded.id)).toMatchObject({
       id: recorded.id,
       outcome: 'trial',
+      receiptVerified: true,
     });
     await expect(
       pool.query("UPDATE workspace.decisions SET rationale = 'rewritten' WHERE id = $1", [
         recorded.id,
       ]),
+    ).rejects.toMatchObject({ code: '55000' });
+    await expect(
+      pool.query("UPDATE workspace.candidates SET label = 'rewritten' WHERE id = $1", [
+        candidate.rows[0]!.id,
+      ]),
+    ).rejects.toMatchObject({ code: '55000' });
+    await expect(
+      pool.query(
+        `UPDATE workspace.candidate_components
+         SET provider_id = (SELECT id FROM catalog.providers WHERE id <> provider_id LIMIT 1)
+         WHERE candidate_id = (SELECT id FROM workspace.candidates
+                               WHERE need_id = $1 AND option_kind = 'provider' LIMIT 1)`,
+        [referenceNeedId],
+      ),
+    ).rejects.toMatchObject({ code: '55000' });
+    await expect(
+      pool.query("UPDATE catalog.score_policies SET code_revision = 'rewritten'"),
     ).rejects.toMatchObject({ code: '55000' });
     const audit = await pool.query<{ action: string; afterHash: string }>(
       `SELECT action, after_hash AS "afterHash" FROM ops.audit_events
@@ -298,6 +367,17 @@ describe('reviewed PostgreSQL contract', () => {
       optionKind: 'status_quo',
       label: 'Revision-test baseline',
     })) as { id: string };
+    const comparison = (await getNeedComparison(pool, localWorkspaceId, created.id)) as {
+      candidates: Array<{
+        id: string;
+        eligibility: string;
+        gateResults: Array<{ state: string; evidenceIds: string[] }>;
+      }>;
+    };
+    expect(comparison.candidates.find((item) => item.id === candidate.id)).toMatchObject({
+      eligibility: 'unknown_blocked',
+      gateResults: [{ state: 'unknown', evidenceIds: [] }],
+    });
     const policyAudit = await pool.query<{ action: string; afterHash: string }>(
       `SELECT action, after_hash AS "afterHash" FROM ops.audit_events
        WHERE object_id = $1 AND action = 'policy.run'`,
@@ -317,5 +397,81 @@ describe('reviewed PostgreSQL contract', () => {
     await expect(
       pool.query("UPDATE workspace.needs SET title = 'rewritten' WHERE id = $1", [created.id]),
     ).rejects.toMatchObject({ code: '55000' });
+  });
+
+  it('binds provider versions and need contexts to their owning records', async () => {
+    const constraints = await pool.query<{ constraintName: string }>(`
+      SELECT conname AS "constraintName" FROM pg_constraint
+      WHERE conname IN (
+        'component_version_provider_fk',
+        'score_version_provider_fk',
+        'fit_need_context_workspace_fk',
+        'decision_need_context_workspace_fk'
+      ) ORDER BY conname
+    `);
+    expect(constraints.rows.map((row) => row.constraintName)).toEqual([
+      'component_version_provider_fk',
+      'decision_need_context_workspace_fk',
+      'fit_need_context_workspace_fk',
+      'score_version_provider_fk',
+    ]);
+
+    const need = await pool.query<{ snapshotHash: string }>(
+      `SELECT pc.snapshot_hash AS "snapshotHash"
+       FROM workspace.needs n JOIN workspace.project_contexts pc ON pc.id = n.project_context_id
+       WHERE n.id = $1`,
+      [referenceNeedId],
+    );
+    await expect(
+      pool.query(
+        `INSERT INTO workspace.candidates
+           (id, workspace_id, need_id, option_kind, label, context_snapshot_hash, discovery_origin)
+         VALUES ($1, $2, $3, 'status_quo', $4, $5, 'integration')`,
+        [randomUUID(), localWorkspaceId, referenceNeedId, randomUUID(), 'f'.repeat(64)],
+      ),
+    ).rejects.toMatchObject({ code: '23514' });
+    expect(need.rows[0]!.snapshotHash).toMatch(/^[a-f0-9]{64}$/);
+
+    const ownership = await pool.query<{
+      versionId: string;
+      versionOwnerId: string;
+      otherProviderId: string;
+    }>(`
+      SELECT pv.id AS "versionId", pv.provider_id AS "versionOwnerId",
+             other.id AS "otherProviderId"
+      FROM catalog.provider_versions pv
+      JOIN LATERAL (
+        SELECT id FROM catalog.providers WHERE id <> pv.provider_id ORDER BY id LIMIT 1
+      ) other ON true
+      ORDER BY pv.id LIMIT 1
+    `);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const candidateId = randomUUID();
+      await client.query(
+        `INSERT INTO workspace.candidates
+           (id, workspace_id, need_id, option_kind, label, context_snapshot_hash, discovery_origin)
+         VALUES ($1, $2, $3, 'provider', $4, $5, 'integration')`,
+        [candidateId, localWorkspaceId, referenceNeedId, randomUUID(), need.rows[0]!.snapshotHash],
+      );
+      await expect(
+        client.query(
+          `INSERT INTO workspace.candidate_components
+             (id, workspace_id, candidate_id, provider_id, provider_version_id, role)
+           VALUES ($1, $2, $3, $4, $5, 'primary')`,
+          [
+            randomUUID(),
+            localWorkspaceId,
+            candidateId,
+            ownership.rows[0]!.otherProviderId,
+            ownership.rows[0]!.versionId,
+          ],
+        ),
+      ).rejects.toMatchObject({ code: '23503' });
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release();
+    }
   });
 });
