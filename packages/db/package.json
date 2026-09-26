@@ -1,0 +1,5 @@
+{
+  "name": "@maestro/db",
+  "private": true,
+  "type": "module"
+}

@@ -1,0 +1,5 @@
+{
+  "name": "@maestro/domain",
+  "private": true,
+  "type": "module"
+}

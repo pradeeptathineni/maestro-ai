@@ -1,0 +1,14 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "declaration": true,
+    "declarationMap": true,
+    "noEmit": false,
+    "outDir": "dist",
+    "rootDir": ".",
+    "sourceMap": true,
+    "types": ["node"]
+  },
+  "include": ["apps/api/**/*.ts", "apps/worker/**/*.ts", "packages/**/*.ts"],
+  "exclude": ["**/*.test.ts", "**/*.integration.test.ts", "packages/test-fixtures/**"]
+}

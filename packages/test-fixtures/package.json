@@ -1,0 +1,5 @@
+{
+  "name": "@maestro/test-fixtures",
+  "private": true,
+  "type": "module"
+}
