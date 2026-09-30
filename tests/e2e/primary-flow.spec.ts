@@ -24,6 +24,13 @@ async function captureIfRequested(page: Page, name: string): Promise<void> {
   await page.evaluate(({ x, y }) => window.scrollTo(x, y), scrollPosition);
 }
 
+async function captureViewportIfRequested(page: Page, name: string): Promise<void> {
+  const directory = process.env.MAESTRO_SCREENSHOT_DIR;
+  if (!directory) return;
+  await mkdir(directory, { recursive: true });
+  await page.screenshot({ path: join(directory, name), fullPage: false });
+}
+
 function observeRuntime(page: Page): () => void {
   const runtimeFailures: string[] = [];
   const unexpectedEgress: string[] = [];
@@ -232,9 +239,15 @@ test('query-first explorer keeps list, map, detail, comparison, and save on one 
   await expect(page.getByRole('heading', { name: 'Results', exact: true })).toBeVisible();
   expect(page.url()).toContain('resultSet=');
   expect(page.url()).not.toContain('context');
+  await expect(page.locator('.result-row').first().locator('.query-signal')).toBeInViewport();
+  await captureViewportIfRequested(page, 'explorer-1440-first-result-viewport.png');
+  await page.setViewportSize({ width: 390, height: 844 });
+  const topResultGlance = page.getByRole('button', { name: /Top result.*Signal/i });
+  await expect(topResultGlance).toBeInViewport();
+  await captureViewportIfRequested(page, 'explorer-390-first-result-viewport.png');
+  await page.setViewportSize({ width: 1440, height: 1000 });
   await queryDetails.click();
-  await expect(page.getByText('query-signal-v1')).toBeVisible();
-  await expect(page.getByText(/Every result gets a 0–100 signal estimate/)).toBeVisible();
+  await expect(page.getByText('query-signal-v2')).toBeVisible();
   await expect(page.getByText('Context Mode', { exact: true }).first()).toBeVisible();
   await expectNoSeriousAccessibilityViolations(page);
   await captureIfRequested(page, 'explorer-1440-list.png');
@@ -278,6 +291,9 @@ test('query-first explorer keeps list, map, detail, comparison, and save on one 
   await captureIfRequested(page, 'explorer-1440-map.png');
 
   await page.setViewportSize({ width: 1024, height: 900 });
+  await expect
+    .poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth))
+    .toBe(true);
   await captureIfRequested(page, 'explorer-1024-map.png');
   await page.getByRole('button', { name: 'Close' }).click();
   await page.getByRole('button', { name: 'List' }).click();
@@ -307,7 +323,7 @@ test('query-first explorer keeps list, map, detail, comparison, and save on one 
   await expect(page.getByText(/local index is unchanged/i)).toBeVisible();
   expect(new URL(page.url()).searchParams.get('resultSet')).toBe(resultSetBeforeRefresh);
   await page.getByRole('button', { name: 'Load 10 more' }).click();
-  await expect(page.getByText(/Showing 20 of 44 filtered results/)).toBeVisible();
+  await expect(page.getByText(/Showing 20 of \d+ filtered results/)).toBeVisible();
   assertRuntime();
 });
 
@@ -439,11 +455,51 @@ test('corpus separates saved leads from indexed knowledge and scores an explicit
 
   await page.getByLabel('Layer').selectOption('indexed_knowledge');
   await expect(
-    page.locator('.corpus-row').first().getByText('Indexed knowledge', { exact: true }),
+    page.locator('.corpus-row').first().getByText('Implementation', { exact: true }),
   ).toBeVisible();
   await page.setViewportSize({ width: 390, height: 844 });
   expect(await page.evaluate(() => document.body.scrollWidth <= window.innerWidth)).toBe(true);
   await captureIfRequested(page, 'corpus-390-search.png');
+  assertRuntime();
+});
+
+test('generic browser authoring creates an attributed Corpus record without execution authority', async ({
+  page,
+}) => {
+  const assertRuntime = observeRuntime(page);
+  const suffix = crypto.randomUUID();
+  const name = `Browser-authored option ${suffix}`;
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.goto('/workspace');
+  await page.getByRole('button', { name: 'Add knowledge' }).click();
+  await page.getByLabel('Name', { exact: true }).fill(name);
+  await page.getByLabel('Kind').selectOption('oss_project');
+  await page
+    .getByLabel('Public canonical URL')
+    .fill(`https://github.com/maestro-e2e/browser-authored-${suffix}`);
+  await page
+    .getByLabel('Description')
+    .fill('A bounded browser-authored fixture with source attribution and no execution authority.');
+  await page.getByLabel('Source title').fill('Browser authoring fixture repository');
+  await page.getByLabel('Source owner').fill('Maestro E2E fixture');
+  await page.getByLabel('Capability key').fill(`browser-authoring-${suffix}`);
+  await page.getByLabel('Capability name').fill('Browser knowledge authoring');
+  await page.getByLabel('Search terms').fill('browser authoring\nattributed source');
+  await page
+    .getByLabel('Limitations')
+    .fill('Fixture metadata is not independent evidence of usefulness.');
+  await page.getByRole('button', { name: 'Add source-backed option' }).click();
+  await expect(page.getByText(`${name} was added as Proposed public knowledge.`)).toBeVisible();
+  await expectNoSeriousAccessibilityViolations(page);
+
+  await page.getByRole('link', { name: 'Corpus', exact: true }).click();
+  await page.getByLabel('Search the corpus').fill(name);
+  await page.getByRole('button', { name: 'Search corpus' }).click();
+  const row = page.locator('.corpus-row').filter({ hasText: name }).first();
+  await expect(row).toBeVisible();
+  await expect(row.getByText('Proposed', { exact: true })).toBeVisible();
+  await expect(row.getByText(/Human Supplied Documentation/)).toBeVisible();
+  await expect(page.getByText(/saved lead is not reviewed knowledge/i)).toBeVisible();
   assertRuntime();
 });
 
@@ -519,11 +575,9 @@ test('connected source results remain visibly preliminary and source-linked', as
   await page.goto('/');
   await page.getByLabel('Capability question').fill('context tool');
   await page.getByRole('button', { name: 'Search' }).click();
-  await expect(page.getByRole('heading', { name: 'Current source results' })).toBeVisible();
-  const sectionHeadings = await page.locator('main h2').allTextContents();
-  expect(sectionHeadings.indexOf('Current source results')).toBeLessThan(
-    sectionHeadings.indexOf('Results'),
-  );
+  const sourceResults = page.locator('details.source-results');
+  await expect(sourceResults.getByText('Source plan and live leads')).toBeVisible();
+  await sourceResults.locator('summary').click();
   await expect(page.getByText('example/context-tool')).toBeVisible();
   await expect(page.getByText('Signal 34', { exact: true })).toBeVisible();
   await expect(page.getByText('Preliminary', { exact: true }).last()).toBeVisible();
@@ -562,7 +616,7 @@ test('source search is explicit and local semantic assistance stays separate', a
   await page.getByLabel('Capability question').fill('context compression');
   await page.getByRole('button', { name: 'Search' }).click();
   await expect(page.getByRole('heading', { name: 'Results', exact: true })).toBeVisible();
-  await expect(page.getByText('No connected source is enabled.').first()).toBeVisible();
+  await expect(page.getByText(/no connected source request was queued/i)).toBeVisible();
   await captureIfRequested(page, 'explorer-1440-optional-integrations.png');
 
   await page.getByRole('link', { name: 'Workspace', exact: true }).click();

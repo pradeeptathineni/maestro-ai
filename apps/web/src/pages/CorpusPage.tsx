@@ -6,7 +6,7 @@ import { Badge, Empty, ErrorPanel, Loading, PageHeader } from '../ui.js';
 
 interface CorpusItem {
   id: string;
-  layer: 'indexed_knowledge' | 'source_lead';
+  layer: 'indexed_knowledge' | 'knowledge_document' | 'source_lead';
   providerId: string | null;
   name: string;
   summary: string;
@@ -163,6 +163,7 @@ export function CorpusPage() {
             >
               <option value="">All layers</option>
               <option value="indexed_knowledge">Indexed knowledge</option>
+              <option value="knowledge_document">Knowledge documents</option>
               <option value="source_lead">Source leads</option>
             </select>
           </label>
@@ -255,7 +256,11 @@ export function CorpusPage() {
                     <div className="corpus-record-main">
                       <div className="card-topline">
                         <Badge>
-                          {item.layer === 'indexed_knowledge' ? 'Indexed knowledge' : 'Source lead'}
+                          {item.layer === 'indexed_knowledge'
+                            ? 'Implementation'
+                            : item.layer === 'knowledge_document'
+                              ? 'Knowledge document'
+                              : 'Source lead'}
                         </Badge>
                         <Badge>{label(item.state)}</Badge>
                         <Badge>{label(item.kind)}</Badge>

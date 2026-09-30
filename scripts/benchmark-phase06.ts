@@ -129,7 +129,7 @@ async function main(): Promise<void> {
   const databaseUrl = testDatabaseUrl();
   const databaseName = decodeURIComponent(new URL(databaseUrl).pathname.slice(1));
   if (!databaseName.endsWith('_test')) {
-    throw new Error('Phase 06 benchmark only resets a dedicated database ending in _test.');
+    throw new Error('Discovery benchmark only resets a dedicated database ending in _test.');
   }
   await ensureTestDatabase();
   await resetTestSchemas();
@@ -138,6 +138,9 @@ async function main(): Promise<void> {
   await importSeed(databaseUrl);
   const pool = createPool(databaseUrl);
   try {
+    const realKnowledgeCount = await pool.query<{ count: string }>(
+      'SELECT count(*)::text AS count FROM catalog.knowledge_projections',
+    );
     await insertSyntheticCorpus(pool);
     const latencies: number[] = [];
     for (let index = 0; index < 20; index += 1) {
@@ -179,11 +182,11 @@ async function main(): Promise<void> {
     `);
     const postgresql = await pool.query<{ version: string }>('SELECT version()');
     const report = {
-      benchmarkId: 'phase06-search-and-corpus-10k-v2',
+      benchmarkId: 'phase07-search-and-corpus-10k-v1',
       executedAt: new Date().toISOString(),
       dataset: {
         syntheticRecords: syntheticCount,
-        realKnowledgeRecords: 61,
+        realKnowledgeRecords: Number(realKnowledgeCount.rows[0]!.count),
         statement:
           'Synthetic rows measure local query mechanics only and are not evidence or knowledge-quality data.',
       },

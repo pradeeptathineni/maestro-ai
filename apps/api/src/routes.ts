@@ -279,11 +279,22 @@ export function registerRoutes(app: FastifyInstance, pool: Pool): void {
             request.body.query.trim(),
           )
         : [];
+      const queuedDiscovery = discoveryOperations.filter(
+        (operation) =>
+          typeof operation === 'object' &&
+          operation !== null &&
+          (operation as { state?: unknown }).state === 'queued',
+      );
       return reply.code(201).send({
         ...session,
         externalDiscovery: {
-          attempted: discoveryOperations.length > 0,
-          state: discoveryOperations.length > 0 ? 'queued' : 'not_configured',
+          attempted: queuedDiscovery.length > 0,
+          state:
+            queuedDiscovery.length > 0
+              ? 'queued'
+              : discoveryOperations.length > 0
+                ? 'route_plan_recorded'
+                : 'not_configured',
         },
         discoveryOperations,
       });

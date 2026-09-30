@@ -57,6 +57,7 @@ describe('reviewed PostgreSQL contract', () => {
       '0012_query_privacy_control.sql',
       '0013_query_value_projection_cache.sql',
       '0014_semantic_adapter_configuration.sql',
+      '0015_discovery_intelligence.sql',
     ]);
     expect(migrations.rows.every((row) => /^[a-f0-9]{64}$/.test(row.sha256))).toBe(true);
   });
@@ -73,6 +74,14 @@ describe('reviewed PostgreSQL contract', () => {
     expect(second.counts.projects).toBeGreaterThanOrEqual(1);
     expect(second.counts.needs).toBeGreaterThanOrEqual(1);
     expect(second.counts.candidates).toBeGreaterThanOrEqual(3);
+    const documentSubjects = await pool.query<{ total: number; logical: number }>(
+      `SELECT count(*)::int AS total,
+              count(DISTINCT (document_id, provider_id, capability_definition_id,
+                              relation_type))::int AS logical
+       FROM catalog.knowledge_document_subjects`,
+    );
+    expect(documentSubjects.rows[0]!.total).toBe(documentSubjects.rows[0]!.logical);
+    expect(documentSubjects.rows[0]!.total).toBeGreaterThan(0);
   });
 
   it('replays every stored score without a mismatch', async () => {
@@ -159,7 +168,26 @@ describe('reviewed PostgreSQL contract', () => {
   });
 
   it('keeps reviewed SQL and Drizzle table/column declarations aligned', async () => {
-    expect(await checkSchemaDefinitions(pool)).toEqual({ checkedTables: 72, errors: [] });
+    expect(await checkSchemaDefinitions(pool)).toEqual({ checkedTables: 77, errors: [] });
+  });
+
+  it('keeps first-class knowledge documents and their query results immutable', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const document = await client.query<{ id: string }>(
+        'SELECT id FROM catalog.knowledge_documents ORDER BY id LIMIT 1',
+      );
+      await expect(
+        client.query(
+          'UPDATE catalog.knowledge_documents SET summary = summary || $2 WHERE id = $1',
+          [document.rows[0]!.id, ' rewritten'],
+        ),
+      ).rejects.toMatchObject({ code: '55000' });
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release();
+    }
   });
 
   it('keeps the public catalog independent of private workspace foreign keys', async () => {
@@ -531,7 +559,7 @@ describe('reviewed PostgreSQL contract', () => {
     try {
       const inputs = [
         ...Array.from({ length: 37 }, (_, index) => ({ intent: 'deepen' as const, index })),
-        ...Array.from({ length: 17 }, (_, index) => ({ intent: 'explore' as const, index })),
+        ...Array.from({ length: 27 }, (_, index) => ({ intent: 'explore' as const, index })),
       ];
       const results = (await Promise.all(
         inputs.map(({ intent, index }) =>
@@ -544,7 +572,7 @@ describe('reviewed PostgreSQL contract', () => {
         ),
       )) as Array<{ state: string; intent: string }>;
 
-      expect(results.filter((result) => result.state === 'queued')).toHaveLength(50);
+      expect(results.filter((result) => result.state === 'queued')).toHaveLength(60);
       expect(results.filter((result) => result.state === 'budget_denied')).toHaveLength(4);
 
       const budget = await pool.query<{ reserved: number; denied: number }>(
@@ -552,7 +580,7 @@ describe('reviewed PostgreSQL contract', () => {
          FROM ops.adapter_daily_budgets
          WHERE adapter_key = 'github' AND budget_date = current_date`,
       );
-      expect(budget.rows[0]).toEqual({ reserved: 50, denied: 4 });
+      expect(budget.rows[0]).toEqual({ reserved: 60, denied: 4 });
       const operations = await pool.query<{ state: string; calls: number }>(
         `SELECT state, sum(reserved_calls)::int AS calls
          FROM ops.discovery_operations WHERE workspace_id = $1
@@ -561,7 +589,7 @@ describe('reviewed PostgreSQL contract', () => {
       );
       expect(operations.rows).toEqual(
         expect.arrayContaining([
-          { state: 'queued', calls: 50 },
+          { state: 'queued', calls: 60 },
           { state: 'budget_denied', calls: 0 },
         ]),
       );

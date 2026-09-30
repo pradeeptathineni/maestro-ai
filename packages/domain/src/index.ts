@@ -1,6 +1,7 @@
 export * from './canonical.js';
 export * from './bundle.js';
 export * from './decision.js';
+export * from './discovery-plan.js';
 export * from './gates.js';
 export * from './ids.js';
 export * from './jobs.js';

@@ -291,10 +291,15 @@ export interface ProblemDetails {
 
 interface ExplorerInterpretation {
   normalizedText: string;
+  canonicalConcepts: string[];
   explicitFacets: Array<{ key: string; label: string; value: string; origin: string }>;
   inferredFacets: Array<{ key: string; label: string; value: string; origin: string }>;
   missingContext: Array<{ key: string; label: string; value: string; origin: string }>;
   capabilityGroups: string[];
+  landscapeFacets: string[];
+  intentMode: string;
+  typedTarget: string | null;
+  sourceRoutingHints: string[];
   coverageState: 'maintained' | 'partial' | 'outside_maintained_coverage';
 }
 
@@ -321,8 +326,10 @@ export interface ExplorerRefresh {
 export interface ExplorerResultItem {
   id: string;
   position: number;
-  providerId: string;
-  providerRevision: number;
+  providerId: string | null;
+  documentId?: string | null;
+  subjectType: 'implementation' | 'document';
+  providerRevision: number | null;
   capabilityGroup: string;
   matchedFields: string[];
   explanation: string;
@@ -364,6 +371,19 @@ export interface ExplorerResultPage {
       projectFitState: 'unknown_blocked' | 'not_applicable';
       projectContextAffectsSignal: false;
     };
+    queryPlan?: {
+      policyVersion: string;
+      intentMode: string;
+      planHash: string;
+      routes: Array<{
+        id: string;
+        adapterKey: string;
+        state: string;
+        variant: string | null;
+        reason: string;
+        callLimit: number;
+      }>;
+    };
     signalPolicyVersion: string;
     retrievalPolicyVersion: string;
     createdAt: string;
@@ -373,12 +393,21 @@ export interface ExplorerResultPage {
   filters: Record<string, unknown>;
   filteredCount: number;
   items: ExplorerResultItem[];
-  discoveryOperations: Array<{ id: string; adapterKey: string; state: string }>;
+  discoveryOperations: Array<{
+    id: string;
+    adapterKey: string;
+    state: string;
+    planRouteId?: string;
+    routingReason?: string;
+    sourcePlanState?: string;
+    safeDetail?: string;
+  }>;
   nextCursor: string | null;
 }
 
 export interface ExplorerItemDetail extends ExplorerResultItem {
   resultSetId: string;
+  canonicalUri?: string;
   relevanceAnchors: Record<string, unknown>;
   valueInputs: Array<{
     key: string;
@@ -386,7 +415,7 @@ export interface ExplorerItemDetail extends ExplorerResultItem {
     confidence: number;
     coverage: number;
     prior: number;
-    adjusted: number;
+    adjusted: number | null;
     state: string;
     reasons: string[];
     missing: string[];
@@ -430,7 +459,7 @@ export interface ExplorerGraphData {
     id: string;
     resultItemId?: string;
     providerId?: string;
-    type: 'provider' | 'capability_group';
+    type: 'implementation' | 'document' | 'capability_group';
     label: string;
     kind?: string;
     group: string;

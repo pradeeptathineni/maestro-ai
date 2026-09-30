@@ -39,7 +39,7 @@ export type DiscoveryResult =
     };
 
 export interface DiscoveryAdapter {
-  key: 'github' | 'mcp_registry' | 'searxng';
+  key: 'github' | 'mcp_registry' | 'searxng' | 'hacker_news';
   version: string;
   search(query: string, limit?: number): Promise<DiscoveryResult>;
 }
@@ -169,7 +169,7 @@ export function createGitHubDiscoveryAdapter(options: AdapterOptions = {}): Disc
         ...options,
         headers: {
           accept: 'application/vnd.github+json',
-          'user-agent': 'maestro-ai-local-phase06',
+          'user-agent': 'maestro-ai-local-discovery-v1',
           'x-github-api-version': '2022-11-28',
         },
       });
@@ -352,6 +352,68 @@ export function createSearxngDiscoveryAdapter(
           leads.length < Math.min(record.results?.length ?? 0, boundedLimit(limit))
             ? 'partial'
             : 'complete',
+        leads,
+        responseBytes: result.bytes,
+        httpStatus: result.status,
+        rateLimit: {
+          remaining: null,
+          resetAt: null,
+          retryAfter: result.headers.get('retry-after'),
+        },
+      };
+    },
+  };
+}
+
+export function createHackerNewsDiscoveryAdapter(options: AdapterOptions = {}): DiscoveryAdapter {
+  return {
+    key: 'hacker_news',
+    version: 'hn-algolia-v1',
+    async search(query, limit) {
+      const url = validateFixedPublicUrl('https://hn.algolia.com/api/v1/search', [
+        'hn.algolia.com',
+      ]);
+      url.searchParams.set('query', cleanQuery(query));
+      url.searchParams.set('tags', 'story');
+      url.searchParams.set('hitsPerPage', String(boundedLimit(limit)));
+      const result = await requestJson(url, options);
+      if (!('ok' in result)) return result;
+      const record = result.value as { hits?: unknown[] };
+      const observedAt = new Date().toISOString();
+      const leads = (record.hits ?? []).flatMap((entry): DiscoveryLead[] => {
+        if (!entry || typeof entry !== 'object') return [];
+        const value = entry as Record<string, unknown>;
+        if (typeof value.objectID !== 'string' || typeof value.title !== 'string') return [];
+        const canonicalUri = `https://news.ycombinator.com/item?id=${encodeURIComponent(value.objectID)}`;
+        const targetUri = normalizedPublicLeadUrl(value.url);
+        const points = typeof value.points === 'number' ? value.points : null;
+        const commentCount = typeof value.num_comments === 'number' ? value.num_comments : null;
+        return [
+          {
+            externalId: value.objectID,
+            canonicalUri,
+            title: value.title,
+            summary: `Hacker News discussion lead${points === null ? '' : ` with ${points} points`}${commentCount === null ? '' : ` and ${commentCount} comments`}. Community attention is not independent technical evidence.`,
+            kindHint: 'community_discussion',
+            payload: {
+              discussionUri: canonicalUri,
+              targetUri,
+              points,
+              commentCount,
+              createdAt: typeof value.created_at === 'string' ? value.created_at : null,
+            },
+            provenance: {
+              adapter: 'hacker_news',
+              adapterVersion: 'hn-algolia-v1',
+              source: 'Hacker News Algolia Search API',
+              observedAt,
+              reviewState: 'lead',
+            },
+          },
+        ];
+      });
+      return {
+        state: leads.length < (record.hits?.length ?? 0) ? 'partial' : 'complete',
         leads,
         responseBytes: result.bytes,
         httpStatus: result.status,

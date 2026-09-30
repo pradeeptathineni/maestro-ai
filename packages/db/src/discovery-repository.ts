@@ -7,14 +7,22 @@ import type {
 } from '../../contracts/src/index.js';
 import {
   hashCanonical,
+  buildDiscoveryPlan,
   interpretQuery,
   lexicalRelevance,
   newOpaqueId,
+  type DiscoveryPlan,
+  type DiscoveryRouteState,
   type QueryInterpretation,
 } from '../../domain/src/index.js';
-import { calculateQuerySignalV1, type QueryValueInput } from '../../scoring/src/index.js';
+import {
+  calculateQuerySignalV2,
+  querySignalKindProfile,
+  type QueryValueInput,
+} from '../../scoring/src/index.js';
 import {
   createGitHubDiscoveryAdapter,
+  createHackerNewsDiscoveryAdapter,
   createMcpRegistryDiscoveryAdapter,
   createSearxngDiscoveryAdapter,
   validateExplicitLocalEndpoint,
@@ -136,10 +144,11 @@ export function scoreDiscoveryCandidate(
     capabilities: candidate.kindHint ? [candidate.kindHint] : [],
     searchText: `${candidate.title} ${candidate.summary}`,
   });
-  const signal = calculateQuerySignalV1({
+  const signal = calculateQuerySignalV2({
     relevanceOrdinal: relevance.ordinal,
     relevanceMethod: 'rule',
     dimensions: discoveryLeadValueProfile(candidate),
+    kindProfile: querySignalKindProfile(candidate.kindHint ?? 'other'),
     provisional: true,
   });
   const publicCandidate = { ...candidate };
@@ -198,7 +207,9 @@ export async function configureAdapter(
   adapterKey: string,
   input: AdapterConfigBody,
 ): Promise<unknown> {
-  if (!['github', 'mcp_registry', 'searxng', 'local_semantic'].includes(adapterKey)) {
+  if (
+    !['github', 'mcp_registry', 'searxng', 'hacker_news', 'local_semantic'].includes(adapterKey)
+  ) {
     throw new NotFoundError('Adapter not found.');
   }
   if (['searxng', 'local_semantic'].includes(adapterKey) && input.enabled) {
@@ -218,7 +229,7 @@ export async function configureAdapter(
   if (adapterKey !== 'local_semantic' && input.modelIdentifier) {
     throw new DomainValidationError('Only the local semantic adapter accepts a modelIdentifier.');
   }
-  if (['github', 'mcp_registry'].includes(adapterKey) && input.baseUrl) {
+  if (['github', 'mcp_registry', 'hacker_news'].includes(adapterKey) && input.baseUrl) {
     throw new DomainValidationError(
       'Native adapter destinations are fixed and cannot be overridden.',
     );
@@ -261,6 +272,13 @@ export async function requestDiscovery(
   workspaceId: string,
   querySessionId: string,
   input: DiscoveryRequestBody,
+  route?: {
+    planRouteId: string;
+    variantIndex: number;
+    routingReason: string;
+    sourcePlanState: DiscoveryRouteState;
+    outboundQuery: string | null;
+  },
 ): Promise<unknown> {
   return inTransaction(pool, async (client) => {
     const intent = input.intent ?? 'deepen';
@@ -293,12 +311,22 @@ export async function requestDiscovery(
     );
     if (!config.rowCount) throw new NotFoundError('Adapter not found.');
     const operationId = newOpaqueId();
-    const calls = Math.min(1, config.rows[0]!.perOperationCallLimit);
-    let state: 'queued' | 'not_configured' | 'budget_denied' = 'not_configured';
+    const calls =
+      route?.sourcePlanState === 'planned'
+        ? Math.min(1, config.rows[0]!.perOperationCallLimit)
+        : route
+          ? 0
+          : Math.min(1, config.rows[0]!.perOperationCallLimit);
+    let state: 'queued' | 'not_configured' | 'budget_denied' | 'skipped' | 'unsupported' =
+      route?.sourcePlanState === 'skipped'
+        ? 'skipped'
+        : route?.sourcePlanState === 'unsupported'
+          ? 'unsupported'
+          : 'not_configured';
     let reservedCalls = 0;
-    if (config.rows[0]!.enabled && calls > 0) {
+    if ((!route || route.sourcePlanState === 'planned') && config.rows[0]!.enabled && calls > 0) {
       await client.query(
-        `SELECT pg_advisory_xact_lock(hashtext('phase06-external-daily-budget:' || current_date::text))`,
+        `SELECT pg_advisory_xact_lock(hashtext('discovery-external-daily-budget:' || current_date::text))`,
       );
       await client.query(
         `INSERT INTO ops.adapter_daily_budgets (adapter_key, budget_date)
@@ -314,7 +342,7 @@ export async function requestDiscovery(
       const reserved = await client.query(
         `UPDATE ops.adapter_daily_budgets SET reserved_calls = reserved_calls + $2, updated_at = now()
          WHERE adapter_key = $1 AND budget_date = current_date
-           AND reserved_calls + $2 <= $3 AND $4 + $2 <= 50
+           AND reserved_calls + $2 <= $3 AND $4 + $2 <= 60
          RETURNING reserved_calls`,
         [input.adapterKey, calls, config.rows[0]!.dailyCallLimit, overall.rows[0]!.reserved],
       );
@@ -334,9 +362,11 @@ export async function requestDiscovery(
       `INSERT INTO ops.discovery_operations
          (id, workspace_id, query_session_id, result_set_id, adapter_key, idempotency_key,
           intent, outbound_query, outbound_query_hash, disclosure, state, reserved_calls,
-          safe_detail, finished_at)
+          safe_detail, finished_at, plan_route_id, variant_index, routing_reason,
+          source_plan_state)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-               CASE WHEN $11 IN ('not_configured', 'budget_denied') THEN now() ELSE NULL END)`,
+               CASE WHEN $11 IN ('not_configured', 'budget_denied', 'skipped', 'unsupported')
+                    THEN now() ELSE NULL END, $14, $15, $16, $17)`,
       [
         operationId,
         workspaceId,
@@ -345,27 +375,33 @@ export async function requestDiscovery(
         input.adapterKey,
         input.idempotencyKey,
         intent,
-        input.approvedPublicQuery,
-        hashCanonical(input.approvedPublicQuery),
+        route?.outboundQuery ?? input.approvedPublicQuery,
+        hashCanonical(route?.outboundQuery ?? input.approvedPublicQuery),
         json({
-          approvedBy: 'human_request',
+          approvedBy: route ? 'bounded_source_plan' : 'human_request',
           sentFields: ['approvedPublicQuery'],
           privateProjectContextIncluded: false,
         }),
         state,
         reservedCalls,
-        state === 'not_configured'
-          ? 'Adapter is disabled. Cached exploration remains available.'
-          : state === 'budget_denied'
-            ? 'Atomic daily call budget denied this operation.'
-            : 'Queued for the local worker.',
+        state === 'skipped' || state === 'unsupported'
+          ? route!.routingReason
+          : state === 'not_configured'
+            ? 'Adapter is disabled. Cached exploration remains available.'
+            : state === 'budget_denied'
+              ? 'Atomic daily call budget denied this operation.'
+              : 'Queued for the local worker.',
+        route?.planRouteId ?? null,
+        route?.variantIndex ?? 1,
+        route?.routingReason ?? null,
+        route?.sourcePlanState ?? 'planned',
       ],
     );
     if (state === 'queued') {
       await client.query(
         `INSERT INTO ops.outbox
            (id, operation_key, task_name, payload, state)
-         VALUES ($1, $2, 'phase06_discovery_v1', $3, 'pending')`,
+         VALUES ($1, $2, 'discovery_retrieve_v1', $3, 'pending')`,
         [newOpaqueId(), `discovery:${operationId}`, json({ operationId, workspaceId })],
       );
     }
@@ -377,6 +413,9 @@ export async function requestDiscovery(
       disclosure: { sentFields: ['approvedPublicQuery'], privateProjectContextIncluded: false },
       reservedCalls,
       duplicate: false,
+      planRouteId: route?.planRouteId ?? null,
+      routingReason: route?.routingReason ?? null,
+      sourcePlanState: route?.sourcePlanState ?? 'planned',
     };
   });
 }
@@ -387,21 +426,42 @@ export async function requestEnabledDiscovery(
   querySessionId: string,
   approvedPublicQuery: string,
 ): Promise<unknown[]> {
-  const enabled = await pool.query<{ adapterKey: 'github' | 'mcp_registry' | 'searxng' }>(
-    `SELECT adapter_key AS "adapterKey"
-     FROM ops.source_adapter_configs
-     WHERE enabled AND source_class <> 'local_semantic'
-     ORDER BY adapter_key`,
+  const session = await pool.query<{
+    interpretation: QueryInterpretation;
+    plan: DiscoveryPlan | null;
+  }>(
+    `SELECT qs.normalized_intent AS interpretation, qp.plan
+     FROM workspace.query_sessions qs
+     LEFT JOIN workspace.query_plans qp
+       ON qp.query_session_id = qs.id AND qp.workspace_id = qs.workspace_id
+     WHERE qs.id = $1 AND qs.workspace_id = $2 AND qs.deleted_at IS NULL`,
+    [querySessionId, workspaceId],
   );
+  if (!session.rowCount) throw new NotFoundError('Query session not found.');
+  const plan =
+    session.rows[0]!.plan ??
+    buildDiscoveryPlan(approvedPublicQuery, session.rows[0]!.interpretation);
   const operations: unknown[] = [];
-  for (const row of enabled.rows) {
+  for (const route of plan.routes) {
     operations.push(
-      await requestDiscovery(pool, workspaceId, querySessionId, {
-        adapterKey: row.adapterKey,
-        approvedPublicQuery,
-        idempotencyKey: `search:${querySessionId}:${row.adapterKey}`,
-        intent: 'explore',
-      }),
+      await requestDiscovery(
+        pool,
+        workspaceId,
+        querySessionId,
+        {
+          adapterKey: route.adapterKey,
+          approvedPublicQuery,
+          idempotencyKey: `search:${querySessionId}:${route.id}:1`,
+          intent: 'explore',
+        },
+        {
+          planRouteId: route.id,
+          variantIndex: 1,
+          routingReason: route.reason,
+          sourcePlanState: route.state,
+          outboundQuery: route.variant,
+        },
+      ),
     );
   }
   return operations;
@@ -415,6 +475,8 @@ export async function getDiscoveryOperation(
   const operation = await pool.query<JsonRow>(
     `SELECT id, adapter_key AS "adapterKey", intent, disclosure, state,
             outbound_query AS "outboundQuery",
+            plan_route_id AS "planRouteId", variant_index AS "variantIndex",
+            routing_reason AS "routingReason", source_plan_state AS "sourcePlanState",
             reserved_calls AS "reservedCalls", consumed_calls AS "consumedCalls",
             result_count AS "resultCount", error_code AS "errorCode",
             safe_detail AS "safeDetail", started_at AS "startedAt",
@@ -512,6 +574,7 @@ function adapterFor(config: {
   const options = { timeoutMs: config.timeoutMs, maximumBytes: config.responseByteLimit };
   if (config.adapterKey === 'github') return createGitHubDiscoveryAdapter(options);
   if (config.adapterKey === 'mcp_registry') return createMcpRegistryDiscoveryAdapter(options);
+  if (config.adapterKey === 'hacker_news') return createHackerNewsDiscoveryAdapter(options);
   if (config.adapterKey === 'searxng' && config.baseUrl) {
     return createSearxngDiscoveryAdapter(config.baseUrl, options);
   }

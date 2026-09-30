@@ -197,12 +197,13 @@ export async function furnishKnowledgeOption(
   input: KnowledgeOptionBody,
 ): Promise<unknown> {
   if (!allowedKinds.has(input.kind)) throw new DomainValidationError('Unsupported option kind.');
-  let normalizedUrl: string;
+  let normalized: ReturnType<typeof normalizeConsiderUrl>;
   try {
-    normalizedUrl = normalizeConsiderUrl(input.canonicalUrl).normalizedUrl;
+    normalized = normalizeConsiderUrl(input.canonicalUrl);
   } catch {
     throw new DomainValidationError('Knowledge sources require a safe uncredentialed HTTPS URL.');
   }
+  const normalizedUrl = normalized.normalizedUrl;
   const url = new URL(normalizedUrl);
   return inTransaction(pool, async (client) => {
     const workspace = await client.query('SELECT id FROM workspace.workspaces WHERE id = $1', [
@@ -253,12 +254,24 @@ export async function furnishKnowledgeOption(
        VALUES ($1, $2, $3, $4, 'unknown', 'global', 1)`,
       [providerId, input.kind, input.name, input.description],
     );
+    const identity = normalized.strongIdentity ?? {
+      scheme: 'canonical_document' as const,
+      value: normalizedUrl,
+    };
     await client.query(
       `INSERT INTO catalog.provider_identities
          (id, provider_id, scheme, normalized_value, display_value, source_observation_id,
           confidence, is_canonical, valid_from)
-       VALUES ($1, $2, 'canonical_document', $3, $3, $4, 1, true, $5)`,
-      [newOpaqueId(), providerId, normalizedUrl, observationId, now],
+       VALUES ($1, $2, $3, $4, $5, $6, 1, true, $7)`,
+      [
+        newOpaqueId(),
+        providerId,
+        identity.scheme,
+        identity.value,
+        normalizedUrl,
+        observationId,
+        now,
+      ],
     );
     const displayHash = hashCanonical({
       providerId,

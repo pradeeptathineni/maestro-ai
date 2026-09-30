@@ -2,6 +2,8 @@ import fc from 'fast-check';
 import { describe, expect, it } from 'vitest';
 import {
   calculateQuerySignalV1,
+  calculateQuerySignalV2,
+  querySignalKindProfile,
   type QueryValueInput,
   type QueryValueKey,
 } from './query-signal.js';
@@ -82,6 +84,28 @@ describe('query-signal-v1', () => {
     });
   });
 
+  it('preserves the historical exact-threshold replay boundary', () => {
+    const thresholdValues = values([70, 70, 70, 70]).map((item) => ({
+      ...item,
+      coverage: 0.45,
+    }));
+    expect(
+      calculateQuerySignalV1({
+        relevanceOrdinal: 'direct',
+        relevanceMethod: 'rule',
+        dimensions: thresholdValues,
+      }).displayState,
+    ).toBe('available');
+    expect(
+      calculateQuerySignalV2({
+        relevanceOrdinal: 'direct',
+        relevanceMethod: 'rule',
+        kindProfile: 'implementation',
+        dimensions: thresholdValues,
+      }).displayState,
+    ).toBe('insufficient_evidence');
+  });
+
   it('is bounded and competitor-independent', () => {
     fc.assert(
       fc.property(
@@ -101,5 +125,45 @@ describe('query-signal-v1', () => {
         },
       ),
     );
+  });
+});
+
+describe('query-signal-v2', () => {
+  it('profiles heterogeneous kinds without changing relevance into evidence', () => {
+    const implementation = calculateQuerySignalV2({
+      relevanceOrdinal: 'direct',
+      relevanceMethod: 'rule',
+      kindProfile: querySignalKindProfile('runtime'),
+      dimensions: values([80, 70, 60, 90]),
+    });
+    const document = calculateQuerySignalV2({
+      relevanceOrdinal: 'direct',
+      relevanceMethod: 'rule',
+      kindProfile: querySignalKindProfile('article'),
+      dimensions: values([80, 70, 60, 90]),
+    });
+    expect(implementation).toMatchObject({
+      policyVersion: 'query-signal-v2',
+      kindProfile: 'implementation',
+      relevanceValue: 100,
+    });
+    expect(document.kindProfile).toBe('knowledge_document');
+    expect(document.signalDisplay).not.toBe(implementation.signalDisplay);
+  });
+
+  it('retains a numeric estimate when evidence coverage is sparse', () => {
+    const sparse = values([70, 70, 70, 70], 1).map((item, index) =>
+      index === 0
+        ? item
+        : { ...item, raw: null, confidence: 0, coverage: 0, state: 'missing' as const },
+    );
+    const result = calculateQuerySignalV2({
+      relevanceOrdinal: 'direct',
+      relevanceMethod: 'rule',
+      kindProfile: 'practice',
+      dimensions: sparse,
+    });
+    expect(result.displayState).toBe('insufficient_evidence');
+    expect(result.signalDisplay).toEqual(expect.any(Number));
   });
 });

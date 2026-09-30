@@ -2,6 +2,7 @@ import type { LookupAddress } from 'node:dns';
 import { describe, expect, it, vi } from 'vitest';
 import {
   createGitHubDiscoveryAdapter,
+  createHackerNewsDiscoveryAdapter,
   createMcpRegistryDiscoveryAdapter,
   createSearxngDiscoveryAdapter,
 } from './discovery.js';
@@ -174,6 +175,34 @@ describe('bounded discovery adapters', () => {
     expect(() => createSearxngDiscoveryAdapter('https://public.example')).toThrow(
       NetworkPolicyError,
     );
+  });
+
+  it('keeps Hacker News discussion identity distinct from the linked primary target', async () => {
+    const result = await createHackerNewsDiscoveryAdapter({
+      fetchImpl: async () =>
+        jsonResponse({
+          hits: [
+            {
+              objectID: '42',
+              title: 'A new context compression method',
+              url: 'https://example.com/research',
+              points: 12,
+              num_comments: 4,
+              created_at: '2026-09-30T00:00:00Z',
+            },
+          ],
+        }),
+    }).search('context compression');
+    expect(result).toMatchObject({
+      leads: [
+        {
+          canonicalUri: 'https://news.ycombinator.com/item?id=42',
+          kindHint: 'community_discussion',
+          payload: { targetUri: 'https://example.com/research' },
+          provenance: { adapter: 'hacker_news', reviewState: 'lead' },
+        },
+      ],
+    });
   });
 
   it('drops unsafe source links before they can become clickable leads', async () => {

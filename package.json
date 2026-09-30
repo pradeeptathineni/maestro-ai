@@ -28,6 +28,8 @@
     "dev:web": "vite --config apps/web/vite.config.ts --host 127.0.0.1",
     "dev:worker": "node --env-file-if-exists=.env --import tsx --watch apps/worker/src/server.ts",
     "eval:phase06": "node --import tsx scripts/evaluate-phase06.ts",
+    "eval:phase07": "node --import tsx scripts/evaluate-phase07.ts",
+    "study:discovery-live": "node --import tsx scripts/run-discovery-live-study.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "eslint . --max-warnings=0",

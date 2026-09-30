@@ -11,6 +11,48 @@ export const querySignalPolicyV1 = {
   },
 } as const;
 
+export type QuerySignalKindProfile =
+  'implementation' | 'model' | 'practice' | 'standard' | 'knowledge_document';
+
+export const querySignalPolicyV2 = {
+  id: 'query-signal',
+  version: 'query-signal-v2',
+  coverageThreshold: 0.45,
+  uncertaintyDeduction: 20,
+  profiles: {
+    implementation: {
+      reuse_leverage: { weight: 0.4, prior: 50 },
+      adoption_ease: { weight: 0.25, prior: 35 },
+      maturity: { weight: 0.2, prior: 50 },
+      provenance_clarity: { weight: 0.15, prior: 35, highPrivilegePrior: 25 },
+    },
+    model: {
+      reuse_leverage: { weight: 0.3, prior: 45 },
+      adoption_ease: { weight: 0.2, prior: 30 },
+      maturity: { weight: 0.3, prior: 40 },
+      provenance_clarity: { weight: 0.2, prior: 35, highPrivilegePrior: 25 },
+    },
+    practice: {
+      reuse_leverage: { weight: 0.45, prior: 50 },
+      adoption_ease: { weight: 0.15, prior: 40 },
+      maturity: { weight: 0.15, prior: 45 },
+      provenance_clarity: { weight: 0.25, prior: 40, highPrivilegePrior: 30 },
+    },
+    standard: {
+      reuse_leverage: { weight: 0.35, prior: 45 },
+      adoption_ease: { weight: 0.15, prior: 35 },
+      maturity: { weight: 0.25, prior: 50 },
+      provenance_clarity: { weight: 0.25, prior: 45, highPrivilegePrior: 35 },
+    },
+    knowledge_document: {
+      reuse_leverage: { weight: 0.45, prior: 45 },
+      adoption_ease: { weight: 0.05, prior: 50 },
+      maturity: { weight: 0.2, prior: 45 },
+      provenance_clarity: { weight: 0.3, prior: 45, highPrivilegePrior: 35 },
+    },
+  },
+} as const;
+
 export type QueryValueKey = keyof typeof querySignalPolicyV1.dimensions;
 export type QueryValueState =
   'present' | 'missing' | 'zero' | 'stale' | 'contradicted' | 'not_applicable';
@@ -35,7 +77,8 @@ export interface QueryValueResult extends QueryValueInput {
 }
 
 export interface QuerySignalResult {
-  policyVersion: 'query-signal-v1';
+  policyVersion: 'query-signal-v1' | 'query-signal-v2';
+  kindProfile?: QuerySignalKindProfile;
   relevanceOrdinal: 'no_match' | 'incidental' | 'complementary' | 'partial' | 'direct';
   relevanceValue: 0 | 25 | 50 | 75 | 100;
   relevanceMethod: 'rule' | 'human' | 'model_proposal';
@@ -73,21 +116,39 @@ function roundHalfUp(value: number): number {
   return Math.floor(value + 0.5);
 }
 
-export function calculateQuerySignalV1(input: {
+interface QuerySignalInput {
   relevanceOrdinal: QuerySignalResult['relevanceOrdinal'];
   relevanceMethod: QuerySignalResult['relevanceMethod'];
   dimensions: QueryValueInput[];
   excluded?: boolean;
   provisional?: boolean;
-}): QuerySignalResult {
-  const orderedKeys = Object.keys(querySignalPolicyV1.dimensions) as QueryValueKey[];
+}
+
+interface QuerySignalDimensionPolicy {
+  weight: number;
+  prior: number;
+  highPrivilegePrior?: number;
+}
+
+function calculateQuerySignal(
+  input: QuerySignalInput,
+  policy: {
+    version: QuerySignalResult['policyVersion'];
+    kindProfile?: QuerySignalKindProfile;
+    dimensions: Record<QueryValueKey, QuerySignalDimensionPolicy>;
+    uncertaintyDeduction: number;
+    coverageThreshold: number;
+    coverageAtThresholdIsInsufficient: boolean;
+  },
+): QuerySignalResult {
+  const orderedKeys = Object.keys(policy.dimensions) as QueryValueKey[];
   const byKey = new Map(input.dimensions.map((dimension) => [dimension.key, dimension]));
   if (
     input.dimensions.length !== orderedKeys.length ||
     byKey.size !== orderedKeys.length ||
     orderedKeys.some((key) => !byKey.has(key))
   ) {
-    throw new Error('Every query-signal-v1 dimension must be provided exactly once.');
+    throw new Error(`Every ${policy.version} dimension must be provided exactly once.`);
   }
   const dimensions = orderedKeys.map((key): QueryValueResult => {
     const dimension = byKey.get(key)!;
@@ -111,14 +172,14 @@ export function calculateQuerySignalV1(input: {
     if (dimension.state === 'zero' && dimension.raw !== 0) {
       throw new Error(`${key} zero state requires raw zero.`);
     }
-    const policy = querySignalPolicyV1.dimensions[key];
+    const dimensionPolicy = policy.dimensions[key];
     const prior =
-      dimension.highPrivilege && 'highPrivilegePrior' in policy
-        ? policy.highPrivilegePrior
-        : policy.prior;
+      dimension.highPrivilege && dimensionPolicy.highPrivilegePrior !== undefined
+        ? dimensionPolicy.highPrivilegePrior
+        : dimensionPolicy.prior;
     return {
       ...dimension,
-      weight: policy.weight,
+      weight: dimensionPolicy.weight,
       prior,
       adjusted:
         dimension.raw === null
@@ -136,16 +197,19 @@ export function calculateQuerySignalV1(input: {
   const valueCentral = precise(weighted((dimension) => dimension.adjusted!));
   const valueUncertainty = precise(1 - weighted((dimension) => dimension.confidence));
   const valueConservative = precise(
-    Math.max(0, Math.min(100, valueCentral - 20 * valueUncertainty)),
+    Math.max(0, Math.min(100, valueCentral - policy.uncertaintyDeduction * valueUncertainty)),
   );
   const evidenceCoverage = precise(weighted((dimension) => dimension.coverage));
   const relevanceValue = RELEVANCE_VALUES[input.relevanceOrdinal];
   const signalUnrounded = precise((relevanceValue / 100) * valueConservative);
+  const hasInsufficientCoverage = policy.coverageAtThresholdIsInsufficient
+    ? evidenceCoverage <= policy.coverageThreshold
+    : evidenceCoverage < policy.coverageThreshold;
   const displayState = input.excluded
     ? 'excluded'
     : input.provisional || input.relevanceMethod === 'model_proposal'
       ? 'provisional'
-      : evidenceCoverage < querySignalPolicyV1.coverageThreshold
+      : hasInsufficientCoverage
         ? 'insufficient_evidence'
         : 'available';
   // Confidence and review state qualify the estimate; they do not suppress it.
@@ -162,7 +226,8 @@ export function calculateQuerySignalV1(input: {
             ? 'Investigate'
             : 'Weak consideration';
   return {
-    policyVersion: querySignalPolicyV1.version,
+    policyVersion: policy.version,
+    ...(policy.kindProfile ? { kindProfile: policy.kindProfile } : {}),
     relevanceOrdinal: input.relevanceOrdinal,
     relevanceValue,
     relevanceMethod: input.relevanceMethod,
@@ -177,4 +242,43 @@ export function calculateQuerySignalV1(input: {
     band,
     inputEvidenceIds: [...new Set(dimensions.flatMap((dimension) => dimension.evidenceIds))].sort(),
   };
+}
+
+export function calculateQuerySignalV1(input: QuerySignalInput): QuerySignalResult {
+  return calculateQuerySignal(input, {
+    version: querySignalPolicyV1.version,
+    dimensions: querySignalPolicyV1.dimensions,
+    uncertaintyDeduction: querySignalPolicyV1.uncertaintyDeduction,
+    coverageThreshold: querySignalPolicyV1.coverageThreshold,
+    // Historical v1 treats exact-threshold coverage as sufficient. Keep replay stable.
+    coverageAtThresholdIsInsufficient: false,
+  });
+}
+
+export function querySignalKindProfile(kind: string): QuerySignalKindProfile {
+  if (kind === 'model') return 'model';
+  if (['practice', 'technique', 'concept', 'convention'].includes(kind)) return 'practice';
+  if (['protocol', 'standard'].includes(kind)) return 'standard';
+  if (['article', 'research', 'resource', 'specification'].includes(kind)) {
+    return 'knowledge_document';
+  }
+  return 'implementation';
+}
+
+export function calculateQuerySignalV2(input: {
+  relevanceOrdinal: QuerySignalResult['relevanceOrdinal'];
+  relevanceMethod: QuerySignalResult['relevanceMethod'];
+  dimensions: QueryValueInput[];
+  kindProfile: QuerySignalKindProfile;
+  excluded?: boolean;
+  provisional?: boolean;
+}): QuerySignalResult {
+  return calculateQuerySignal(input, {
+    version: querySignalPolicyV2.version,
+    kindProfile: input.kindProfile,
+    dimensions: querySignalPolicyV2.profiles[input.kindProfile],
+    uncertaintyDeduction: querySignalPolicyV2.uncertaintyDeduction,
+    coverageThreshold: querySignalPolicyV2.coverageThreshold,
+    coverageAtThresholdIsInsufficient: true,
+  });
 }

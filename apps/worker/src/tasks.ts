@@ -55,6 +55,11 @@ export function createTaskList(
       if (!isIntakePayload(payload)) throw new Error('invalid_intake_job_payload');
       await processIntakeMetadata(pool, payload.intakeId, adapter, helpers.job.id);
     },
+    discovery_retrieve_v1: async (payload) => {
+      if (!isDiscoveryPayload(payload)) throw new Error('invalid_discovery_job_payload');
+      await processDiscoveryOperation(pool, payload);
+    },
+    // Compatibility aliases preserve already-durable Phase 06 outbox rows.
     phase06_discovery_v1: async (payload) => {
       if (!isDiscoveryPayload(payload)) throw new Error('invalid_discovery_job_payload');
       await processDiscoveryOperation(pool, payload);
@@ -62,6 +67,10 @@ export function createTaskList(
     phase06_semantic_v1: async (payload) => {
       if (!isDiscoveryPayload(payload)) throw new Error('invalid_semantic_job_payload');
       await processSemanticInterpretation(pool, payload);
+    },
+    refresh_watch_v2: async (payload) => {
+      if (!isWatchPayload(payload)) throw new Error('invalid_watch_job_payload');
+      await processWatchRefresh(pool, payload, adapter);
     },
     phase06_refresh_watch_v1: async (payload) => {
       if (!isWatchPayload(payload)) throw new Error('invalid_watch_job_payload');

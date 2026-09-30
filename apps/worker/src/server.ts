@@ -3,7 +3,7 @@ import {
   createGraphileJobQueue,
   createGitHubMetadataAdapter,
 } from '../../../packages/adapters/src/index.js';
-import { createPool, databaseUrl } from '../../../packages/db/src/index.js';
+import { createPool, databaseUrl, recoverDueWatches } from '../../../packages/db/src/index.js';
 import { dispatchOutbox } from './outbox.js';
 import { createTaskList } from './tasks.js';
 
@@ -39,8 +39,18 @@ const dispatch = async (): Promise<void> => {
     );
   });
 };
+const recoverSchedules = async (): Promise<void> => {
+  if (stopping) return;
+  await recoverDueWatches(pool).catch((error: unknown) => {
+    process.stderr.write(
+      `Watch recovery failed: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+  });
+};
+await recoverSchedules();
 await dispatch();
 const timer = setInterval(() => void dispatch(), 500);
+const recoveryTimer = setInterval(() => void recoverSchedules(), 30_000);
 const heartbeatTimer = setInterval(() => {
   void pool
     .query(
@@ -53,6 +63,7 @@ const shutdown = async (signal: string): Promise<void> => {
   if (stopping) return;
   stopping = true;
   clearInterval(timer);
+  clearInterval(recoveryTimer);
   clearInterval(heartbeatTimer);
   await runner.stop(signal);
   await queue.release();

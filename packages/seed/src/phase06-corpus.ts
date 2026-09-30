@@ -1,11 +1,12 @@
 import type { PoolClient } from 'pg';
 import { hashCanonical, stableUuid } from '../../domain/src/index.js';
 import { querySignalPolicyV1 } from '../../scoring/src/index.js';
+import { discoveryCorpusV1 } from './discovery-corpus.js';
 
 const namespace = 'maestro-ai:phase06:corpus-v1';
 const observedAt = '2026-09-29T12:00:00.000Z';
 
-interface CorpusRecord {
+export interface CorpusRecord {
   key: string;
   name: string;
   kind: string;
@@ -1450,4 +1451,5 @@ export async function importPhase06Knowledge(client: PoolClient): Promise<void> 
   }
 
   for (const record of phase06CorpusV1) await importProposedRecord(client, record);
+  for (const record of discoveryCorpusV1) await importProposedRecord(client, record);
 }

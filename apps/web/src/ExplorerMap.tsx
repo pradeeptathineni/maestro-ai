@@ -30,6 +30,8 @@ export function ExplorerMap({
 
   useEffect(() => {
     let disposed = false;
+    let resizeObserver: ResizeObserver | null = null;
+    let resizeFrame: number | null = null;
     async function render() {
       if (!container.current) return;
       setRenderState('loading');
@@ -88,9 +90,11 @@ export function ExplorerMap({
                   size: isGroup ? 72 : 22,
                   fill: isGroup
                     ? '#174235'
-                    : node.displayState === 'provisional'
-                      ? '#f2deb0'
-                      : '#dcebe2',
+                    : node.type === 'document'
+                      ? '#dce4f3'
+                      : node.displayState === 'provisional'
+                        ? '#f2deb0'
+                        : '#dcebe2',
                   stroke: isSelected ? '#de9c27' : '#225b48',
                   lineWidth: isSelected ? 4 : 1.5,
                 },
@@ -121,6 +125,15 @@ export function ExplorerMap({
         await graph.render();
         if (!disposed) {
           graphRef.current = graph;
+          resizeObserver = new ResizeObserver(() => {
+            if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
+            resizeFrame = requestAnimationFrame(() => {
+              resizeFrame = null;
+              graph.resize();
+              void graph.fitView({ when: 'overflow' });
+            });
+          });
+          resizeObserver.observe(container.current);
           setRenderState('ready');
         } else {
           graph.destroy();
@@ -132,6 +145,8 @@ export function ExplorerMap({
     void render();
     return () => {
       disposed = true;
+      resizeObserver?.disconnect();
+      if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
       graphRef.current?.destroy();
       graphRef.current = null;
     };
@@ -213,10 +228,13 @@ export function ExplorerMap({
           <i className="legend-dot provisional" /> Proposed item
         </span>
         <span>
+          <i className="legend-dot document" /> Knowledge document
+        </span>
+        <span>
           <i className="legend-dot group" /> Capability group
         </span>
         <span>
-          <i className="legend-line" /> Provides (query projection)
+          <i className="legend-line" /> Provides or is about a mechanism
         </span>
       </div>
       <section className="map-accessible-tree" aria-labelledby="map-tree-heading">

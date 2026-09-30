@@ -19,8 +19,9 @@ interface WatchRow {
   sourceId: string | null;
   querySessionId: string | null;
   cadence: 'manual' | 'daily' | 'weekly';
-  state: 'active' | 'paused';
+  state: 'active' | 'paused' | 'disabled';
   sourceWatermark: string | null;
+  failureCount: number;
 }
 
 interface CheckOptions {
@@ -35,9 +36,17 @@ function json(value: unknown): string {
   return JSON.stringify(value);
 }
 
-function nextDue(cadence: WatchRow['cadence'], from = new Date()): Date | null {
+function nextDue(
+  cadence: WatchRow['cadence'],
+  from = new Date(),
+  consecutiveFailures = 0,
+): Date | null {
   if (cadence === 'manual') return null;
-  return new Date(from.getTime() + (cadence === 'daily' ? 24 : 7 * 24) * 60 * 60 * 1000);
+  const cadenceMs = (cadence === 'daily' ? 24 : 7 * 24) * 60 * 60 * 1000;
+  const delayMs = consecutiveFailures
+    ? Math.min(cadenceMs, 15 * 60 * 1000 * 2 ** Math.min(consecutiveFailures - 1, 10))
+    : cadenceMs;
+  return new Date(from.getTime() + delayMs);
 }
 
 async function enqueueWatch(
@@ -49,7 +58,7 @@ async function enqueueWatch(
   await client.query(
     `INSERT INTO ops.outbox
        (id, operation_key, task_name, payload, state, available_at)
-     VALUES ($1, $2, 'phase06_refresh_watch_v1', $3, 'pending', $4)
+     VALUES ($1, $2, 'refresh_watch_v2', $3, 'pending', $4)
      ON CONFLICT (operation_key) DO NOTHING`,
     [
       newOpaqueId(),
@@ -68,7 +77,7 @@ async function readWatchForUpdate(
   const result = await client.query<WatchRow>(
     `SELECT id, workspace_id AS "workspaceId", provider_id AS "providerId",
             source_id AS "sourceId", query_session_id AS "querySessionId", cadence,
-            state, source_watermark AS "sourceWatermark"
+            state, source_watermark AS "sourceWatermark", failure_count AS "failureCount"
      FROM workspace.watches WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
     [watchId, workspaceId],
   );
@@ -143,6 +152,8 @@ export async function listWatches(pool: Pool, workspaceId: string): Promise<Json
             w.priority, w.state, w.last_checked_at AS "lastCheckedAt",
             w.last_succeeded_at AS "lastSucceededAt",
             w.source_watermark AS "sourceWatermark", w.next_due_at AS "nextDueAt",
+            w.failure_count AS "failureCount", w.lease_until AS "leaseUntil",
+            w.last_error_code AS "lastErrorCode",
             count(mc.id) FILTER (WHERE cns.disposition IS NULL)::int AS "pendingChangeCount"
      FROM workspace.watches w
      LEFT JOIN catalog.providers p ON p.id = w.provider_id
@@ -224,7 +235,8 @@ export async function recordWatchCheck(
       throw new DomainValidationError('A changed check requires a new watermark.');
     }
     const checkedAt = new Date();
-    const dueAt = nextDue(watch.cadence, checkedAt);
+    const failureCount = input.outcome === 'failed' ? Math.min(20, watch.failureCount + 1) : 0;
+    const dueAt = nextDue(watch.cadence, checkedAt, failureCount);
     let observationId: string | null = null;
     let change: JsonRow | null = null;
     if (input.outcome === 'changed') {
@@ -319,9 +331,19 @@ export async function recordWatchCheck(
        SET last_checked_at = $3,
            last_succeeded_at = CASE WHEN $4 = 'failed' THEN last_succeeded_at ELSE $3 END,
            source_watermark = CASE WHEN $4 = 'failed' THEN source_watermark ELSE $5 END,
-           next_due_at = $6, updated_at = now()
+           next_due_at = $6, failure_count = $7,
+           last_error_code = CASE WHEN $4 = 'failed' THEN 'refresh_failed' ELSE NULL END,
+           lease_token = NULL, lease_until = NULL, updated_at = now()
        WHERE id = $1 AND workspace_id = $2`,
-      [watchId, workspaceId, checkedAt, input.outcome, input.watermark ?? null, dueAt],
+      [
+        watchId,
+        workspaceId,
+        checkedAt,
+        input.outcome,
+        input.watermark ?? null,
+        dueAt,
+        failureCount,
+      ],
     );
     const adapterKey = await adapterForSource(client, watch.sourceId);
     if (adapterKey) {
@@ -414,7 +436,7 @@ export async function setChangeDisposition(
 async function reserveGitHubRefresh(pool: Pool): Promise<'reserved' | 'disabled' | 'denied'> {
   return inTransaction(pool, async (client) => {
     await client.query(
-      `SELECT pg_advisory_xact_lock(hashtext('phase06-external-daily-budget:' || current_date::text))`,
+      `SELECT pg_advisory_xact_lock(hashtext('discovery-external-daily-budget:' || current_date::text))`,
     );
     const config = await client.query<{ enabled: boolean; dailyLimit: number }>(
       `SELECT enabled, daily_call_limit AS "dailyLimit"
@@ -430,7 +452,7 @@ async function reserveGitHubRefresh(pool: Pool): Promise<'reserved' | 'disabled'
               COALESCE(max(reserved_calls) FILTER (WHERE adapter_key = 'github'), 0)::int AS adapter
        FROM ops.adapter_daily_budgets WHERE budget_date = current_date`,
     );
-    if (totals.rows[0]!.total >= 50 || totals.rows[0]!.adapter >= config.rows[0].dailyLimit) {
+    if (totals.rows[0]!.total >= 60 || totals.rows[0]!.adapter >= config.rows[0].dailyLimit) {
       await client.query(
         `UPDATE ops.adapter_daily_budgets
          SET denied_calls = denied_calls + 1, updated_at = now()
@@ -452,19 +474,22 @@ export async function processWatchRefresh(
   payload: { watchId: string; workspaceId: string },
   adapter: GitHubMetadataAdapter,
 ): Promise<void> {
+  const leaseToken = newOpaqueId();
   const target = await pool.query<{
     state: string;
     identity: string | null;
   }>(
-    `SELECT w.state, identity.normalized_value AS identity
-     FROM workspace.watches w
-     LEFT JOIN LATERAL (
-       SELECT normalized_value FROM catalog.provider_identities
-       WHERE provider_id = w.provider_id AND scheme = 'github_repository' AND valid_to IS NULL
-       ORDER BY is_canonical DESC, confidence DESC LIMIT 1
-     ) identity ON true
-     WHERE w.id = $1 AND w.workspace_id = $2`,
-    [payload.watchId, payload.workspaceId],
+    `UPDATE workspace.watches w
+     SET lease_token = $3, lease_until = now() + interval '5 minutes', updated_at = now()
+     WHERE w.id = $1 AND w.workspace_id = $2 AND w.state = 'active'
+       AND (w.lease_until IS NULL OR w.lease_until < now())
+     RETURNING w.state,
+       (SELECT normalized_value
+        FROM catalog.provider_identities
+        WHERE provider_id = w.provider_id AND scheme = 'github_repository' AND valid_to IS NULL
+        ORDER BY is_canonical DESC, confidence DESC LIMIT 1) AS identity
+    `,
+    [payload.watchId, payload.workspaceId, leaseToken],
   );
   if (!target.rowCount || target.rows[0]!.state !== 'active') return;
   if (!target.rows[0]!.identity) {
@@ -558,4 +583,42 @@ export async function processWatchRefresh(
       excerpt: json(result.metadata),
     },
   );
+}
+
+/**
+ * Re-arms every due watch whose prior worker lease expired. The outbox upsert is
+ * intentionally recoverable: a process crash after dispatch cannot strand the
+ * durable schedule forever, while the worker-side lease prevents concurrent
+ * refreshes for the same watch.
+ */
+export async function recoverDueWatches(pool: Pool, limit = 50): Promise<number> {
+  return inTransaction(pool, async (client) => {
+    const due = await client.query<{ id: string; workspaceId: string; nextDueAt: Date }>(
+      `SELECT id, workspace_id AS "workspaceId", next_due_at AS "nextDueAt"
+       FROM workspace.watches
+       WHERE state = 'active' AND cadence <> 'manual' AND next_due_at <= now()
+         AND (lease_until IS NULL OR lease_until < now())
+       ORDER BY priority DESC, next_due_at, id
+       FOR UPDATE SKIP LOCKED LIMIT $1`,
+      [Math.min(Math.max(limit, 1), 200)],
+    );
+    for (const watch of due.rows) {
+      await client.query(
+        `INSERT INTO ops.outbox
+           (id, operation_key, task_name, payload, state, available_at)
+         VALUES ($1, $2, 'refresh_watch_v2', $3, 'pending', now())
+         ON CONFLICT (operation_key) DO UPDATE
+           SET task_name = 'refresh_watch_v2', payload = EXCLUDED.payload,
+               state = 'pending', available_at = now(), attempts = 0,
+               last_error_code = NULL, dispatched_at = NULL
+           WHERE ops.outbox.state IN ('dispatched', 'failed')`,
+        [
+          newOpaqueId(),
+          `watch:${watch.id}:${watch.nextDueAt.toISOString()}`,
+          json({ watchId: watch.id, workspaceId: watch.workspaceId }),
+        ],
+      );
+    }
+    return due.rowCount ?? 0;
+  });
 }

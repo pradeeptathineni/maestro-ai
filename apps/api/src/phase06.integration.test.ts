@@ -7,8 +7,9 @@ import {
   createPool,
   processDiscoveryOperation,
   processSemanticInterpretation,
+  recoverDueWatches,
 } from '../../../packages/db/src/index.js';
-import { localWorkspaceId } from '../../../packages/seed/src/import.js';
+import { localWorkspaceId, referenceProjectContextId } from '../../../packages/seed/src/import.js';
 import { testDatabaseUrl } from '../../../packages/test-fixtures/src/database.js';
 import { buildApp } from './app.js';
 
@@ -81,7 +82,7 @@ describe('Phase 06 explorer and authoring contracts', () => {
     }>();
     expect(firstPage.resultSet).toMatchObject({
       id: session.resultSetId,
-      signalPolicyVersion: 'query-signal-v1',
+      signalPolicyVersion: 'query-signal-v2',
     });
     expect(firstPage.items).toHaveLength(5);
     const second = await app.inject({
@@ -195,6 +196,47 @@ describe('Phase 06 explorer and authoring contracts', () => {
     expect(items.every((item) => typeof item.signalDisplay === 'number')).toBe(true);
   });
 
+  it('keeps cached Corpus scoring equivalent to full Explorer materialization', async () => {
+    const session = await createSession('context compression');
+    const explorerResponse = await app.inject({
+      method: 'GET',
+      url: `/api/v1/explorer/result-sets/${session.resultSetId}?limit=50`,
+      headers: hostHeaders,
+    });
+    const explorerItem = explorerResponse
+      .json<{
+        items: Array<{
+          providerId: string;
+          signalDisplay: number;
+          evidenceCoverage: number;
+          displayState: string;
+        }>;
+      }>()
+      .items.find((item) => item.providerId);
+    expect(explorerItem).toBeDefined();
+
+    const corpusResponse = await app.inject({
+      method: 'POST',
+      url: '/api/v1/corpus/search',
+      headers: mutationHeaders,
+      payload: { query: 'context compression', layer: 'indexed_knowledge', limit: 50 },
+    });
+    expect(corpusResponse.statusCode).toBe(200);
+    const corpusItem = corpusResponse
+      .json<{
+        items: Array<Record<string, unknown> & { providerId: string }>;
+      }>()
+      .items.find((item) => item.providerId === explorerItem!.providerId);
+    expect(corpusItem).toMatchObject({
+      signalDisplay: explorerItem!.signalDisplay,
+      evidenceCoverage: explorerItem!.evidenceCoverage,
+      displayState: explorerItem!.displayState,
+    });
+    expect(corpusItem).not.toHaveProperty('valueProfile');
+    expect(corpusItem).not.toHaveProperty('cachedValueConservative');
+    expect(corpusItem).not.toHaveProperty('cachedEvidenceCoverage');
+  });
+
   it('keeps list, graph, detail, comparison, and portable export on one snapshot', async () => {
     const session = await createSession('ai context reduction github');
     const list = await app.inject({
@@ -230,7 +272,7 @@ describe('Phase 06 explorer and authoring contracts', () => {
     expect(detail.statusCode).toBe(200);
     expect(detail.json()).toMatchObject({
       resultSetId: session.resultSetId,
-      policyVersion: 'query-signal-v1',
+      policyVersion: 'query-signal-v2',
       valueInputs: expect.any(Array),
       evidence: expect.any(Array),
     });
@@ -254,6 +296,74 @@ describe('Phase 06 explorer and authoring contracts', () => {
       status: 'partial',
       valid: true,
     });
+  });
+
+  it('treats explanatory documents as first-class, inspectable, saveable results', async () => {
+    const session = await createSession('AI context reduction article');
+    const list = await app.inject({
+      method: 'GET',
+      url: `/api/v1/explorer/result-sets/${session.resultSetId}?limit=10`,
+      headers: hostHeaders,
+    });
+    const document = list
+      .json<{ items: Array<{ id: string; subjectType: string; kind: string }> }>()
+      .items.find((item) => item.subjectType === 'document');
+    expect(document).toBeDefined();
+    const detail = await app.inject({
+      method: 'GET',
+      url: `/api/v1/explorer/result-sets/${session.resultSetId}/items/${document!.id}`,
+      headers: hostHeaders,
+    });
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json()).toMatchObject({
+      subjectType: 'document',
+      valueInputs: expect.any(Array),
+      evidence: [expect.objectContaining({ dimensionKey: 'document_identity' })],
+    });
+    const saved = await app.inject({
+      method: 'POST',
+      url: `/api/v1/explorer/result-sets/${session.resultSetId}/shortlists`,
+      headers: mutationHeaders,
+      payload: {
+        projectContextId: referenceProjectContextId,
+        name: 'Knowledge document shortlist',
+        resultItemIds: [document!.id],
+      },
+    });
+    expect(saved.statusCode).toBe(201);
+    const stored = await pool.query<{ count: number }>(
+      `SELECT count(*)::int AS count FROM workspace.shortlist_document_items
+       WHERE shortlist_id = $1`,
+      [saved.json<{ id: string }>().id],
+    );
+    expect(stored.rows[0]!.count).toBe(1);
+  });
+
+  it('keeps representative model families visible in the broad AI landscape', async () => {
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/v1/explorer/sessions',
+      headers: mutationHeaders,
+      payload: { query: 'ai' },
+    });
+    expect(created.statusCode).toBe(201);
+    const session = created.json<{ resultSetId: string }>();
+    const page = await app.inject({
+      method: 'GET',
+      url: `/api/v1/explorer/result-sets/${session.resultSetId}?limit=20&sort=recommended`,
+      headers: hostHeaders,
+    });
+    expect(page.statusCode).toBe(200);
+    const names = page.json<{ items: Array<{ name: string }> }>().items.map((item) => item.name);
+    expect(names).toEqual(
+      expect.arrayContaining([
+        'OpenAI',
+        'GPT model family',
+        'Claude model family',
+        'Gemini model family',
+        'Llama model family',
+      ]),
+    );
   });
 
   it('creates an explicit immutable result revision only when maintained knowledge changes', async () => {
@@ -320,7 +430,7 @@ describe('Phase 06 explorer and authoring contracts', () => {
     ).toBe(10);
     const revisedPage = await app.inject({
       method: 'GET',
-      url: `/api/v1/explorer/result-sets/${nextResultSetId}?limit=50&sort=name`,
+      url: `/api/v1/explorer/result-sets/${nextResultSetId}?limit=50&sort=name&kind=practice`,
       headers: hostHeaders,
     });
     expect(revisedPage.json<{ items: Array<{ name: string }> }>().items).toContainEqual(
@@ -553,6 +663,39 @@ describe('Phase 06 explorer and authoring contracts', () => {
     expect(created.statusCode).toBe(201);
     expect(created.json()).toMatchObject({ name, publicationState: 'reviewed' });
 
+    const githubName = `Refreshable option ${randomUUID()}`;
+    const github = await app.inject({
+      method: 'POST',
+      url: '/api/v1/knowledge/options',
+      headers: mutationHeaders,
+      payload: {
+        name: githubName,
+        kind: 'oss_project',
+        description: 'A repository-backed option that can enter the bounded refresh loop.',
+        canonicalUrl: 'https://github.com/DeepSeek-AI/FlashMLA',
+        sourceTitle: 'FlashMLA repository',
+        sourceOwner: 'DeepSeek AI',
+        capabilityKey: `optimized-attention-${randomUUID()}`,
+        capabilityName: 'Optimized attention kernels',
+        searchTerms: ['FlashMLA', 'attention', 'MLA'],
+        limitations: ['Repository metadata is not an independent performance evaluation.'],
+        reviewState: 'proposed',
+      },
+    });
+    expect(github.statusCode).toBe(201);
+    const githubIdentity = await pool.query(
+      `SELECT scheme, normalized_value AS "normalizedValue", display_value AS "displayValue"
+       FROM catalog.provider_identities WHERE provider_id = $1`,
+      [github.json().id],
+    );
+    expect(githubIdentity.rows).toEqual([
+      {
+        scheme: 'github_repository',
+        normalizedValue: 'deepseek-ai/flashmla',
+        displayValue: 'https://github.com/DeepSeek-AI/FlashMLA',
+      },
+    ]);
+
     const blocked = await app.inject({
       method: 'POST',
       url: '/api/v1/knowledge/options',
@@ -616,9 +759,10 @@ describe('Phase 06 explorer and authoring contracts', () => {
     expect(requested.statusCode).toBe(201);
     expect(requested.json()).toMatchObject({
       externalDiscovery: { attempted: true, state: 'queued' },
-      discoveryOperations: [
+      discoveryOperations: expect.arrayContaining([
         expect.objectContaining({ adapterKey: 'github', state: 'queued', reservedCalls: 1 }),
-      ],
+        expect.objectContaining({ adapterKey: 'mcp_registry', state: 'skipped' }),
+      ]),
     });
     const operationId = requested.json<{
       discoveryOperations: Array<{ id: string }>;
@@ -688,7 +832,9 @@ describe('Phase 06 explorer and authoring contracts', () => {
       headers: hostHeaders,
     });
     expect(restored.json()).toMatchObject({
-      discoveryOperations: [expect.objectContaining({ id: operationId, state: 'complete' })],
+      discoveryOperations: expect.arrayContaining([
+        expect.objectContaining({ id: operationId, state: 'complete' }),
+      ]),
     });
     const leadCorpus = await app.inject({
       method: 'POST',
@@ -1070,6 +1216,49 @@ describe('Phase 06 explorer and authoring contracts', () => {
     });
     expect(disposition.statusCode).toBe(200);
     expect(disposition.json()).toMatchObject({ disposition: 'reviewed' });
+  });
+
+  it('recovers due schedules idempotently and preserves explicit disable state', async () => {
+    const provider = await pool.query<{ id: string }>(
+      `SELECT p.id FROM catalog.providers p
+       WHERE NOT EXISTS (
+         SELECT 1 FROM workspace.watches w
+         WHERE w.workspace_id = $1 AND w.provider_id = p.id AND w.cadence = 'daily'
+       )
+       ORDER BY p.id LIMIT 1`,
+      [localWorkspaceId],
+    );
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/v1/watches',
+      headers: mutationHeaders,
+      payload: { providerId: provider.rows[0]!.id, cadence: 'daily', priority: 99 },
+    });
+    expect(created.statusCode).toBe(201);
+    const watchId = created.json<{ id: string }>().id;
+    await pool.query('DELETE FROM ops.outbox WHERE operation_key LIKE $1', [`watch:${watchId}:%`]);
+    await pool.query(
+      `UPDATE workspace.watches
+       SET next_due_at = now() - interval '1 minute', lease_token = NULL, lease_until = NULL
+       WHERE id = $1`,
+      [watchId],
+    );
+    expect(await recoverDueWatches(pool)).toBeGreaterThanOrEqual(1);
+    await recoverDueWatches(pool);
+    const outbox = await pool.query<{ count: number; taskName: string }>(
+      `SELECT count(*)::int AS count, max(task_name) AS "taskName"
+       FROM ops.outbox WHERE operation_key LIKE $1`,
+      [`watch:${watchId}:%`],
+    );
+    expect(outbox.rows[0]).toEqual({ count: 1, taskName: 'refresh_watch_v2' });
+    const disabled = await app.inject({
+      method: 'PUT',
+      url: `/api/v1/watches/${watchId}/state`,
+      headers: mutationHeaders,
+      payload: { state: 'disabled' },
+    });
+    expect(disabled.statusCode).toBe(200);
+    expect(disabled.json()).toMatchObject({ state: 'disabled', nextDueAt: null });
   });
 
   it('binds new fit evidence relationally and rejects a cross-provider reference', async () => {

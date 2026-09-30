@@ -134,7 +134,11 @@ export type ExplorerQueryBody = Static<typeof ExplorerQueryBodySchema>;
 
 const CorpusFilterSchema = Type.Object({
   layer: Type.Optional(
-    Type.Union([Type.Literal('indexed_knowledge'), Type.Literal('source_lead')]),
+    Type.Union([
+      Type.Literal('indexed_knowledge'),
+      Type.Literal('knowledge_document'),
+      Type.Literal('source_lead'),
+    ]),
   ),
   state: Type.Optional(
     Type.Union([
@@ -162,6 +166,7 @@ export const ResultPageQuerySchema = Type.Object({
   limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
   sort: Type.Optional(
     Type.Union([
+      Type.Literal('recommended'),
       Type.Literal('signal'),
       Type.Literal('relevance'),
       Type.Literal('evidence'),
@@ -271,6 +276,7 @@ export const DiscoveryRequestBodySchema = Type.Object({
     Type.Literal('github'),
     Type.Literal('mcp_registry'),
     Type.Literal('searxng'),
+    Type.Literal('hacker_news'),
   ]),
   approvedPublicQuery: Type.String({ minLength: 1, maxLength: 300 }),
   idempotencyKey: Type.String({ minLength: 1, maxLength: 120 }),
@@ -318,7 +324,7 @@ export const WatchBodySchema = Type.Object({
 export type WatchBody = Static<typeof WatchBodySchema>;
 
 export const WatchStateBodySchema = Type.Object({
-  state: Type.Union([Type.Literal('active'), Type.Literal('paused')]),
+  state: Type.Union([Type.Literal('active'), Type.Literal('paused'), Type.Literal('disabled')]),
 });
 export type WatchStateBody = Static<typeof WatchStateBodySchema>;
 

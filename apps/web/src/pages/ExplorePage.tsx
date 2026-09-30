@@ -119,7 +119,7 @@ export function ExplorePage() {
   const [question, setQuestion] = useState('');
   const [clarification, setClarification] = useState('');
   const [view, setView] = useState<'list' | 'map'>('list');
-  const [sort, setSort] = useState('signal');
+  const [sort, setSort] = useState('recommended');
   const [kind, setKind] = useState('');
   const [evidenceState, setEvidenceState] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -226,10 +226,15 @@ export function ExplorePage() {
       setComparison(null);
       setDiscoveryOperationIds(session.discoveryOperations.map((operation) => operation.id));
       setClarification('');
+      const activeOperationCount = session.discoveryOperations.filter((operation) =>
+        ['queued', 'running'].includes(operation.state),
+      ).length;
       setNotice(
-        session.discoveryOperations.length
-          ? `${session.counts.assessed} indexed results are ready. ${session.discoveryOperations.length} connected source search${session.discoveryOperations.length === 1 ? ' is' : 'es are'} running.`
-          : `${session.counts.assessed} indexed results are ready. No connected source is enabled.`,
+        activeOperationCount
+          ? `${session.counts.assessed} indexed results are ready. ${activeOperationCount} connected source search${activeOperationCount === 1 ? ' is' : 'es are'} running.`
+          : session.discoveryOperations.length
+            ? `${session.counts.assessed} indexed results are ready. The source plan was recorded; no connected source request was queued.`
+            : `${session.counts.assessed} indexed results are ready. No connected source is enabled.`,
       );
       void client.invalidateQueries({ queryKey: ['explorer-history'] });
     },
@@ -384,6 +389,10 @@ export function ExplorePage() {
     (left, right) =>
       right.signalDisplay - left.signalDisplay || left.title.localeCompare(right.title),
   );
+  const connectedSearchesPending = discoveryOperations.some(
+    (operation) =>
+      operation.isPending || ['queued', 'running'].includes(operation.data?.state ?? ''),
+  );
 
   function toggleComparison(id: string): void {
     setComparison(null);
@@ -398,7 +407,10 @@ export function ExplorePage() {
 
   return (
     <div className="page-shell explorer-page">
-      <section className="explorer-hero" aria-labelledby="explorer-heading">
+      <section
+        className={`explorer-hero${results.data ? ' populated' : ''}`}
+        aria-labelledby="explorer-heading"
+      >
         <p className="eyebrow">Technology search</p>
         <h1 id="explorer-heading">Find existing tools for what you need</h1>
         <p>
@@ -529,6 +541,54 @@ export function ExplorePage() {
                 </div>
               </div>
             </div>
+            {interpretation?.landscapeFacets.length ? (
+              <div className="landscape-overview" aria-labelledby="landscape-heading">
+                <div>
+                  <strong id="landscape-heading">Landscape lenses</strong>
+                  <span>
+                    Broad intent: {label(interpretation.intentMode)}. Choose a lens to create a new,
+                    explicit snapshot.
+                  </span>
+                </div>
+                <div className="landscape-lenses">
+                  {interpretation.landscapeFacets.map((facet) => (
+                    <button
+                      key={facet}
+                      type="button"
+                      onClick={() =>
+                        runQuery.mutate({
+                          query: results.data.resultSet.query,
+                          searchConnectedSources: true,
+                          explicitFacets: { landscape_focus: facet },
+                        })
+                      }
+                    >
+                      {facet}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+            {results.data.resultSet.queryPlan ? (
+              <div className="query-plan" aria-labelledby="query-plan-heading">
+                <div>
+                  <strong id="query-plan-heading">Inspectable source plan</strong>
+                  <span>{results.data.resultSet.queryPlan.policyVersion}</span>
+                </div>
+                <ul>
+                  {results.data.resultSet.queryPlan.routes.map((route) => (
+                    <li key={route.id}>
+                      <span>
+                        <strong>{label(route.adapterKey)}</strong>
+                        <StateBadge state={route.state} />
+                      </span>
+                      <code>{route.variant ?? 'No outbound query'}</code>
+                      <small>{route.reason}</small>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
             <p className="snapshot-meta">
               Snapshot r{results.data.resultSet.revision} · {visibleItems.length} shown of{' '}
               {results.data.filteredCount} filtered · {results.data.resultSet.availableCount}{' '}
@@ -575,73 +635,80 @@ export function ExplorePage() {
             </form>
           </details>
 
-          <section className="source-results" aria-labelledby="source-results-heading">
-            <div className="section-heading">
+          <details className="source-results">
+            <summary>
               <div>
                 <p className="eyebrow">Connected sources</p>
-                <h2 id="source-results-heading">Current source results</h2>
+                <strong>Source plan and live leads</strong>
               </div>
+              <span>{discoveryOperationIds.length} planned route states</span>
+            </summary>
+            <div className="source-results-body">
               <p className="hint">
                 Source results are scored immediately from query relevance and available metadata.
                 Low confidence remains visible until stronger evidence is attached.
               </p>
-            </div>
-            {discoveryOperationIds.length ? (
-              <>
-                <div className="source-status-row" aria-live="polite">
-                  {discoveryOperations.map((operation, index) => (
-                    <span key={discoveryOperationIds[index]}>
-                      <strong>{label(operation.data?.adapterKey ?? `source ${index + 1}`)}</strong>
-                      <StateBadge state={operation.data?.state ?? 'running'} />
-                    </span>
-                  ))}
-                </div>
-                {connectedCandidates.length ? (
-                  <div className="source-result-list">
-                    {connectedCandidates.map((candidate) => (
-                      <article className="source-result-row" key={candidate.id}>
-                        <div className="result-identity">
-                          <div className="card-topline">
-                            <Badge>{label(candidate.kindHint ?? 'source result')}</Badge>
-                            <Badge>{signalStateLabel(candidate.displayState)}</Badge>
-                          </div>
-                          <h3>{candidate.title}</h3>
-                          <p>{candidate.summary}</p>
-                        </div>
-                        <div className="query-signal">
-                          <strong>Signal {candidate.signalDisplay}</strong>
-                          <span>
-                            {label(candidate.relevanceOrdinal)} relevance ·{' '}
-                            {signalStateLabel(candidate.displayState)}
-                          </span>
-                          <small>
-                            {formatFractionPercent(candidate.evidenceCoverage)} evidence coverage
-                          </small>
-                        </div>
-                        <a
-                          className="button secondary compact"
-                          href={candidate.canonicalUri}
-                          rel="noreferrer"
-                          target="_blank"
-                        >
-                          Open source
-                        </a>
-                      </article>
+              {discoveryOperationIds.length ? (
+                <>
+                  <div className="source-status-row" aria-live="polite">
+                    {discoveryOperations.map((operation, index) => (
+                      <span key={discoveryOperationIds[index]}>
+                        <strong>
+                          {label(operation.data?.adapterKey ?? `source ${index + 1}`)}
+                        </strong>
+                        <StateBadge state={operation.data?.state ?? 'running'} />
+                      </span>
                     ))}
                   </div>
-                ) : (
-                  <p className="hint">
-                    Connected source searches are still running or returned no results.
-                  </p>
-                )}
-              </>
-            ) : (
-              <p className="source-empty">
-                No connected source is enabled. The local index still works without network access.{' '}
-                <Link to="/workspace#integrations">Configure sources</Link>
-              </p>
-            )}
-          </section>
+                  {connectedCandidates.length ? (
+                    <div className="source-result-list">
+                      {connectedCandidates.map((candidate) => (
+                        <article className="source-result-row" key={candidate.id}>
+                          <div className="result-identity">
+                            <div className="card-topline">
+                              <Badge>{label(candidate.kindHint ?? 'source result')}</Badge>
+                              <Badge>{signalStateLabel(candidate.displayState)}</Badge>
+                            </div>
+                            <h3>{candidate.title}</h3>
+                            <p>{candidate.summary}</p>
+                          </div>
+                          <div className="query-signal">
+                            <strong>Signal {candidate.signalDisplay}</strong>
+                            <span>
+                              {label(candidate.relevanceOrdinal)} relevance ·{' '}
+                              {signalStateLabel(candidate.displayState)}
+                            </span>
+                            <small>
+                              {formatFractionPercent(candidate.evidenceCoverage)} evidence coverage
+                            </small>
+                          </div>
+                          <a
+                            className="button secondary compact"
+                            href={candidate.canonicalUri}
+                            rel="noreferrer"
+                            target="_blank"
+                          >
+                            Open source
+                          </a>
+                        </article>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="hint">
+                      {connectedSearchesPending
+                        ? 'Connected source searches are still running.'
+                        : 'No live leads were returned. Route states above preserve skipped, unsupported, disabled, failed, and empty outcomes.'}
+                    </p>
+                  )}
+                </>
+              ) : (
+                <p className="source-empty">
+                  No connected source is enabled. The local index still works without network
+                  access. <Link to="/workspace#integrations">Configure sources</Link>
+                </p>
+              )}
+            </div>
+          </details>
 
           <section className="explorer-workbench" aria-labelledby="results-heading">
             <div className="workbench-toolbar">
@@ -662,10 +729,25 @@ export function ExplorePage() {
                 </button>
               </div>
             </div>
+            {view === 'list' && visibleItems[0] ? (
+              <button
+                className="top-result-glance"
+                onClick={() => inspect(visibleItems[0]!.id)}
+                type="button"
+              >
+                <span>Top result</span>
+                <strong>{visibleItems[0].name}</strong>
+                <small>
+                  {label(visibleItems[0].relevanceOrdinal)} match · {signalLabel(visibleItems[0])} ·{' '}
+                  {formatFractionPercent(visibleItems[0].evidenceCoverage)} evidence coverage
+                </small>
+              </button>
+            ) : null}
             <div className="result-controls">
               <label>
                 Sort
                 <select value={sort} onChange={(event) => setSort(event.target.value)}>
+                  <option value="recommended">Recommended</option>
                   <option value="signal">Query signal</option>
                   <option value="relevance">Relevance</option>
                   <option value="evidence">Evidence coverage</option>
@@ -964,14 +1046,25 @@ export function ExplorePage() {
               {detail.data.policyVersion} · {label(detail.data.relevanceOrdinal)} relevance
             </span>
           </div>
-          <button
-            className="button secondary"
-            disabled={watch.isPending}
-            onClick={() => watch.mutate(detail.data.providerId)}
-            type="button"
-          >
-            Track material changes weekly
-          </button>
+          {detail.data.providerId ? (
+            <button
+              className="button secondary"
+              disabled={watch.isPending}
+              onClick={() => watch.mutate(detail.data.providerId!)}
+              type="button"
+            >
+              Track material changes weekly
+            </button>
+          ) : detail.data.canonicalUri ? (
+            <a
+              className="button secondary"
+              href={detail.data.canonicalUri}
+              rel="noreferrer"
+              target="_blank"
+            >
+              Open document source
+            </a>
+          ) : null}
           <h3>Why it appears</h3>
           <p>{detail.data.explanation}</p>
           <h3>Signal calculation</h3>
@@ -980,7 +1073,9 @@ export function ExplorePage() {
               <div key={input.key}>
                 <strong>{label(input.key)}</strong>
                 <span>
-                  {input.state === 'missing' ? 'Missing' : `${input.adjusted.toFixed(1)} adjusted`}
+                  {input.adjusted === null
+                    ? label(input.state)
+                    : `${input.adjusted.toFixed(1)} adjusted`}
                 </span>
                 <small>
                   confidence {formatFractionPercent(input.confidence)} · coverage{' '}

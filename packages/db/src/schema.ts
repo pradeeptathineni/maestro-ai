@@ -1,3 +1,4 @@
+import { sql } from 'drizzle-orm';
 import {
   boolean,
   integer,
@@ -7,6 +8,7 @@ import {
   text,
   timestamp,
   unique,
+  uniqueIndex,
   uuid,
 } from 'drizzle-orm/pg-core';
 
@@ -777,6 +779,53 @@ export const knowledgeProjectionSources = catalog.table('knowledge_projection_so
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
+export const knowledgeDocuments = catalog.table('knowledge_documents', {
+  id: uuid().primaryKey(),
+  documentKind: text('document_kind').notNull(),
+  title: text().notNull(),
+  summary: text().notNull(),
+  canonicalUri: text('canonical_uri').notNull().unique(),
+  publisher: text().notNull(),
+  publicationState: text('publication_state').notNull(),
+  sourceObservationId: uuid('source_observation_id')
+    .notNull()
+    .references(() => sourceObservations.id),
+  searchText: text('search_text').notNull(),
+  aliases: text().array().notNull().default([]),
+  mechanismKeys: text('mechanism_keys').array().notNull().default([]),
+  valueProfile: jsonb('value_profile').notNull(),
+  contentDigest: text('content_digest').notNull(),
+  observedAt: timestamp('observed_at', { withTimezone: true }).notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const knowledgeDocumentSubjects = catalog.table(
+  'knowledge_document_subjects',
+  {
+    documentId: uuid('document_id')
+      .notNull()
+      .references(() => knowledgeDocuments.id),
+    providerId: uuid('provider_id').references(() => providers.id),
+    capabilityDefinitionId: uuid('capability_definition_id').references(
+      () => capabilityDefinitions.id,
+    ),
+    relationType: text('relation_type').notNull(),
+    sourceObservationId: uuid('source_observation_id')
+      .notNull()
+      .references(() => sourceObservations.id),
+    rationale: text().notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('knowledge_document_provider_subject_unique')
+      .on(table.documentId, table.providerId, table.relationType)
+      .where(sql`${table.providerId} IS NOT NULL`),
+    uniqueIndex('knowledge_document_capability_subject_unique')
+      .on(table.documentId, table.capabilityDefinitionId, table.relationType)
+      .where(sql`${table.capabilityDefinitionId} IS NOT NULL`),
+  ],
+);
+
 export const projectDisplayRevisions = workspace.table('project_display_revisions', {
   id: uuid().primaryKey(),
   workspaceId: uuid('workspace_id').notNull(),
@@ -851,6 +900,52 @@ export const queryResultSets = workspace.table('query_result_sets', {
   expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
 });
 
+export const queryPlans = workspace.table(
+  'query_plans',
+  {
+    id: uuid().primaryKey(),
+    workspaceId: uuid('workspace_id').notNull(),
+    querySessionId: uuid('query_session_id').notNull(),
+    policyVersion: text('policy_version').notNull(),
+    intentMode: text('intent_mode').notNull(),
+    plan: jsonb().notNull(),
+    planHash: text('plan_hash').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.querySessionId, table.policyVersion)],
+);
+
+export const queryDocumentResults = workspace.table(
+  'query_document_results',
+  {
+    id: uuid().primaryKey(),
+    workspaceId: uuid('workspace_id').notNull(),
+    resultSetId: uuid('result_set_id').notNull(),
+    documentId: uuid('document_id')
+      .notNull()
+      .references(() => knowledgeDocuments.id),
+    rankPosition: integer('rank_position').notNull(),
+    relevanceOrdinal: text('relevance_ordinal').notNull(),
+    relevanceValue: integer('relevance_value').notNull(),
+    relevanceAnchors: jsonb('relevance_anchors').notNull(),
+    matchedFields: text('matched_fields').array().notNull().default([]),
+    signalPolicyVersion: text('signal_policy_version').notNull(),
+    kindProfile: text('kind_profile').notNull(),
+    valueConservative: numeric('value_conservative', { precision: 9, scale: 6 }).notNull(),
+    signalUnrounded: numeric('signal_unrounded', { precision: 12, scale: 8 }).notNull(),
+    signalDisplay: integer('signal_display').notNull(),
+    evidenceCoverage: numeric('evidence_coverage', { precision: 9, scale: 6 }).notNull(),
+    valueInputs: jsonb('value_inputs').notNull(),
+    displayState: text('display_state').notNull(),
+    explanation: text().notNull(),
+    caveats: text().array().notNull().default([]),
+    missing: text().array().notNull().default([]),
+    inputHash: text('input_hash').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.resultSetId, table.documentId)],
+);
+
 export const querySignalRuns = workspace.table('query_signal_runs', {
   id: uuid().primaryKey(),
   workspaceId: uuid('workspace_id').notNull(),
@@ -921,6 +1016,13 @@ export const shortlistItems = workspace.table('shortlist_items', {
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
+export const shortlistDocumentItems = workspace.table('shortlist_document_items', {
+  shortlistId: uuid('shortlist_id').notNull(),
+  workspaceId: uuid('workspace_id').notNull(),
+  queryDocumentResultId: uuid('query_document_result_id').notNull(),
+  addedAt: timestamp('added_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const sourceAdapterConfigs = ops.table('source_adapter_configs', {
   adapterKey: text('adapter_key').primaryKey(),
   adapterVersion: text('adapter_version').notNull(),
@@ -969,6 +1071,10 @@ export const discoveryOperations = ops.table('discovery_operations', {
   resultCount: integer('result_count').notNull().default(0),
   errorCode: text('error_code'),
   safeDetail: text('safe_detail'),
+  planRouteId: text('plan_route_id'),
+  variantIndex: integer('variant_index').notNull().default(1),
+  routingReason: text('routing_reason'),
+  sourcePlanState: text('source_plan_state').notNull().default('planned'),
   startedAt: timestamp('started_at', { withTimezone: true }),
   finishedAt: timestamp('finished_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -1058,6 +1164,10 @@ export const watches = workspace.table('watches', {
   lastSucceededAt: timestamp('last_succeeded_at', { withTimezone: true }),
   sourceWatermark: text('source_watermark'),
   nextDueAt: timestamp('next_due_at', { withTimezone: true }),
+  failureCount: integer('failure_count').notNull().default(0),
+  leaseToken: uuid('lease_token'),
+  leaseUntil: timestamp('lease_until', { withTimezone: true }),
+  lastErrorCode: text('last_error_code'),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });

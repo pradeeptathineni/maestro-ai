@@ -19,7 +19,7 @@ interface WatchSummary {
   sourceUrl: string | null;
   cadence: string;
   priority: number;
-  state: 'active' | 'paused';
+  state: 'active' | 'paused' | 'disabled';
   lastCheckedAt: string | null;
   lastSucceededAt: string | null;
   nextDueAt: string | null;
@@ -207,6 +207,7 @@ function ContextFields({ context = {} }: { context?: Record<string, unknown> }) 
 export function WorkspacePage() {
   const queryClient = useQueryClient();
   const [showCreate, setShowCreate] = useState(false);
+  const [showKnowledgeForm, setShowKnowledgeForm] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [formError, setFormError] = useState('');
   const [notice, setNotice] = useState('');
@@ -240,6 +241,25 @@ export function WorkspacePage() {
     },
     onError: (error) =>
       setFormError(error instanceof Error ? error.message : 'Could not create project.'),
+  });
+  const createKnowledge = useMutation({
+    mutationFn: (body: Record<string, unknown>) =>
+      api<{ id: string; name: string; publicationState: string }>('/api/v1/knowledge/options', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
+    onSuccess: async (created) => {
+      setShowKnowledgeForm(false);
+      setNotice(
+        `${created.name} was added as ${label(created.publicationState)} public knowledge.`,
+      );
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['knowledge-coverage'] }),
+        queryClient.invalidateQueries({ queryKey: ['corpus'] }),
+      ]);
+    },
+    onError: (error) =>
+      setFormError(error instanceof Error ? error.message : 'Could not add public knowledge.'),
   });
   const reviseContext = useMutation({
     mutationFn: ({ project, context }: { project: Project; context: Record<string, unknown> }) =>
@@ -299,6 +319,25 @@ export function WorkspacePage() {
     setFormError('');
     const data = new FormData(event.currentTarget);
     createProject.mutate({ name: formString(data, 'name'), context: contextFromForm(data) });
+  }
+
+  function submitKnowledge(event: FormEvent<HTMLFormElement>): void {
+    event.preventDefault();
+    setFormError('');
+    const data = new FormData(event.currentTarget);
+    createKnowledge.mutate({
+      name: formString(data, 'name').trim(),
+      kind: formString(data, 'kind'),
+      description: formString(data, 'description').trim(),
+      canonicalUrl: formString(data, 'canonicalUrl').trim(),
+      sourceTitle: formString(data, 'sourceTitle').trim(),
+      sourceOwner: formString(data, 'sourceOwner').trim(),
+      capabilityKey: formString(data, 'capabilityKey').trim(),
+      capabilityName: formString(data, 'capabilityName').trim(),
+      searchTerms: lines(formString(data, 'searchTerms')),
+      limitations: lines(formString(data, 'limitations')),
+      reviewState: formString(data, 'reviewState'),
+    });
   }
 
   function submitRevision(event: FormEvent<HTMLFormElement>, project: Project): void {
@@ -430,6 +469,109 @@ export function WorkspacePage() {
           </div>
         </section>
       ) : null}
+      <section className="panel form-panel" aria-labelledby="knowledge-authoring-heading">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">Public knowledge</p>
+            <h2 id="knowledge-authoring-heading">Add a source-backed option</h2>
+          </div>
+          <button
+            className="button secondary compact"
+            type="button"
+            aria-expanded={showKnowledgeForm}
+            onClick={() => {
+              setFormError('');
+              setShowKnowledgeForm((current) => !current);
+            }}
+          >
+            {showKnowledgeForm ? 'Close form' : 'Add knowledge'}
+          </button>
+        </div>
+        <p className="section-intro">
+          Submit bounded metadata from a public HTTPS source. This creates an attributed option for
+          review; it does not install, execute, or approve the subject.
+        </p>
+        {showKnowledgeForm ? (
+          <form onSubmit={submitKnowledge}>
+            <div className="form-grid two-column">
+              <label>
+                Name
+                <input name="name" required maxLength={240} />
+              </label>
+              <label>
+                Kind
+                <select name="kind" defaultValue="oss_project">
+                  <option value="oss_project">Open-source project</option>
+                  <option value="library">Library</option>
+                  <option value="framework">Framework</option>
+                  <option value="model">Model</option>
+                  <option value="protocol">Protocol</option>
+                  <option value="practice">Practice</option>
+                  <option value="standard">Standard</option>
+                  <option value="service">Service</option>
+                  <option value="other">Other</option>
+                </select>
+              </label>
+            </div>
+            <label>
+              Public canonical URL
+              <input name="canonicalUrl" type="url" required maxLength={2048} />
+              <small>
+                HTTPS only. Local, private, credentialed, and non-standard-port URLs fail closed.
+              </small>
+            </label>
+            <label>
+              Description
+              <textarea name="description" required maxLength={2000} rows={4} />
+            </label>
+            <div className="form-grid two-column">
+              <label>
+                Source title
+                <input name="sourceTitle" required maxLength={500} />
+              </label>
+              <label>
+                Source owner
+                <input name="sourceOwner" required maxLength={240} />
+              </label>
+              <label>
+                Capability key
+                <input
+                  name="capabilityKey"
+                  required
+                  maxLength={120}
+                  pattern="[a-z0-9]+(?:-[a-z0-9]+)*"
+                  placeholder="optimized-attention-kernels"
+                />
+              </label>
+              <label>
+                Capability name
+                <input name="capabilityName" required maxLength={240} />
+              </label>
+            </div>
+            <label>
+              Search terms <small>One per line or comma-separated</small>
+              <textarea name="searchTerms" required rows={3} />
+            </label>
+            <label>
+              Limitations <small>One per line or comma-separated</small>
+              <textarea name="limitations" rows={3} />
+            </label>
+            <label>
+              Review state
+              <select name="reviewState" defaultValue="proposed">
+                <option value="proposed">Proposed — needs independent review</option>
+                <option value="reviewed">Reviewed — source scope checked by the submitter</option>
+              </select>
+            </label>
+            <InputError id="knowledge-form-error">{formError}</InputError>
+            <div className="form-actions">
+              <button className="button" disabled={createKnowledge.isPending}>
+                {createKnowledge.isPending ? 'Adding…' : 'Add source-backed option'}
+              </button>
+            </div>
+          </form>
+        ) : null}
+      </section>
       {integrations.data ? (
         <section
           id="integrations"
