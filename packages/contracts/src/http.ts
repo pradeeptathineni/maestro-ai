@@ -150,6 +150,7 @@ const CorpusFilterSchema = Type.Object({
   ),
   source: Type.Optional(Type.String({ maxLength: 120 })),
   kind: Type.Optional(Type.String({ maxLength: 80 })),
+  entityClass: Type.Optional(Type.String({ maxLength: 80 })),
   cursor: Type.Optional(Type.String({ maxLength: 800 })),
   limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
 });

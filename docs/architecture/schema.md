@@ -29,8 +29,25 @@ executable contract; this summary must not be used to infer a table that is not 
 
 The Phase 06 contract is split across migrations `0009`–`0014`: integrity/authoring, explorer
 snapshots, bounded discovery, query privacy controls, query-value projection cache, and optional
-semantic-adapter configuration. The readiness gate requires all fourteen repository migrations;
-catalog cardinality is diagnostic data, not readiness.
+semantic-adapter configuration. Phase 07 migration `0015` adds first-class knowledge documents,
+query plans, heterogeneous document results, source-route state, and restart-safe watch leases.
+
+Phase 08 migration `0016` adds a compatibility layer rather than replacing those records:
+
+- `facet_definitions`, `concept_schemes`, `concepts`, `concept_labels`, and `concept_relations`
+  represent versioned entity-class, interface, service-model, domain, capability, and document-type
+  semantics;
+- `knowledge_entities` gives existing providers and documents stable canonical subject identities;
+- immutable `knowledge_entity_revisions` and `knowledge_document_revisions` preserve current and
+  future corrections without rewriting the Phase 07 rows;
+- `entity_facet_assignments` binds orthogonal, evidence-qualified facets to subjects; and
+- `knowledge_relationships` projects old provider/document links into typed, directional,
+  evidence-bearing, revision-scoped relationships.
+
+Compatibility triggers project future writes through the historical provider/document APIs into
+the new layer. They do not reverse-sync or change old score, query, receipt, or provenance meaning.
+The readiness gate checks the ordered repository migrations; catalog cardinality remains diagnostic
+data rather than readiness.
 
 Drizzle declarations mirror queryable concepts but do not replace reviewed SQL. Startup never uses
 schema push. Corrections to immutable evidence, score, context, and decision records require a new

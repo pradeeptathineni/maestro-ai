@@ -58,6 +58,7 @@ describe('reviewed PostgreSQL contract', () => {
       '0013_query_value_projection_cache.sql',
       '0014_semantic_adapter_configuration.sql',
       '0015_discovery_intelligence.sql',
+      '0016_faceted_knowledge.sql',
     ]);
     expect(migrations.rows.every((row) => /^[a-f0-9]{64}$/.test(row.sha256))).toBe(true);
   });
@@ -168,7 +169,50 @@ describe('reviewed PostgreSQL contract', () => {
   });
 
   it('keeps reviewed SQL and Drizzle table/column declarations aligned', async () => {
-    expect(await checkSchemaDefinitions(pool)).toEqual({ checkedTables: 77, errors: [] });
+    expect(await checkSchemaDefinitions(pool)).toEqual({ checkedTables: 87, errors: [] });
+  });
+
+  it('projects every historical provider and document into the faceted knowledge model', async () => {
+    const counts = await pool.query<{
+      providers: number;
+      documents: number;
+      entities: number;
+      entityRevisions: number;
+      documentRevisions: number;
+      evidenceBearingRelationships: number;
+      relationships: number;
+    }>(`
+      SELECT
+        (SELECT count(*)::int FROM catalog.providers) AS providers,
+        (SELECT count(*)::int FROM catalog.knowledge_documents) AS documents,
+        (SELECT count(*)::int FROM catalog.knowledge_entities) AS entities,
+        (SELECT count(*)::int FROM catalog.knowledge_entity_revisions) AS "entityRevisions",
+        (SELECT count(*)::int FROM catalog.knowledge_document_revisions) AS "documentRevisions",
+        (SELECT count(*)::int FROM catalog.knowledge_relationships
+          WHERE evidence_basis <> '{}'::jsonb) AS "evidenceBearingRelationships",
+        (SELECT count(*)::int FROM catalog.knowledge_relationships) AS relationships
+    `);
+    expect(counts.rows[0]).toMatchObject({
+      entities: counts.rows[0]!.providers + counts.rows[0]!.documents,
+      entityRevisions: counts.rows[0]!.providers + counts.rows[0]!.documents,
+      documentRevisions: counts.rows[0]!.documents,
+      evidenceBearingRelationships: counts.rows[0]!.relationships,
+    });
+
+    const facets = await pool.query<{ facetKey: string; total: number }>(`
+      SELECT facet_key AS "facetKey", count(*)::int AS total
+      FROM catalog.concepts
+      GROUP BY facet_key
+      ORDER BY facet_key
+    `);
+    expect(facets.rows).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ facetKey: 'entity_class', total: 7 }),
+        expect.objectContaining({ facetKey: 'domain' }),
+        expect.objectContaining({ facetKey: 'capability' }),
+        expect.objectContaining({ facetKey: 'document_type', total: 5 }),
+      ]),
+    );
   });
 
   it('keeps first-class knowledge documents and their query results immutable', async () => {

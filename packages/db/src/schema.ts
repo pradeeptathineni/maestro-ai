@@ -826,6 +826,191 @@ export const knowledgeDocumentSubjects = catalog.table(
   ],
 );
 
+export const facetDefinitions = catalog.table('facet_definitions', {
+  facetKey: text('facet_key').primaryKey(),
+  label: text().notNull(),
+  description: text().notNull(),
+  selectionMode: text('selection_mode').notNull(),
+  displayOrder: integer('display_order').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const conceptSchemes = catalog.table(
+  'concept_schemes',
+  {
+    id: uuid().primaryKey(),
+    schemeKey: text('scheme_key').notNull(),
+    version: integer().notNull(),
+    title: text().notNull(),
+    status: text().notNull(),
+    sourceUri: text('source_uri'),
+    supersedesId: uuid('supersedes_id'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.schemeKey, table.version)],
+);
+
+export const concepts = catalog.table(
+  'concepts',
+  {
+    id: uuid().primaryKey(),
+    conceptSchemeId: uuid('concept_scheme_id')
+      .notNull()
+      .references(() => conceptSchemes.id),
+    facetKey: text('facet_key')
+      .notNull()
+      .references(() => facetDefinitions.facetKey),
+    stableKey: text('stable_key').notNull(),
+    preferredLabel: text('preferred_label').notNull(),
+    definition: text().notNull(),
+    status: text().notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.conceptSchemeId, table.stableKey)],
+);
+
+export const conceptLabels = catalog.table(
+  'concept_labels',
+  {
+    id: uuid().primaryKey(),
+    conceptId: uuid('concept_id')
+      .notNull()
+      .references(() => concepts.id),
+    label: text().notNull(),
+    normalizedLabel: text('normalized_label').notNull(),
+    labelKind: text('label_kind').notNull(),
+    locale: text().notNull().default('en'),
+    sourceObservationId: uuid('source_observation_id').references(() => sourceObservations.id),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.conceptId, table.normalizedLabel, table.labelKind, table.locale)],
+);
+
+export const conceptRelations = catalog.table('concept_relations', {
+  id: uuid().primaryKey(),
+  conceptSchemeId: uuid('concept_scheme_id')
+    .notNull()
+    .references(() => conceptSchemes.id),
+  subjectConceptId: uuid('subject_concept_id')
+    .notNull()
+    .references(() => concepts.id),
+  relationType: text('relation_type').notNull(),
+  objectConceptId: uuid('object_concept_id')
+    .notNull()
+    .references(() => concepts.id),
+  sourceObservationId: uuid('source_observation_id').references(() => sourceObservations.id),
+  evidenceBasis: jsonb('evidence_basis').notNull(),
+  confidence: numeric({ precision: 5, scale: 4 }).notNull(),
+  validFrom: timestamp('valid_from', { withTimezone: true }).notNull(),
+  validTo: timestamp('valid_to', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const knowledgeEntities = catalog.table('knowledge_entities', {
+  id: uuid().primaryKey(),
+  sourceKind: text('source_kind').notNull(),
+  providerId: uuid('provider_id').references(() => providers.id),
+  documentId: uuid('document_id').references(() => knowledgeDocuments.id),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const knowledgeEntityRevisions = catalog.table(
+  'knowledge_entity_revisions',
+  {
+    id: uuid().primaryKey(),
+    entityId: uuid('entity_id')
+      .notNull()
+      .references(() => knowledgeEntities.id),
+    revision: integer().notNull(),
+    entityClassConceptId: uuid('entity_class_concept_id')
+      .notNull()
+      .references(() => concepts.id),
+    entityClassFacetKey: text('entity_class_facet_key').notNull().default('entity_class'),
+    preferredLabel: text('preferred_label').notNull(),
+    summary: text().notNull(),
+    lifecycleState: text('lifecycle_state').notNull(),
+    sourceObservationId: uuid('source_observation_id').references(() => sourceObservations.id),
+    predecessorId: uuid('predecessor_id'),
+    contentHash: text('content_hash').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.entityId, table.revision)],
+);
+
+export const entityFacetAssignments = catalog.table(
+  'entity_facet_assignments',
+  {
+    id: uuid().primaryKey(),
+    entityId: uuid('entity_id')
+      .notNull()
+      .references(() => knowledgeEntities.id),
+    conceptId: uuid('concept_id')
+      .notNull()
+      .references(() => concepts.id),
+    facetKey: text('facet_key')
+      .notNull()
+      .references(() => facetDefinitions.facetKey),
+    origin: text().notNull(),
+    confidence: numeric({ precision: 5, scale: 4 }).notNull(),
+    rationale: text().notNull(),
+    sourceObservationId: uuid('source_observation_id').references(() => sourceObservations.id),
+    evidenceItemIds: uuid('evidence_item_ids').array().notNull().default([]),
+    validFrom: timestamp('valid_from', { withTimezone: true }).notNull(),
+    validTo: timestamp('valid_to', { withTimezone: true }),
+    supersedesId: uuid('supersedes_id'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.entityId, table.conceptId, table.validFrom)],
+);
+
+export const knowledgeRelationships = catalog.table('knowledge_relationships', {
+  id: uuid().primaryKey(),
+  subjectEntityId: uuid('subject_entity_id')
+    .notNull()
+    .references(() => knowledgeEntities.id),
+  relationType: text('relation_type').notNull(),
+  objectEntityId: uuid('object_entity_id').references(() => knowledgeEntities.id),
+  objectConceptId: uuid('object_concept_id').references(() => concepts.id),
+  direction: text().notNull(),
+  sourceObservationId: uuid('source_observation_id').references(() => sourceObservations.id),
+  evidenceItemIds: uuid('evidence_item_ids').array().notNull().default([]),
+  evidenceBasis: jsonb('evidence_basis').notNull(),
+  confidence: numeric({ precision: 5, scale: 4 }).notNull(),
+  revisionScope: jsonb('revision_scope').notNull(),
+  validFrom: timestamp('valid_from', { withTimezone: true }).notNull(),
+  validTo: timestamp('valid_to', { withTimezone: true }),
+  state: text().notNull(),
+  supersedesId: uuid('supersedes_id'),
+  legacySourceTable: text('legacy_source_table'),
+  legacySourceKey: text('legacy_source_key'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const knowledgeDocumentRevisions = catalog.table(
+  'knowledge_document_revisions',
+  {
+    id: uuid().primaryKey(),
+    documentId: uuid('document_id')
+      .notNull()
+      .references(() => knowledgeDocuments.id),
+    revision: integer().notNull(),
+    predecessorId: uuid('predecessor_id'),
+    supersedesDocumentId: uuid('supersedes_document_id').references(() => knowledgeDocuments.id),
+    title: text().notNull(),
+    summary: text().notNull(),
+    canonicalUri: text('canonical_uri').notNull(),
+    publicationState: text('publication_state').notNull(),
+    contentDigest: text('content_digest').notNull(),
+    sourceObservationId: uuid('source_observation_id')
+      .notNull()
+      .references(() => sourceObservations.id),
+    observedAt: timestamp('observed_at', { withTimezone: true }).notNull(),
+    changeKind: text('change_kind').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.documentId, table.revision)],
+);
+
 export const projectDisplayRevisions = workspace.table('project_display_revisions', {
   id: uuid().primaryKey(),
   workspaceId: uuid('workspace_id').notNull(),

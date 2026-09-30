@@ -12,6 +12,7 @@ export * from './migrate.js';
 export * from './schema.js';
 export * from './schema-check.js';
 export * from './semantic-repository.js';
+export * from './taxonomy-repository.js';
 export * from './transaction.js';
 export * from './workspace-repository.js';
 export * from './watch-repository.js';

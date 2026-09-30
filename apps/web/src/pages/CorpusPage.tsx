@@ -7,6 +7,7 @@ import { Badge, Empty, ErrorPanel, Loading, PageHeader } from '../ui.js';
 interface CorpusItem {
   id: string;
   layer: 'indexed_knowledge' | 'knowledge_document' | 'source_lead';
+  entityClass: string;
   providerId: string | null;
   name: string;
   summary: string;
@@ -36,6 +37,7 @@ interface CorpusResponse {
     states: Array<{ value: string; count: number }>;
     sources: Array<{ value: string; count: number }>;
     kinds: Array<{ value: string; count: number }>;
+    entityClasses: Array<{ value: string; count: number }>;
   };
   items: CorpusItem[];
   nextCursor: string | null;
@@ -55,7 +57,7 @@ export function CorpusPage() {
   const [previousCursors, setPreviousCursors] = useState<string[]>([]);
   const queryString = useMemo(() => {
     const query = new URLSearchParams();
-    for (const key of ['layer', 'state', 'source', 'kind', 'cursor']) {
+    for (const key of ['layer', 'state', 'source', 'kind', 'entityClass', 'cursor']) {
       const value = parameters.get(key);
       if (value) query.set(key, value);
     }
@@ -196,6 +198,20 @@ export function CorpusPage() {
             </select>
           </label>
           <label>
+            Entity class
+            <select
+              value={parameters.get('entityClass') ?? ''}
+              onChange={(event) => replaceParameter('entityClass', event.target.value)}
+            >
+              <option value="">All entity classes</option>
+              {corpus.data?.facets.entityClasses.map((facet) => (
+                <option key={facet.value} value={facet.value}>
+                  {label(facet.value)} ({facet.count})
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
             Kind
             <select
               value={parameters.get('kind') ?? ''}
@@ -263,6 +279,7 @@ export function CorpusPage() {
                               : 'Source lead'}
                         </Badge>
                         <Badge>{label(item.state)}</Badge>
+                        <Badge>{label(item.entityClass)}</Badge>
                         <Badge>{label(item.kind)}</Badge>
                       </div>
                       <h3>{item.name}</h3>

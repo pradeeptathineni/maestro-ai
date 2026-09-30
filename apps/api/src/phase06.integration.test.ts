@@ -143,6 +143,54 @@ describe('Phase 06 explorer and authoring contracts', () => {
     expect(medicalCorpus.json()).toMatchObject({ matchedCount: 0, items: [] });
   });
 
+  it('serves versioned data-backed facets and filters Corpus by entity class', async () => {
+    const taxonomy = await app.inject({
+      method: 'GET',
+      url: '/api/v1/taxonomy/facets',
+      headers: hostHeaders,
+    });
+    expect(taxonomy.statusCode).toBe(200);
+    const body = taxonomy.json<{
+      semantics: string;
+      facets: Array<{
+        key: string;
+        values: Array<{ stableKey: string; count: number; scheme: { version: number } }>;
+      }>;
+    }>();
+    expect(body.semantics).toContain('independent facets');
+    expect(body.facets.map((facet) => facet.key)).toEqual([
+      'entity_class',
+      'interface',
+      'service_model',
+      'domain',
+      'capability',
+      'document_type',
+    ]);
+    expect(body.facets.find((facet) => facet.key === 'entity_class')?.values).toContainEqual(
+      expect.objectContaining({
+        stableKey: 'entity-class:implementation',
+        count: expect.any(Number),
+        scheme: expect.objectContaining({ version: 1 }),
+      }),
+    );
+
+    const documents = await app.inject({
+      method: 'GET',
+      url: '/api/v1/corpus?entityClass=document&limit=50',
+      headers: hostHeaders,
+    });
+    expect(documents.statusCode).toBe(200);
+    const documentBody = documents.json<{
+      facets: { entityClasses: Array<{ value: string; count: number }> };
+      items: Array<{ entityClass: string; layer: string }>;
+    }>();
+    expect(documentBody.facets.entityClasses).toContainEqual(
+      expect.objectContaining({ value: 'document' }),
+    );
+    expect(documentBody.items.length).toBeGreaterThan(0);
+    expect(documentBody.items.every((item) => item.entityClass === 'document')).toBe(true);
+  });
+
   it('dogfoods the explorer with a signal estimate for every returned tool', async () => {
     const session = await createSession(
       'ai coding agent repository skills hooks runtime verification orchestration multi-model integrations',

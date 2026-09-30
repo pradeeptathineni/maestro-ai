@@ -21,6 +21,7 @@ type CorpusLayer = 'indexed_knowledge' | 'knowledge_document' | 'source_lead';
 interface CorpusRow {
   id: string;
   layer: CorpusLayer;
+  entityClass: string;
   providerId: string | null;
   documentId: string | null;
   name: string;
@@ -132,7 +133,7 @@ function cachedImplementationSignal(
 
 function countFacets(
   rows: ScoredCorpusRow[],
-  key: 'kind' | 'state',
+  key: 'entityClass' | 'kind' | 'state',
 ): Array<{
   value: string;
   count: number;
@@ -254,6 +255,7 @@ async function loadCorpus(pool: Pool, workspaceId: string): Promise<CorpusRow[]>
        ORDER BY dc.canonical_uri, dc.created_at DESC, dc.id DESC
      )
      SELECT kp.id::text AS id, 'indexed_knowledge'::text AS layer,
+            COALESCE(revision_data."entityClass", 'implementation') AS "entityClass",
             kp.provider_id::text AS "providerId", NULL::text AS "documentId",
             kp.preferred_label AS name,
             kp.summary, kp.kind_profile AS kind, kp.publication_state AS state,
@@ -269,6 +271,16 @@ async function loadCorpus(pool: Pool, workspaceId: string): Promise<CorpusRow[]>
             kp.query_evidence_coverage::float8 AS "cachedEvidenceCoverage",
             NULL::jsonb AS "sourcePayload"
      FROM catalog.knowledge_projections kp
+     LEFT JOIN catalog.knowledge_entities entity ON entity.provider_id = kp.provider_id
+     LEFT JOIN LATERAL (
+       SELECT replace(class_concept.stable_key, 'entity-class:', '') AS "entityClass"
+       FROM catalog.knowledge_entity_revisions entity_revision
+       JOIN catalog.concepts class_concept
+         ON class_concept.id = entity_revision.entity_class_concept_id
+       WHERE entity_revision.entity_id = entity.id
+       ORDER BY entity_revision.revision DESC, entity_revision.created_at DESC
+       LIMIT 1
+     ) revision_data ON true
      LEFT JOIN LATERAL (
        SELECT array_agg(DISTINCT source.source_type ORDER BY source.source_type) AS sources,
               (array_agg(source.canonical_uri ORDER BY observation.observed_at DESC, source.id))[1]
@@ -284,6 +296,7 @@ async function loadCorpus(pool: Pool, workspaceId: string): Promise<CorpusRow[]>
        AND (kp.expires_at IS NULL OR kp.expires_at > now())
      UNION ALL
      SELECT kd.id::text AS id, 'knowledge_document'::text AS layer,
+            'document'::text AS "entityClass",
             NULL::text AS "providerId", kd.id::text AS "documentId", kd.title AS name,
             kd.summary, kd.document_kind AS kind, kd.publication_state AS state,
             kd.aliases, kd.mechanism_keys AS capabilities, kd.search_text AS "searchText",
@@ -297,7 +310,8 @@ async function loadCorpus(pool: Pool, workspaceId: string): Promise<CorpusRow[]>
      JOIN catalog.sources s ON s.id = so.source_id
      WHERE kd.publication_state <> 'withdrawn'
      UNION ALL
-     SELECT lead.id::text AS id, 'source_lead'::text AS layer, NULL::text AS "providerId",
+     SELECT lead.id::text AS id, 'source_lead'::text AS layer,
+            'lead'::text AS "entityClass", NULL::text AS "providerId",
             NULL::text AS "documentId",
             lead.title AS name, lead.summary, COALESCE(lead.kind_hint, 'other') AS kind,
             'lead'::text AS state, ARRAY[]::text[] AS aliases, ARRAY[]::text[] AS capabilities,
@@ -337,6 +351,7 @@ export async function listResearchCorpus(
     state: query.state ?? null,
     source: query.source ?? null,
     kind: query.kind ?? null,
+    entityClass: query.entityClass ?? null,
   };
   const viewHash = hashCanonical(view);
   const offset = decodeCursor(query.cursor, viewHash);
@@ -365,12 +380,14 @@ export async function listResearchCorpus(
     states: countFacets(matched, 'state'),
     sources: sourceFacets(matched),
     kinds: countFacets(matched, 'kind'),
+    entityClasses: countFacets(matched, 'entityClass'),
   };
   const filtered = matched
     .filter((row) => !query.layer || row.layer === query.layer)
     .filter((row) => !query.state || row.state === query.state)
     .filter((row) => !query.source || row.sources.includes(query.source))
     .filter((row) => !query.kind || row.kind === query.kind)
+    .filter((row) => !query.entityClass || row.entityClass === query.entityClass)
     .sort((left, right) => {
       if (normalizedQuery) {
         return (
