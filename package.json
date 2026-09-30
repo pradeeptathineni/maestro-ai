@@ -29,6 +29,7 @@
     "dev:worker": "node --env-file-if-exists=.env --import tsx --watch apps/worker/src/server.ts",
     "eval:phase06": "node --import tsx scripts/evaluate-phase06.ts",
     "eval:phase07": "node --import tsx scripts/evaluate-phase07.ts",
+    "eval:phase08": "node --import tsx scripts/evaluate-phase08.ts",
     "study:discovery-live": "node --import tsx scripts/run-discovery-live-study.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
