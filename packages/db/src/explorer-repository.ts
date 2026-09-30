@@ -39,6 +39,7 @@ import {
   type QuerySignalResult,
   type QueryValueInput,
 } from '../../scoring/src/index.js';
+import { postgresPrefixTsQuery, uniqueCandidateTerms } from './candidate-search.js';
 import { DomainValidationError, NotFoundError } from './errors.js';
 import { loadQueryKnowledge } from './taxonomy-repository.js';
 import { inTransaction } from './transaction.js';
@@ -115,6 +116,15 @@ interface RetrievalIndex {
   projectionCount: number;
   documentCount: number;
   indexRevision: string;
+  candidateSelection: {
+    policyVersion: 'postgres-lexical-concept-candidates-v1';
+    applied: boolean;
+    threshold: number;
+    providerLimit: number | null;
+    documentLimit: number | null;
+    selectedProviderCount: number;
+    selectedDocumentCount: number;
+  };
 }
 
 interface ResultItemRow extends JsonRow {
@@ -225,7 +235,47 @@ function retrievalRelevance(
   };
 }
 
-async function loadRetrievalIndex(client: PoolClient): Promise<RetrievalIndex> {
+const retrievalCandidateThreshold = 5_000;
+const retrievalCandidateLimit = 100;
+const retrievalCandidateOverfetch = 300;
+
+function postgresRetrievalQuery(interpretation: QueryInterpretation): string {
+  return postgresPrefixTsQuery(
+    uniqueCandidateTerms([
+      interpretation.terms,
+      interpretation.expandedTerms,
+      interpretation.canonicalConcepts,
+      interpretation.mechanismTerms,
+    ]),
+  );
+}
+
+async function loadRetrievalIndex(
+  client: PoolClient,
+  interpretation: QueryInterpretation,
+): Promise<RetrievalIndex> {
+  const counts = await client.query<{ providers: number; documents: number }>(`
+    SELECT
+      (SELECT count(*)::int FROM catalog.knowledge_projections kp
+       WHERE kp.publication_state <> 'withdrawn'
+         AND (kp.expires_at IS NULL OR kp.expires_at > now())) AS providers,
+      (SELECT count(*)::int FROM catalog.knowledge_documents document
+       WHERE document.publication_state <> 'withdrawn') AS documents
+  `);
+  const totalProviders = counts.rows[0]!.providers;
+  const totalDocuments = counts.rows[0]!.documents;
+  const pruneCandidates = totalProviders + totalDocuments > retrievalCandidateThreshold;
+  const tsQuery = postgresRetrievalQuery(interpretation);
+  const resolvedConceptIds = interpretation.resolvedConcepts.map((concept) => concept.conceptId);
+  const exactEntityIds = interpretation.exactEntities.map((entity) => entity.entityId);
+  const candidateTerms = uniqueCandidateTerms([
+    interpretation.terms,
+    interpretation.expandedTerms,
+    interpretation.canonicalConcepts,
+    interpretation.mechanismTerms,
+  ]);
+  const providerLimit = pruneCandidates ? retrievalCandidateLimit : Math.max(totalProviders, 1);
+  const documentLimit = pruneCandidates ? retrievalCandidateLimit : Math.max(totalDocuments, 1);
   const providers = await client.query<{
     providerId: string;
     entityId: string;
@@ -238,7 +288,70 @@ async function loadRetrievalIndex(client: PoolClient): Promise<RetrievalIndex> {
     concepts: RetrievalDocument['concepts'];
     projectionId: string;
     providerRevision: number;
-  }>(`
+  }>(
+    `
+    WITH priority_projection_ids AS (
+      SELECT kp.id,
+             CASE WHEN entity.id = ANY($3::uuid[]) THEN 0 ELSE 1 END AS selection_priority
+      FROM catalog.knowledge_projections kp
+      JOIN catalog.knowledge_entities entity ON entity.provider_id = kp.provider_id
+      WHERE $1::boolean
+        AND kp.publication_state <> 'withdrawn'
+        AND (kp.expires_at IS NULL OR kp.expires_at > now())
+        AND (
+          entity.id = ANY($3::uuid[])
+          OR EXISTS (
+            SELECT 1 FROM catalog.entity_facet_assignments selected_assignment
+            WHERE selected_assignment.entity_id = entity.id
+              AND selected_assignment.concept_id = ANY($4::uuid[])
+              AND selected_assignment.valid_to IS NULL
+          )
+        )
+    ), lexical_projection_ids AS (
+      SELECT kp.id, 2 AS selection_priority
+      FROM catalog.knowledge_projections kp
+      WHERE $1::boolean
+        AND kp.publication_state <> 'withdrawn'
+        AND (kp.expires_at IS NULL OR kp.expires_at > now())
+        AND (
+          kp.aliases && $6::text[]
+          OR kp.capability_keys && $6::text[]
+          OR to_tsvector(
+               'simple'::regconfig,
+               kp.preferred_label || ' ' || kp.summary || ' ' || kp.search_text
+             ) @@ to_tsquery('simple'::regconfig, NULLIF($2, ''))
+        )
+      ORDER BY kp.id
+      LIMIT $7
+    ), all_projection_ids AS (
+      SELECT kp.id, 2 AS selection_priority
+      FROM catalog.knowledge_projections kp
+      WHERE NOT $1::boolean
+        AND kp.publication_state <> 'withdrawn'
+        AND (kp.expires_at IS NULL OR kp.expires_at > now())
+    ), candidate_projection_ids AS (
+      SELECT id, min(selection_priority) AS selection_priority
+      FROM (
+        SELECT * FROM priority_projection_ids
+        UNION ALL SELECT * FROM lexical_projection_ids
+        UNION ALL SELECT * FROM all_projection_ids
+      ) candidates
+      GROUP BY id
+    ), selected_projections AS (
+      SELECT kp.id, candidates.selection_priority,
+             ts_rank_cd(
+               to_tsvector(
+                 'simple'::regconfig,
+                 kp.preferred_label || ' ' || kp.summary || ' ' || kp.search_text
+               ),
+               to_tsquery('simple'::regconfig, NULLIF($2, ''))
+             ) AS lexical_rank
+      FROM candidate_projection_ids candidates
+      JOIN catalog.knowledge_projections kp ON kp.id = candidates.id
+      ORDER BY candidates.selection_priority, lexical_rank DESC,
+               kp.preferred_label, kp.provider_id
+      LIMIT $5
+    )
     SELECT kp.provider_id AS "providerId", entity.id AS "entityId",
            COALESCE(replace(class_concept.stable_key, 'entity-class:', ''), 'implementation')
              AS "entityClass",
@@ -247,7 +360,8 @@ async function loadRetrievalIndex(client: PoolClient): Promise<RetrievalIndex> {
            COALESCE(identity_data.identity_keys, '{}') AS "identityKeys",
            COALESCE(facets.concepts, '[]'::jsonb) AS concepts,
            kp.id AS "projectionId", kp.provider_revision AS "providerRevision"
-    FROM catalog.knowledge_projections kp
+    FROM selected_projections selected
+    JOIN catalog.knowledge_projections kp ON kp.id = selected.id
     JOIN catalog.knowledge_entities entity ON entity.provider_id = kp.provider_id
     LEFT JOIN LATERAL (
       SELECT revision.entity_class_concept_id
@@ -277,10 +391,19 @@ async function loadRetrievalIndex(client: PoolClient): Promise<RetrievalIndex> {
       JOIN catalog.concepts concept ON concept.id = assignment.concept_id
       WHERE assignment.entity_id = entity.id AND assignment.valid_to IS NULL
     ) facets ON true
-    WHERE kp.publication_state <> 'withdrawn'
-      AND (kp.expires_at IS NULL OR kp.expires_at > now())
-    ORDER BY kp.preferred_label, kp.provider_id
-  `);
+    ORDER BY selected.selection_priority, selected.lexical_rank DESC,
+             kp.preferred_label, kp.provider_id
+  `,
+    [
+      pruneCandidates,
+      tsQuery,
+      exactEntityIds,
+      resolvedConceptIds,
+      providerLimit,
+      candidateTerms,
+      retrievalCandidateOverfetch,
+    ],
+  );
   const documents = await client.query<{
     documentId: string;
     entityId: string;
@@ -292,7 +415,47 @@ async function loadRetrievalIndex(client: PoolClient): Promise<RetrievalIndex> {
     canonicalUri: string;
     contentDigest: string;
     concepts: RetrievalDocument['concepts'];
-  }>(`
+  }>(
+    `
+    WITH selected_documents AS (
+      SELECT document.id,
+             CASE WHEN NOT $1::boolean THEN 2
+                  WHEN entity.id = ANY($3::uuid[]) THEN 0
+                  WHEN EXISTS (
+                    SELECT 1 FROM catalog.entity_facet_assignments selected_assignment
+                    WHERE selected_assignment.entity_id = entity.id
+                      AND selected_assignment.concept_id = ANY($4::uuid[])
+                      AND selected_assignment.valid_to IS NULL
+                  ) THEN 1 ELSE 2 END AS selection_priority,
+             ts_rank_cd(
+               to_tsvector(
+                 'simple'::regconfig,
+                 document.title || ' ' || document.summary || ' ' || document.search_text
+               ),
+               to_tsquery('simple'::regconfig, NULLIF($2, ''))
+             ) AS lexical_rank
+      FROM catalog.knowledge_documents document
+      JOIN catalog.knowledge_entities entity ON entity.document_id = document.id
+      WHERE document.publication_state <> 'withdrawn'
+        AND (
+          NOT $1::boolean
+          OR entity.id = ANY($3::uuid[])
+          OR EXISTS (
+            SELECT 1 FROM catalog.entity_facet_assignments selected_assignment
+            WHERE selected_assignment.entity_id = entity.id
+              AND selected_assignment.concept_id = ANY($4::uuid[])
+              AND selected_assignment.valid_to IS NULL
+          )
+          OR document.aliases && $6::text[]
+          OR document.mechanism_keys && $6::text[]
+          OR to_tsvector(
+               'simple'::regconfig,
+               document.title || ' ' || document.summary || ' ' || document.search_text
+             ) @@ to_tsquery('simple'::regconfig, NULLIF($2, ''))
+        )
+      ORDER BY selection_priority, lexical_rank DESC, document.title, document.id
+      LIMIT $5
+    )
     SELECT document.id AS "documentId", entity.id AS "entityId",
            COALESCE(replace(class_concept.stable_key, 'entity-class:', ''), 'document')
              AS "entityClass",
@@ -300,7 +463,8 @@ async function loadRetrievalIndex(client: PoolClient): Promise<RetrievalIndex> {
            document.search_text AS "searchText", document.canonical_uri AS "canonicalUri",
            document.content_digest AS "contentDigest",
            COALESCE(facets.concepts, '[]'::jsonb) AS concepts
-    FROM catalog.knowledge_documents document
+    FROM selected_documents selected
+    JOIN catalog.knowledge_documents document ON document.id = selected.id
     JOIN catalog.knowledge_entities entity ON entity.document_id = document.id
     LEFT JOIN LATERAL (
       SELECT revision.entity_class_concept_id
@@ -322,9 +486,11 @@ async function loadRetrievalIndex(client: PoolClient): Promise<RetrievalIndex> {
       JOIN catalog.concepts concept ON concept.id = assignment.concept_id
       WHERE assignment.entity_id = entity.id AND assignment.valid_to IS NULL
     ) facets ON true
-    WHERE document.publication_state <> 'withdrawn'
-    ORDER BY document.title, document.id
-  `);
+    ORDER BY selected.selection_priority, selected.lexical_rank DESC,
+             document.title, document.id
+  `,
+    [pruneCandidates, tsQuery, exactEntityIds, resolvedConceptIds, documentLimit, candidateTerms],
+  );
   const retrievalDocuments: RetrievalDocument[] = [
     ...providers.rows.map((row) => ({
       candidateKey: `implementation:${row.providerId}`,
@@ -351,11 +517,23 @@ async function loadRetrievalIndex(client: PoolClient): Promise<RetrievalIndex> {
       concepts: row.concepts,
     })),
   ];
+  const candidateSelection: RetrievalIndex['candidateSelection'] = {
+    policyVersion: 'postgres-lexical-concept-candidates-v1',
+    applied: pruneCandidates,
+    threshold: retrievalCandidateThreshold,
+    providerLimit: pruneCandidates ? retrievalCandidateLimit : null,
+    documentLimit: pruneCandidates ? retrievalCandidateLimit : null,
+    selectedProviderCount: providers.rows.length,
+    selectedDocumentCount: documents.rows.length,
+  };
   return {
     documents: retrievalDocuments,
-    projectionCount: providers.rowCount ?? providers.rows.length,
-    documentCount: documents.rowCount ?? documents.rows.length,
+    projectionCount: totalProviders,
+    documentCount: totalDocuments,
     indexRevision: hashCanonical({
+      candidateSelection,
+      totalProviders,
+      totalDocuments,
       providers: providers.rows.map((row) => ({
         id: row.projectionId,
         revision: row.providerRevision,
@@ -367,6 +545,7 @@ async function loadRetrievalIndex(client: PoolClient): Promise<RetrievalIndex> {
         concepts: row.concepts.map((concept) => concept.conceptId),
       })),
     }),
+    candidateSelection,
   };
 }
 
@@ -591,6 +770,7 @@ interface PreparedSnapshot {
   projectionCount: number;
   indexedDocumentCount: number;
   indexRevision: string;
+  candidateSelection: RetrievalIndex['candidateSelection'];
   candidatePoolHash: string;
   resultHash: string;
   fusionPolicy: RetrievalFusionPolicy;
@@ -679,7 +859,7 @@ async function prepareSnapshot(
   interpretation: QueryInterpretation,
   fusionPolicy: RetrievalFusionPolicy = defaultFusionPolicy,
 ): Promise<PreparedSnapshot> {
-  const index = await loadRetrievalIndex(client);
+  const index = await loadRetrievalIndex(client, interpretation);
   const compatible = index.documents.filter((document) =>
     compatibleRetrievalDocument(document, interpretation),
   );
@@ -806,6 +986,7 @@ async function prepareSnapshot(
     projectionCount: index.projectionCount,
     indexedDocumentCount: index.documentCount,
     indexRevision: index.indexRevision,
+    candidateSelection: index.candidateSelection,
     candidatePoolHash,
     resultHash,
     fusionPolicy,
@@ -1082,6 +1263,7 @@ async function insertResultSetRevision(
         coverageState: input.interpretation.coverageState,
         indexedProjectionCount: projectionCount,
         indexedDocumentCount,
+        candidateSelection: input.prepared.candidateSelection,
         intentMode: input.interpretation.intentMode,
         landscapeFacets: input.interpretation.landscapeFacets,
         firstPassCoverage: input.prepared.firstPassCoverage,
@@ -1438,7 +1620,7 @@ export async function createExplorerSession(
     }
     // Project fit is a separate assessment layer. Binding private context to a
     // snapshot must not silently change query relevance or query-signal-v2.
-    const knowledge = await loadQueryKnowledge(client);
+    const knowledge = await loadQueryKnowledge(client, input.query);
     const initialInterpretation = interpretQuery(
       input.query,
       input.explicitFacets ?? {},
@@ -1571,6 +1753,7 @@ export async function createExplorerSession(
         stopReason: retrievalStopReason(prepared),
         firstPassCoverage: prepared.firstPassCoverage,
         finalCoverage: prepared.finalCoverage,
+        candidateSelection: prepared.candidateSelection,
         retrievers: prepared.rankings.map((ranking) => ({
           key: ranking.retrieverKey,
           passIndex: ranking.passIndex,

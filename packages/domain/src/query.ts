@@ -39,6 +39,7 @@ export interface QueryEntityKnowledge {
 export interface QueryKnowledge {
   concepts: QueryConceptKnowledge[];
   entities: QueryEntityKnowledge[];
+  availableEntityCount?: number;
 }
 
 export interface ResolvedQueryConcept {
@@ -749,7 +750,7 @@ export function interpretQuery(
     interpretationMethod: 'deterministic-v3',
     knowledgeStats: {
       availableConcepts: knowledge.concepts.length,
-      availableEntities: knowledge.entities.length,
+      availableEntities: knowledge.availableEntityCount ?? knowledge.entities.length,
       resolvedConcepts: resolvedConcepts.length,
       resolvedEntities: exactEntities.length,
     },

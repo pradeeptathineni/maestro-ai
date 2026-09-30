@@ -5,6 +5,10 @@ import type {
   QueryEntityKnowledge,
   QueryKnowledge,
 } from '../../domain/src/index.js';
+import { postgresPrefixTsQuery } from './candidate-search.js';
+
+const queryEntityCandidateThreshold = 5_000;
+const queryEntityCandidateLimit = 128;
 
 export interface TaxonomyFacetValue {
   conceptId: string;
@@ -127,7 +131,10 @@ export async function listTaxonomyFacets(pool: Pool): Promise<{
   };
 }
 
-export async function loadQueryKnowledge(pool: Pool | PoolClient): Promise<QueryKnowledge> {
+export async function loadQueryKnowledge(
+  pool: Pool | PoolClient,
+  entityQuery?: string,
+): Promise<QueryKnowledge> {
   // A PoolClient may be inside a transaction and cannot execute concurrent
   // queries. Keep this loader sequential so it is safe for both Pool and client.
   const conceptResult = await pool.query<QueryConceptRow>(`
@@ -169,7 +176,15 @@ export async function loadQueryKnowledge(pool: Pool | PoolClient): Promise<Query
       WHERE relation.valid_to IS NULL AND subject_concept.status = 'active'
       ORDER BY "ownerConceptId", "relationType", label, "conceptId"
     `);
-  const entityResult = await pool.query<QueryEntityKnowledge>(`
+  const entityCountResult = await pool.query<{ count: number }>(
+    'SELECT count(*)::int AS count FROM catalog.knowledge_entities',
+  );
+  const availableEntityCount = entityCountResult.rows[0]!.count;
+  const candidateSelectionApplied =
+    entityQuery !== undefined && availableEntityCount > queryEntityCandidateThreshold;
+  const tsQuery = postgresPrefixTsQuery(entityQuery ? [entityQuery] : []);
+  const entityResult = await pool.query<QueryEntityKnowledge>(
+    `
       WITH latest_revisions AS (
         SELECT DISTINCT ON (revision.entity_id)
                revision.entity_id, revision.preferred_label,
@@ -177,10 +192,66 @@ export async function loadQueryKnowledge(pool: Pool | PoolClient): Promise<Query
         FROM catalog.knowledge_entity_revisions revision
         ORDER BY revision.entity_id, revision.revision DESC, revision.created_at DESC,
                  revision.id DESC
+      ), candidate_entities AS (
+        SELECT entity.id, entity.source_kind, entity.provider_id, entity.document_id,
+               latest.preferred_label, latest.entity_class_concept_id,
+               CASE
+                 WHEN lower(latest.preferred_label) = lower($2)
+                   OR EXISTS (
+                     SELECT 1 FROM catalog.provider_aliases provider_alias
+                     WHERE provider_alias.provider_id = entity.provider_id
+                       AND lower(provider_alias.alias) = lower($2)
+                   )
+                   OR EXISTS (
+                     SELECT 1 FROM catalog.provider_identities identity
+                     WHERE identity.provider_id = entity.provider_id
+                       AND identity.valid_to IS NULL
+                       AND lower(identity.display_value) = lower($2)
+                   )
+                   OR EXISTS (
+                     SELECT 1 FROM catalog.knowledge_documents candidate_document,
+                                    unnest(candidate_document.aliases) alias
+                     WHERE candidate_document.id = entity.document_id
+                       AND lower(alias) = lower($2)
+                   ) THEN 0
+                 WHEN strpos(lower($2), lower(latest.preferred_label)) > 0 THEN 1
+                 ELSE 2
+               END AS selection_priority,
+               ts_rank_cd(
+                 to_tsvector('simple'::regconfig, latest.preferred_label),
+                 to_tsquery('simple'::regconfig, NULLIF($3, ''))
+               ) AS lexical_rank
+        FROM catalog.knowledge_entities entity
+        JOIN latest_revisions latest ON latest.entity_id = entity.id
+        LEFT JOIN catalog.knowledge_documents candidate_document
+          ON candidate_document.id = entity.document_id
+        WHERE NOT $1::boolean
+           OR to_tsvector('simple'::regconfig, latest.preferred_label)
+                @@ to_tsquery('simple'::regconfig, NULLIF($3, ''))
+           OR EXISTS (
+             SELECT 1 FROM catalog.provider_aliases provider_alias
+             WHERE provider_alias.provider_id = entity.provider_id
+               AND to_tsvector('simple'::regconfig, provider_alias.alias)
+                   @@ to_tsquery('simple'::regconfig, NULLIF($3, ''))
+           )
+           OR EXISTS (
+             SELECT 1 FROM catalog.provider_identities identity
+             WHERE identity.provider_id = entity.provider_id
+               AND identity.valid_to IS NULL
+               AND to_tsvector('simple'::regconfig, identity.display_value)
+                   @@ to_tsquery('simple'::regconfig, NULLIF($3, ''))
+           )
+           OR EXISTS (
+             SELECT 1 FROM unnest(candidate_document.aliases) alias
+             WHERE to_tsvector('simple'::regconfig, alias)
+                   @@ to_tsquery('simple'::regconfig, NULLIF($3, ''))
+           )
+        ORDER BY selection_priority, lexical_rank DESC, latest.preferred_label, entity.id
+        LIMIT $4
       )
       SELECT entity.id::text AS "entityId",
              replace(class_concept.stable_key, 'entity-class:', '') AS "entityClass",
-             latest.preferred_label AS "preferredLabel",
+             entity.preferred_label AS "preferredLabel",
              CASE entity.source_kind
                WHEN 'provider' THEN COALESCE((
                  SELECT array_agg(DISTINCT alias ORDER BY alias)
@@ -196,12 +267,19 @@ export async function loadQueryKnowledge(pool: Pool | PoolClient): Promise<Query
                ), '{}')
                WHEN 'document' THEN COALESCE(document.aliases, '{}')
              END AS aliases
-      FROM catalog.knowledge_entities entity
-      JOIN latest_revisions latest ON latest.entity_id = entity.id
-      JOIN catalog.concepts class_concept ON class_concept.id = latest.entity_class_concept_id
+      FROM candidate_entities entity
+      JOIN catalog.concepts class_concept ON class_concept.id = entity.entity_class_concept_id
       LEFT JOIN catalog.knowledge_documents document ON document.id = entity.document_id
-      ORDER BY latest.preferred_label, entity.id
-    `);
+      ORDER BY entity.selection_priority, entity.lexical_rank DESC,
+               entity.preferred_label, entity.id
+    `,
+    [
+      candidateSelectionApplied,
+      entityQuery ?? '',
+      tsQuery,
+      candidateSelectionApplied ? queryEntityCandidateLimit : Math.max(availableEntityCount, 1),
+    ],
+  );
   const relations = new Map<string, QueryConceptRelationRow[]>();
   for (const relation of relationResult.rows) {
     const values = relations.get(relation.ownerConceptId) ?? [];
@@ -220,5 +298,6 @@ export async function loadQueryKnowledge(pool: Pool | PoolClient): Promise<Query
       })),
     })),
     entities: entityResult.rows,
+    availableEntityCount,
   };
 }

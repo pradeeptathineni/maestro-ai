@@ -15,11 +15,16 @@ import {
   type QuerySignalResult,
   type QueryValueInput,
 } from '../../scoring/src/index.js';
+import { postgresPrefixTsQuery, uniqueCandidateTerms } from './candidate-search.js';
 import { scoreDiscoveryCandidate } from './discovery-repository.js';
 import { DomainValidationError } from './errors.js';
 import { loadQueryKnowledge } from './taxonomy-repository.js';
 
 type CorpusLayer = 'indexed_knowledge' | 'knowledge_document' | 'source_lead';
+
+const corpusCandidateThreshold = 5_000;
+const corpusCandidateLimit = 50;
+const corpusCandidateOverfetch = 100;
 
 interface CorpusRow {
   id: string;
@@ -271,9 +276,132 @@ function assessRow(
   };
 }
 
-async function loadCorpus(pool: Pool, workspaceId: string): Promise<CorpusRow[]> {
+async function loadCorpus(
+  pool: Pool,
+  workspaceId: string,
+  interpretation: QueryInterpretation | null,
+): Promise<{ rows: CorpusRow[]; total: number; candidateSelectionApplied: boolean }> {
+  const totals = await pool.query<{ total: number }>(
+    `
+    SELECT (
+      (SELECT count(*) FROM catalog.knowledge_projections kp
+       WHERE kp.publication_state <> 'withdrawn'
+         AND (kp.expires_at IS NULL OR kp.expires_at > now()))
+      + (SELECT count(*) FROM catalog.knowledge_documents kd
+         WHERE kd.publication_state <> 'withdrawn')
+      + (SELECT count(DISTINCT dc.canonical_uri) FROM ops.discovery_candidates dc
+         WHERE dc.workspace_id = $1 AND dc.review_state = 'lead'
+           AND NOT EXISTS (
+             SELECT 1
+             FROM ops.discovery_candidates admitted_candidate
+             JOIN ops.discovery_admissions admission
+               ON admission.discovery_candidate_id = admitted_candidate.id
+             WHERE admitted_candidate.workspace_id = dc.workspace_id
+               AND admitted_candidate.canonical_uri = dc.canonical_uri
+           ))
+    )::int AS total
+  `,
+    [workspaceId],
+  );
+  const total = totals.rows[0]!.total;
+  const candidateSelectionApplied = Boolean(interpretation && total > corpusCandidateThreshold);
+  const candidateTerms = interpretation
+    ? uniqueCandidateTerms([
+        interpretation.terms,
+        interpretation.expandedTerms,
+        interpretation.canonicalConcepts,
+        interpretation.mechanismTerms,
+      ])
+    : [];
+  const tsQuery = postgresPrefixTsQuery(candidateTerms);
+  const exactEntityIds = interpretation?.exactEntities.map((entity) => entity.entityId) ?? [];
+  const resolvedConceptIds =
+    interpretation?.resolvedConcepts.map((concept) => concept.conceptId) ?? [];
   const result = await pool.query<CorpusRow>(
-    `WITH latest_leads AS (
+    `WITH priority_projection_ids AS (
+       SELECT kp.id,
+              CASE WHEN entity.id = ANY($6::uuid[]) THEN 0 ELSE 1 END AS selection_priority
+       FROM catalog.knowledge_projections kp
+       JOIN catalog.knowledge_entities entity ON entity.provider_id = kp.provider_id
+       WHERE $2::boolean
+         AND kp.publication_state <> 'withdrawn'
+         AND (kp.expires_at IS NULL OR kp.expires_at > now())
+         AND (
+           entity.id = ANY($6::uuid[])
+           OR EXISTS (
+             SELECT 1 FROM catalog.entity_facet_assignments selected_assignment
+             WHERE selected_assignment.entity_id = entity.id
+               AND selected_assignment.concept_id = ANY($7::uuid[])
+               AND selected_assignment.valid_to IS NULL
+           )
+         )
+     ), lexical_projection_ids AS (
+       SELECT kp.id, 2 AS selection_priority
+       FROM catalog.knowledge_projections kp
+       WHERE $2::boolean
+         AND kp.publication_state <> 'withdrawn'
+         AND (kp.expires_at IS NULL OR kp.expires_at > now())
+         AND (
+           kp.aliases && $4::text[]
+           OR kp.capability_keys && $4::text[]
+           OR to_tsvector(
+                'simple'::regconfig,
+                kp.preferred_label || ' ' || kp.summary || ' ' || kp.search_text
+              ) @@ to_tsquery('simple'::regconfig, NULLIF($3, ''))
+         )
+       ORDER BY kp.id
+       LIMIT $8
+     ), all_projection_ids AS (
+       SELECT kp.id, 2 AS selection_priority
+       FROM catalog.knowledge_projections kp
+       WHERE NOT $2::boolean
+         AND kp.publication_state <> 'withdrawn'
+         AND (kp.expires_at IS NULL OR kp.expires_at > now())
+     ), candidate_projection_ids AS (
+       SELECT id, min(selection_priority) AS selection_priority
+       FROM (
+         SELECT * FROM priority_projection_ids
+         UNION ALL SELECT * FROM lexical_projection_ids
+         UNION ALL SELECT * FROM all_projection_ids
+       ) candidates
+       GROUP BY id
+     ), selected_projections AS (
+       SELECT kp.id, candidates.selection_priority,
+         ts_rank_cd(
+           to_tsvector(
+             'simple'::regconfig,
+             kp.preferred_label || ' ' || kp.summary || ' ' || kp.search_text
+           ),
+           to_tsquery('simple'::regconfig, NULLIF($3, ''))
+         ) AS lexical_rank
+       FROM candidate_projection_ids candidates
+       JOIN catalog.knowledge_projections kp ON kp.id = candidates.id
+       ORDER BY candidates.selection_priority, lexical_rank DESC, kp.preferred_label, kp.id
+       LIMIT $5
+     ), selected_documents AS (
+       SELECT kd.id
+       FROM catalog.knowledge_documents kd
+       WHERE kd.publication_state <> 'withdrawn'
+         AND (
+           NOT $2::boolean
+           OR kd.aliases && $4::text[]
+           OR kd.mechanism_keys && $4::text[]
+           OR to_tsvector(
+                'simple'::regconfig,
+                kd.title || ' ' || kd.summary || ' ' || kd.search_text
+              ) @@ to_tsquery('simple'::regconfig, NULLIF($3, ''))
+         )
+       ORDER BY
+         ts_rank_cd(
+           to_tsvector(
+             'simple'::regconfig,
+             kd.title || ' ' || kd.summary || ' ' || kd.search_text
+           ),
+           to_tsquery('simple'::regconfig, NULLIF($3, ''))
+         ) DESC,
+         kd.title, kd.id
+       LIMIT $5
+     ), latest_leads AS (
        SELECT DISTINCT ON (dc.canonical_uri)
               dc.id, dc.canonical_uri, dc.title, dc.summary, dc.kind_hint,
               dc.source_payload, dc.provenance, dc.created_at
@@ -303,6 +431,7 @@ async function loadCorpus(pool: Pool, workspaceId: string): Promise<CorpusRow[]>
             kp.query_evidence_coverage::float8 AS "cachedEvidenceCoverage",
             NULL::jsonb AS "sourcePayload"
      FROM catalog.knowledge_projections kp
+     JOIN selected_projections selected ON selected.id = kp.id
      LEFT JOIN catalog.knowledge_entities entity ON entity.provider_id = kp.provider_id
      LEFT JOIN LATERAL (
        SELECT replace(class_concept.stable_key, 'entity-class:', '') AS "entityClass"
@@ -338,6 +467,7 @@ async function loadCorpus(pool: Pool, workspaceId: string): Promise<CorpusRow[]>
             NULL::float8 AS "cachedEvidenceCoverage",
             NULL::jsonb AS "sourcePayload"
      FROM catalog.knowledge_documents kd
+     JOIN selected_documents selected ON selected.id = kd.id
      JOIN catalog.source_observations so ON so.id = kd.source_observation_id
      JOIN catalog.sources s ON s.id = so.source_id
      WHERE kd.publication_state <> 'withdrawn'
@@ -365,9 +495,18 @@ async function loadCorpus(pool: Pool, workspaceId: string): Promise<CorpusRow[]>
               'updatedAt', lead.source_payload->'updatedAt'
             ) AS "sourcePayload"
      FROM latest_leads lead`,
-    [workspaceId],
+    [
+      workspaceId,
+      candidateSelectionApplied,
+      tsQuery,
+      candidateTerms,
+      candidateSelectionApplied ? corpusCandidateLimit : Math.max(total, 1),
+      exactEntityIds,
+      resolvedConceptIds,
+      corpusCandidateOverfetch,
+    ],
   );
-  return result.rows;
+  return { rows: result.rows, total, candidateSelectionApplied };
 }
 
 export async function listResearchCorpus(
@@ -388,11 +527,12 @@ export async function listResearchCorpus(
   const viewHash = hashCanonical(view);
   const offset = decodeCursor(query.cursor, viewHash);
   const limit = Math.min(Math.max(query.limit ?? 20, 1), 50);
-  const corpus = await loadCorpus(pool, workspaceId);
-  const knowledge = normalizedQuery ? await loadQueryKnowledge(pool) : null;
+  const knowledge = normalizedQuery ? await loadQueryKnowledge(pool, normalizedQuery) : null;
   const interpretation = normalizedQuery
     ? interpretQuery(normalizedQuery, {}, knowledge ?? undefined)
     : null;
+  const corpusSelection = await loadCorpus(pool, workspaceId, interpretation);
+  const corpus = corpusSelection.rows;
   const assessRelevance = interpretation ? compileLexicalRelevance(interpretation) : null;
   const matched = corpus
     .map((row) => assessRow(row, interpretation, assessRelevance))
@@ -455,7 +595,14 @@ export async function listResearchCorpus(
     },
     query: normalizedQuery,
     scoringApplied: normalizedQuery !== null,
-    corpusCount: corpus.length,
+    corpusCount: corpusSelection.total,
+    candidateSelection: {
+      policyVersion: 'postgres-lexical-candidates-v1',
+      applied: corpusSelection.candidateSelectionApplied,
+      assessedCount: corpus.length,
+      limit: corpusSelection.candidateSelectionApplied ? corpusCandidateLimit : null,
+      facetScope: corpusSelection.candidateSelectionApplied ? 'candidate_pool' : 'full_corpus',
+    },
     matchedCount: matched.length,
     filteredCount: filtered.length,
     facets,

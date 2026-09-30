@@ -64,6 +64,15 @@ coverage, exhausted budget, no useful expansion, source unavailable, or cancelle
 No evaluation query has a dedicated production branch. New domains must work through the same label,
 facet, corpus-statistics, and source-routing mechanisms.
 
+Small local catalogs are assessed exhaustively. Above the measured catalog threshold, PostgreSQL
+first selects a bounded candidate window from exact identities, resolved concepts, aliases,
+capabilities, and full-text matches; the unchanged deterministic retrievers, fusion, reranker, and
+receipt writers then operate on that window. The query interpretation stage uses the same
+outside-in rule for entity labels while retaining the full catalog count. Candidate-selection
+policy, threshold, limits, and selected counts are recorded in result diagnostics. This hook is
+downstream of immutable source observations and knowledge revisions, so performance filtering does
+not discard or rewrite original evidence.
+
 ## Match, Signal, evidence, and trend
 
 - **Match** is query-dependent relevance: why this entity or document answers this query.

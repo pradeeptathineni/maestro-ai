@@ -691,6 +691,12 @@ describe('Phase 06 explorer and authoring contracts', () => {
         diagnostics: {
           projectFitState: 'unknown_blocked',
           projectContextAffectsSignal: false,
+          candidateSelection: {
+            policyVersion: 'postgres-lexical-concept-candidates-v1',
+            applied: false,
+            selectedProviderCount: expect.any(Number),
+            selectedDocumentCount: expect.any(Number),
+          },
         },
       },
     });

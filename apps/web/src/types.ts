@@ -402,6 +402,15 @@ export interface ExplorerResultPage {
       externalDiscoveryAttempted: boolean;
       projectFitState: 'unknown_blocked' | 'not_applicable';
       projectContextAffectsSignal: false;
+      candidateSelection?: {
+        policyVersion: string;
+        applied: boolean;
+        threshold: number;
+        providerLimit: number | null;
+        documentLimit: number | null;
+        selectedProviderCount: number;
+        selectedDocumentCount: number;
+      };
     };
     queryPlan?: {
       policyVersion: string;
