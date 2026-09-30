@@ -373,6 +373,7 @@ function extractSubjectTerms(input: {
         !COMMUNITY_WORDS.has(word) &&
         !EXCLUSION_WORDS.has(word) &&
         !AUTHORITY_WORDS.has(word) &&
+        !PROBLEM_WORDS.has(word) &&
         (!QUERY_FORM_WORDS.has(word) || protectedCompoundTerms.has(word)) &&
         (!REQUEST_SCAFFOLD_WORDS.has(word) || protectedCompoundTerms.has(word)) &&
         !GENERIC_RESULT_TYPE_WORDS.has(word) &&
@@ -394,6 +395,7 @@ function extractSubjectTerms(input: {
         !COMMUNITY_WORDS.has(word) &&
         !EXCLUSION_WORDS.has(word) &&
         !AUTHORITY_WORDS.has(word) &&
+        !PROBLEM_WORDS.has(word) &&
         (!QUERY_FORM_WORDS.has(word) || protectedCompoundTerms.has(word)) &&
         (!REQUEST_SCAFFOLD_WORDS.has(word) || protectedCompoundTerms.has(word)) &&
         !excludedTerms.has(word),

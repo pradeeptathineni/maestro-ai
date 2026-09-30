@@ -212,6 +212,21 @@ describe('knowledge-driven query interpretation', () => {
     ).toBe('no_match');
   });
 
+  it('keeps problem verbs as intent while sending subject-bearing terms to sources', () => {
+    const interpretation = interpretQuery('reduce flaky browser tests', {}, knowledge);
+    const plan = buildDiscoveryPlan('reduce flaky browser tests', interpretation, {
+      externalSourcesEnabled: true,
+    });
+    expect(interpretation).toMatchObject({
+      intentMode: 'problem_discovery',
+      subjectTerms: ['flaky', 'browser', 'tests'],
+    });
+    expect(plan.routes.find((route) => route.adapterKey === 'github')).toMatchObject({
+      state: 'planned',
+      variant: 'flaky browser tests',
+    });
+  });
+
   it('preserves source syntax before normalization and distinguishes local-first from locality', () => {
     const localFirst = interpretQuery('CRDT local-first database research article', {}, knowledge);
     expect(localFirst.sourceText).toBe('CRDT local-first database research article');

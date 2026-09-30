@@ -103,6 +103,8 @@ async function runQuery(query: string): Promise<Record<string, unknown>> {
     },
     live: operations.map((operation) => ({
       adapterKey: operation.adapterKey,
+      planRouteId: operation.planRouteId,
+      variantIndex: operation.variantIndex,
       outboundQuery: operation.outboundQuery,
       state: operation.state,
       sourcePlanState: operation.sourcePlanState,
