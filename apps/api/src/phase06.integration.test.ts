@@ -903,7 +903,7 @@ describe('Phase 06 explorer and authoring contracts', () => {
       url: '/api/v1/explorer/sessions',
       headers: mutationHeaders,
       payload: {
-        query: 'ai repository review fixture',
+        query: 'xylophagous beetle stridulation framework',
         searchConnectedSources: true,
       },
     });
@@ -915,6 +915,21 @@ describe('Phase 06 explorer and authoring contracts', () => {
         expect.objectContaining({ adapterKey: 'mcp_registry', state: 'skipped' }),
       ]),
     });
+    const githubOperations = requested
+      .json<{
+        discoveryOperations: Array<{
+          adapterKey: string;
+          variantIndex: number;
+          sourcePlanState: string;
+        }>;
+      }>()
+      .discoveryOperations.filter((operation) => operation.adapterKey === 'github');
+    expect(githubOperations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ variantIndex: 1, sourcePlanState: 'planned' }),
+        expect.objectContaining({ variantIndex: 2, sourcePlanState: 'planned' }),
+      ]),
+    );
     const operationId = requested.json<{
       discoveryOperations: Array<{ id: string }>;
     }>().discoveryOperations[0]!.id;

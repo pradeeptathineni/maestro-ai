@@ -428,6 +428,7 @@ export async function requestDiscovery(
       reservedCalls,
       duplicate: false,
       planRouteId: route?.planRouteId ?? null,
+      variantIndex: route?.variantIndex ?? 1,
       routingReason: route?.routingReason ?? null,
       sourcePlanState: route?.sourcePlanState ?? 'planned',
     };
@@ -455,6 +456,18 @@ export async function requestEnabledDiscovery(
   const plan =
     session.rows[0]!.plan ??
     buildDiscoveryPlan(approvedPublicQuery, session.rows[0]!.interpretation);
+  const plannedSecondPassRoutes =
+    plan.secondPass.state === 'planned' || plan.secondPass.state === 'completed'
+      ? plan.secondPass.routes
+      : [];
+  const executionRoutes = [...plan.routes, ...plannedSecondPassRoutes];
+  const plannedCalls = executionRoutes.reduce(
+    (total, route) => total + (route.state === 'planned' ? route.callLimit : 0),
+    0,
+  );
+  if (plannedCalls > plan.budgets.maximumExternalCalls) {
+    throw new DomainValidationError('The persisted source plan exceeds its external-call budget.');
+  }
   const measured = await pool.query<{
     adapterKey: string;
     attemptedCalls: number;
@@ -475,11 +488,11 @@ export async function requestEnabledDiscovery(
     ORDER BY window_end DESC
   `);
   const values = rankSourcesByMeasuredValue(
-    plan.routes.map((route) => route.adapterKey),
+    executionRoutes.map((route) => route.adapterKey),
     measured.rows,
   );
   const preference = new Map(values.map((value, index) => [value.adapterKey, index]));
-  const orderedRoutes = plan.routes
+  const orderedRoutes = executionRoutes
     .map((route, index) => ({ route, index }))
     .sort(
       (left, right) =>
