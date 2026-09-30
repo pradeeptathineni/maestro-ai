@@ -3,7 +3,7 @@ import { stableUuid } from '../../domain/src/index.js';
 
 const namespace = 'phase08-concept-label-v2';
 
-export interface ConceptVocabularyEntry {
+interface ConceptVocabularyEntry {
   conceptStableKey: string;
   labels: string[];
   relatedConceptStableKeys?: string[];
@@ -11,7 +11,7 @@ export interface ConceptVocabularyEntry {
 
 // Alternate labels describe established ecosystem vocabulary. They are taxonomy data, not query
 // routes or answer maps; the interpreter applies the same matching rules to every entry.
-export const conceptVocabularyV1: ConceptVocabularyEntry[] = [
+const conceptVocabularyV1: ConceptVocabularyEntry[] = [
   {
     conceptStableKey: 'ai-development-tools',
     labels: ['AI developer tools', 'AI development tools', 'AI software tools'],
