@@ -217,7 +217,12 @@ async function runLocalEvaluation(pool: Pool) {
       ...item,
       candidateCount: result.page.filteredCount,
       candidatePoolHash: result.page.resultSet.candidatePoolHash,
+      expectedCoverage: source?.expectedCoverage ?? null,
       actualCoverage: result.page.resultSet.interpretation.coverageState,
+      coverageCorrect:
+        source === undefined
+          ? null
+          : result.page.resultSet.interpretation.coverageState === source.expectedCoverage,
       elapsedMs: result.elapsedMs,
       proxyJudgment: source
         ? proxyJudgment(
@@ -264,6 +269,7 @@ async function runLocalEvaluation(pool: Pool) {
         .map((route) => route.adapterKey),
       coherentPlan:
         plan.policyVersion === 'research-plan-v2' &&
+        result.page.resultSet.interpretation.coverageState === item.expectedPlan.expectedCoverage &&
         result.page.resultSet.retrievalPasses >= item.expectedPlan.minimumPasses &&
         plan.routes.some((route) => route.state === 'planned'),
       usefulCandidateJudgment: 'unjudged_pending_independent_review',
@@ -281,6 +287,10 @@ async function runLocalEvaluation(pool: Pool) {
       labeledProxyCount: proxyRows.length,
       currentPhase07Proxy: {
         meanRecallAt20: average(proxyRows.map((row) => row.recallAt20)),
+        coverageAgreement: ratio(
+          development.filter((row) => row.coverageCorrect === true).length,
+          development.filter((row) => row.coverageCorrect !== null).length,
+        ),
         exactNameRetention: ratio(
           proxyRows.filter((row) => row.exactRetained !== null && row.exactRetained).length,
           proxyRows.filter((row) => row.exactRetained !== null).length,
@@ -297,7 +307,10 @@ async function runLocalEvaluation(pool: Pool) {
       meanNdcgAt10: average(expertMetrics.map((row) => row.ndcgAt10)),
       meanNdcgAt20: average(expertMetrics.map((row) => row.ndcgAt20)),
       meanLowerBoundPrecisionAt5: average(expertMetrics.map((row) => row.lowerBoundPrecisionAt5)),
+      meanLowerBoundPrecisionAt10: average(expertMetrics.map((row) => row.lowerBoundPrecisionAt10)),
       meanJudgedPrecisionAt5: average(expertMetrics.map((row) => row.judgedPrecisionAt5)),
+      meanJudgedPrecisionAt10: average(expertMetrics.map((row) => row.judgedPrecisionAt10)),
+      meanReciprocalRankEssential: average(expertMetrics.map((row) => row.reciprocalRankEssential)),
       prohibitedHitsAt20: expertMetrics.reduce(
         (sum, row) => sum + row.prohibitedHitsAt20.length,
         0,
@@ -456,6 +469,7 @@ async function main(): Promise<void> {
     const failed =
       local.development.currentPhase07Proxy.prohibitedHitsAt20 > 0 ||
       local.development.currentPhase07Proxy.exactNameRetention !== 1 ||
+      local.development.currentPhase07Proxy.coverageAgreement !== 1 ||
       local.challenge.coherentPlanRate !== 1;
     if (failed) process.exitCode = 1;
   } finally {

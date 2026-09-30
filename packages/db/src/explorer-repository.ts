@@ -680,12 +680,27 @@ function summaryForCoverage(document: RetrievalDocument): {
   return { entityClass: document.entityClass, group };
 }
 
-function keepSupportedOpenWorldMatch(
+function supportsCoverageAssessment(
   candidate: RerankedRetrievalCandidate,
   interpretation: QueryInterpretation,
 ): boolean {
   return (
-    interpretation.coverageState !== 'outside_maintained_coverage' || candidate.matchScore >= 8
+    interpretation.coverageState !== 'outside_maintained_coverage' ||
+    candidate.matchBand === 'Direct' ||
+    candidate.matchBand === 'Strong'
+  );
+}
+
+function supportsOpenWorldPromotion(
+  candidate: RerankedRetrievalCandidate,
+  interpretation: QueryInterpretation,
+): boolean {
+  const queryTerms = new Set(interpretation.terms);
+  const matchedExplicitTerms = candidate.matchedTerms.filter((term) => queryTerms.has(term));
+  if (matchedExplicitTerms.length < 2) return false;
+  const explicitCoverage = matchedExplicitTerms.length / Math.max(queryTerms.size, 1);
+  return (
+    candidate.matchBand === 'Direct' || candidate.matchBand === 'Strong' || explicitCoverage >= 0.4
   );
 }
 
@@ -705,13 +720,14 @@ async function prepareSnapshot(
     structuredRerank(firstFused, resolved.documents, interpretation),
     resolved.documents,
     interpretation,
-  ).filter((candidate) => keepSupportedOpenWorldMatch(candidate, interpretation));
+  );
   const byCandidate = new Map(
     resolved.documents.map((document) => [document.candidateKey, document]),
   );
   const firstPassCoverage = assessResearchCoverage(
     interpretation,
     firstReranked
+      .filter((candidate) => supportsCoverageAssessment(candidate, interpretation))
       .slice(0, 100)
       .map((candidate) => byCandidate.get(candidate.candidateKey))
       .filter((document): document is RetrievalDocument => Boolean(document))
@@ -733,12 +749,13 @@ async function prepareSnapshot(
     resolved.documents,
     interpretation,
   );
-  const selected = (fusionPolicy === 'reciprocal-rank-fusion-v1' ? rrfReranked : weightedReranked)
-    .filter((candidate) => keepSupportedOpenWorldMatch(candidate, interpretation))
-    .slice(0, 200);
+  const selected = (
+    fusionPolicy === 'reciprocal-rank-fusion-v1' ? rrfReranked : weightedReranked
+  ).slice(0, 200);
   const finalCoverage = assessResearchCoverage(
     interpretation,
     selected
+      .filter((candidate) => supportsCoverageAssessment(candidate, interpretation))
       .slice(0, 100)
       .map((candidate) => byCandidate.get(candidate.candidateKey))
       .filter((document): document is RetrievalDocument => Boolean(document))
@@ -1466,17 +1483,38 @@ export async function createExplorerSession(
       initialInterpretation.missingContext.some((facet) => facet.key === 'independent_evidence') ||
       (initialInterpretation.terms.length <= 2 &&
         initialInterpretation.inferredFacets.some((facet) => facet.key === 'integration_target'));
-    const supportedOpenWorldTerms = new Set(
-      prepared.selected.slice(0, 20).flatMap((candidate) => candidate.matchedTerms),
-    );
-    const openWorldEvidenceSupported = supportedOpenWorldTerms.size >= 2;
+    const retrievalEvidenceSupported = prepared.selected
+      .slice(0, 20)
+      .some((candidate) => supportsOpenWorldPromotion(candidate, initialInterpretation));
+    const structuredFacetEvidenceSupported =
+      prepared.selected.length > 0 &&
+      initialInterpretation.explicitFacets.length > 0 &&
+      initialInterpretation.resolvedConcepts.some((concept) =>
+        ['domain', 'capability', 'interface', 'service_model'].includes(concept.facetKey),
+      );
+    const authorityBoundarySupported =
+      prepared.selected.length > 0 &&
+      initialInterpretation.missingContext.some((facet) => facet.key === 'action_authority') &&
+      initialInterpretation.resolvedConcepts.some((concept) =>
+        ['domain', 'capability', 'interface'].includes(concept.facetKey),
+      );
+    const promotedFromLocalEvidence =
+      initialInterpretation.coverageState === 'outside_maintained_coverage' &&
+      (retrievalEvidenceSupported ||
+        structuredFacetEvidenceSupported ||
+        authorityBoundarySupported);
     const interpretation: QueryInterpretation = {
       ...initialInterpretation,
       coverageState: forcedPartial
         ? 'partial'
-        : initialInterpretation.coverageState === 'maintained' || openWorldEvidenceSupported
+        : promotedFromLocalEvidence
           ? 'maintained'
           : initialInterpretation.coverageState,
+      coverageBasis: forcedPartial
+        ? 'interpretation_caveat'
+        : promotedFromLocalEvidence
+          ? 'local_retrieval_evidence'
+          : initialInterpretation.coverageBasis,
     };
     const coverageAssessment = prepared.finalCoverage;
     const plan = buildDiscoveryPlan(input.query, interpretation, {

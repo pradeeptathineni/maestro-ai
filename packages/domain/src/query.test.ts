@@ -47,6 +47,7 @@ const knowledge: QueryKnowledge = {
     concept('interface:mcp-server', 'interface', 'MCP server', {
       labels: ['MCP server', 'Model Context Protocol server'],
     }),
+    concept('interface:library', 'interface', 'Library'),
     concept('domain:ocean-engineering', 'domain', 'Ocean engineering', {
       relations: [
         {
@@ -143,6 +144,32 @@ describe('knowledge-driven query interpretation', () => {
     );
     expect(result.sourceRoutingHints).toEqual(
       expect.arrayContaining(['local_index', 'general_web', 'implementation_forge']),
+    );
+  });
+
+  it('does not treat a generic entity-class noun as maintained subject coverage', () => {
+    const result = interpretQuery('xylophagous beetle stridulation framework', {}, knowledge);
+    expect(result.resolvedConcepts).toContainEqual(
+      expect.objectContaining({ stableKey: 'entity-class:implementation' }),
+    );
+    expect(result).toMatchObject({
+      coverageState: 'outside_maintained_coverage',
+      initialCoverageState: 'outside_maintained_coverage',
+      coverageBasis: 'outside_maintained_coverage',
+      typedTarget: null,
+      requestedEntityClasses: [],
+    });
+  });
+
+  it('does not treat a one-word interface inside an unseen subject as maintained coverage', () => {
+    const result = interpretQuery('xylophagous beetle stridulation library', {}, knowledge);
+    expect(result.resolvedConcepts).toContainEqual(
+      expect.objectContaining({ stableKey: 'interface:library' }),
+    );
+    expect(result.coverageState).toBe('outside_maintained_coverage');
+    expect(result.initialCoverageState).toBe('outside_maintained_coverage');
+    expect(interpretQuery('MCP server interoperability', {}, knowledge).coverageState).toBe(
+      'maintained',
     );
   });
 

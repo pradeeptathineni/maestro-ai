@@ -42,6 +42,8 @@ function interpretation(overrides: Partial<QueryInterpretation> = {}): QueryInte
     requestedEntityClasses: [],
     sourceRoutingHints: ['local_index', 'concept_neighborhood'],
     coverageState: 'maintained',
+    initialCoverageState: 'maintained',
+    coverageBasis: 'taxonomy_or_identity',
     interpretationMethod: 'deterministic-v3',
     knowledgeStats: {
       availableConcepts: 3,

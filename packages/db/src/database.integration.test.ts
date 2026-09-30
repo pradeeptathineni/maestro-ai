@@ -378,6 +378,29 @@ describe('reviewed PostgreSQL contract', () => {
     });
   });
 
+  it('rejects weak generic overlap as proof of local open-world coverage', async () => {
+    const session = (await createExplorerSession(pool, localWorkspaceId, {
+      query: 'xylophagous beetle stridulation framework',
+    })) as {
+      interpretation: { coverageState: string };
+      plan: { secondPass: { state: string } };
+      retrieval: {
+        passes: number;
+        stopReason: string;
+        firstPassCoverage: { candidateCount: number };
+      };
+    };
+    expect(session).toMatchObject({
+      interpretation: { coverageState: 'outside_maintained_coverage' },
+      plan: { secondPass: { state: 'completed' } },
+      retrieval: {
+        passes: 2,
+        stopReason: 'second_pass_exhausted',
+        firstPassCoverage: { candidateCount: 0 },
+      },
+    });
+  });
+
   it('freezes one candidate pool while persisting retriever, fusion, and rerank lineage', async () => {
     const session = (await createExplorerSession(pool, localWorkspaceId, {
       query: 'code context compression approaches',

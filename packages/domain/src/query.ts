@@ -93,6 +93,12 @@ export interface QueryInterpretation {
   requestedEntityClasses: string[];
   sourceRoutingHints: string[];
   coverageState: 'maintained' | 'partial' | 'outside_maintained_coverage';
+  initialCoverageState: 'maintained' | 'partial' | 'outside_maintained_coverage';
+  coverageBasis:
+    | 'taxonomy_or_identity'
+    | 'local_retrieval_evidence'
+    | 'interpretation_caveat'
+    | 'outside_maintained_coverage';
   interpretationMethod: 'deterministic-v3';
   knowledgeStats: {
     availableConcepts: number;
@@ -694,11 +700,25 @@ export function interpretQuery(
       : []),
   ]);
   const canonicalConcepts = resolvedConcepts.map((concept) => concept.preferredLabel);
+  const subjectCoverageConcepts = resolvedConcepts.filter((concept) => {
+    if (['domain', 'capability'].includes(concept.facetKey)) return true;
+    if (!['interface', 'service_model'].includes(concept.facetKey)) return false;
+    return (
+      concept.matchMethod === 'acronym' ||
+      normalizedWords(concept.matchedLabel).filter((word) => !STOP_WORDS.has(word)).length >= 2
+    );
+  });
   const capabilityGroups = unique(
     resolvedConcepts
       .filter((concept) => concept.facetKey === 'domain' || concept.facetKey === 'capability')
       .map((concept) => concept.preferredLabel),
   );
+  const initialCoverageState =
+    subjectCoverageConcepts.length || exactEntities.length
+      ? 'maintained'
+      : intentMode === 'ambiguous'
+        ? 'partial'
+        : 'outside_maintained_coverage';
   return {
     normalizedText,
     terms,
@@ -718,11 +738,13 @@ export function interpretQuery(
     typedTarget,
     requestedEntityClasses,
     sourceRoutingHints,
-    coverageState:
-      resolvedConcepts.length || exactEntities.length
-        ? 'maintained'
-        : intentMode === 'ambiguous'
-          ? 'partial'
+    coverageState: initialCoverageState,
+    initialCoverageState,
+    coverageBasis:
+      initialCoverageState === 'maintained'
+        ? 'taxonomy_or_identity'
+        : initialCoverageState === 'partial'
+          ? 'interpretation_caveat'
           : 'outside_maintained_coverage',
     interpretationMethod: 'deterministic-v3',
     knowledgeStats: {
