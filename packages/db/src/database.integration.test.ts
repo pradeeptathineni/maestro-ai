@@ -23,6 +23,7 @@ import { migrate } from './migrate.js';
 import { checkSchemaDefinitions } from './schema-check.js';
 import { requestDiscovery } from './discovery-repository.js';
 import { createExplorerSession } from './explorer-repository.js';
+import { loadQueryKnowledge } from './taxonomy-repository.js';
 import {
   addCandidate,
   createNeed,
@@ -96,6 +97,16 @@ describe('reviewed PostgreSQL contract', () => {
     );
     expect(documentSubjects.rows[0]!.total).toBe(documentSubjects.rows[0]!.logical);
     expect(documentSubjects.rows[0]!.total).toBeGreaterThan(0);
+  });
+
+  it('projects each current semantic concept relation once', async () => {
+    const knowledge = await loadQueryKnowledge(pool);
+    for (const concept of knowledge.concepts) {
+      const relationKeys = concept.relations.map(
+        (relation) => `${relation.conceptId}:${relation.relationType}`,
+      );
+      expect(new Set(relationKeys).size, concept.preferredLabel).toBe(relationKeys.length);
+    }
   });
 
   it('projects one effective current row while retaining append-only predecessors', async () => {

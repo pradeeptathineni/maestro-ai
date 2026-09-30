@@ -159,7 +159,7 @@ export async function loadQueryKnowledge(
       FROM catalog.concept_relations relation
       JOIN catalog.concepts object_concept ON object_concept.id = relation.object_concept_id
       WHERE relation.valid_to IS NULL AND object_concept.status = 'active'
-      UNION ALL
+      UNION
       SELECT relation.object_concept_id::text AS "ownerConceptId",
              subject_concept.id::text AS "conceptId",
              CASE relation.relation_type
