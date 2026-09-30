@@ -692,7 +692,7 @@ describe('Phase 06 explorer and authoring contracts', () => {
           projectFitState: 'unknown_blocked',
           projectContextAffectsSignal: false,
           candidateSelection: {
-            policyVersion: 'postgres-lexical-concept-candidates-v1',
+            policyVersion: 'postgres-lexical-concept-candidates-v2',
             applied: false,
             selectedProviderCount: expect.any(Number),
             selectedDocumentCount: expect.any(Number),

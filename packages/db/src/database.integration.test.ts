@@ -71,6 +71,7 @@ describe('reviewed PostgreSQL contract', () => {
       '0020_corpus_intelligence.sql',
       '0021_history_chain_integrity.sql',
       '0022_current_knowledge_views.sql',
+      '0023_ai_development_tools_domain.sql',
     ]);
     expect(migrations.rows.every((row) => /^[a-f0-9]{64}$/.test(row.sha256))).toBe(true);
   });
@@ -490,9 +491,7 @@ describe('reviewed PostgreSQL contract', () => {
       client.release();
     }
 
-    await createExplorerSession(pool, localWorkspaceId, {
-      query: 'history owner constraint fixture',
-    });
+    await createExplorerSession(pool, localWorkspaceId, { query: 'Ollama' });
     const signal = await pool.query<{ id: string; entityId: string }>(
       `SELECT id, knowledge_entity_id AS "entityId"
        FROM catalog.intrinsic_signal_runs ORDER BY id LIMIT 1`,
@@ -582,12 +581,12 @@ describe('reviewed PostgreSQL contract', () => {
       };
     };
     expect(session.interpretation).toMatchObject({
-      interpretationMethod: 'deterministic-v3',
+      interpretationMethod: 'deterministic-v4',
       coverageState: 'outside_maintained_coverage',
       resolvedConcepts: [],
     });
     expect(session.plan).toMatchObject({
-      policyVersion: 'research-plan-v2',
+      policyVersion: 'research-plan-v3',
       stopReason: 'second_pass_exhausted',
       budgets: { maximumPasses: 2, maximumExternalCalls: 6 },
     });

@@ -15,6 +15,8 @@ import {
   interpretQuery,
   lexicalRelevance,
   newOpaqueId,
+  querySubjectConcepts,
+  querySubjectTerms,
   resolveRetrievalDuplicates,
   retrieveFirstPass,
   retrieveSecondPass,
@@ -46,7 +48,7 @@ import { inTransaction } from './transaction.js';
 
 type JsonRow = Record<string, unknown>;
 
-const retrievalPolicyVersion = 'retrieval-fabric-v5';
+const retrievalPolicyVersion = 'retrieval-fabric-v6';
 const defaultFusionPolicy: RetrievalFusionPolicy = 'normalized-weighted-fusion-v1';
 
 interface ProjectionRow {
@@ -117,7 +119,7 @@ interface RetrievalIndex {
   documentCount: number;
   indexRevision: string;
   candidateSelection: {
-    policyVersion: 'postgres-lexical-concept-candidates-v1';
+    policyVersion: 'postgres-lexical-concept-candidates-v2';
     applied: boolean;
     threshold: number;
     providerLimit: number | null;
@@ -242,9 +244,9 @@ const retrievalCandidateOverfetch = 300;
 function postgresRetrievalQuery(interpretation: QueryInterpretation): string {
   return postgresPrefixTsQuery(
     uniqueCandidateTerms([
-      interpretation.terms,
+      querySubjectTerms(interpretation),
       interpretation.expandedTerms,
-      interpretation.canonicalConcepts,
+      querySubjectConcepts(interpretation).map((concept) => concept.preferredLabel),
       interpretation.mechanismTerms,
     ]),
   );
@@ -266,12 +268,14 @@ async function loadRetrievalIndex(
   const totalDocuments = counts.rows[0]!.documents;
   const pruneCandidates = totalProviders + totalDocuments > retrievalCandidateThreshold;
   const tsQuery = postgresRetrievalQuery(interpretation);
-  const resolvedConceptIds = interpretation.resolvedConcepts.map((concept) => concept.conceptId);
+  const resolvedConceptIds = querySubjectConcepts(interpretation).map(
+    (concept) => concept.conceptId,
+  );
   const exactEntityIds = interpretation.exactEntities.map((entity) => entity.entityId);
   const candidateTerms = uniqueCandidateTerms([
-    interpretation.terms,
+    querySubjectTerms(interpretation),
     interpretation.expandedTerms,
-    interpretation.canonicalConcepts,
+    querySubjectConcepts(interpretation).map((concept) => concept.preferredLabel),
     interpretation.mechanismTerms,
   ]);
   const providerLimit = pruneCandidates ? retrievalCandidateLimit : Math.max(totalProviders, 1);
@@ -457,7 +461,8 @@ async function loadRetrievalIndex(
            COALESCE(replace(class_concept.stable_key, 'entity-class:', ''), 'document')
              AS "entityClass",
            document.document_kind AS kind, document.title AS name, document.aliases,
-           document.search_text AS "searchText", document.canonical_uri AS "canonicalUri",
+           concat_ws(' ', document.search_text, document.summary) AS "searchText",
+           document.canonical_uri AS "canonicalUri",
            document.content_digest AS "contentDigest",
            COALESCE(facets.concepts, '[]'::jsonb) AS concepts
     FROM selected_documents selected
@@ -515,7 +520,7 @@ async function loadRetrievalIndex(
     })),
   ];
   const candidateSelection: RetrievalIndex['candidateSelection'] = {
-    policyVersion: 'postgres-lexical-concept-candidates-v1',
+    policyVersion: 'postgres-lexical-concept-candidates-v2',
     applied: pruneCandidates,
     threshold: retrievalCandidateThreshold,
     providerLimit: pruneCandidates ? retrievalCandidateLimit : null,
@@ -842,7 +847,7 @@ function supportsOpenWorldPromotion(
   candidate: RerankedRetrievalCandidate,
   interpretation: QueryInterpretation,
 ): boolean {
-  const queryTerms = new Set(interpretation.terms);
+  const queryTerms = new Set(querySubjectTerms(interpretation));
   const matchedExplicitTerms = candidate.matchedTerms.filter((term) => queryTerms.has(term));
   if (matchedExplicitTerms.length < 2) return false;
   const explicitCoverage = matchedExplicitTerms.length / Math.max(queryTerms.size, 1);
@@ -1630,7 +1635,7 @@ export async function createExplorerSession(
     );
     const forcedPartial =
       initialInterpretation.missingContext.some((facet) => facet.key === 'independent_evidence') ||
-      (initialInterpretation.terms.length <= 2 &&
+      (querySubjectTerms(initialInterpretation).length <= 2 &&
         initialInterpretation.inferredFacets.some((facet) => facet.key === 'integration_target'));
     const retrievalEvidenceSupported = prepared.selected
       .slice(0, 20)
@@ -1679,8 +1684,8 @@ export async function createExplorerSession(
          (id, workspace_id, project_context_id, query_text, query_hash, normalized_intent,
           explicit_facets, inferred_facets, interpretation_method, interpretation_state,
           retrieval_policy_version, index_revision, state, retention_until, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'deterministic-v3', 'deterministic',
-               $9, $10, 'active', $11, $12)`,
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'deterministic',
+               $10, $11, 'active', $12, $13)`,
       [
         sessionId,
         workspaceId,
@@ -1690,6 +1695,7 @@ export async function createExplorerSession(
         json(interpretation),
         json({ interpreted: interpretation.explicitFacets, supplied: input.explicitFacets ?? {} }),
         json(interpretation.inferredFacets),
+        interpretation.interpretationMethod,
         retrievalPolicyVersion,
         prepared.indexRevision,
         retentionUntil,

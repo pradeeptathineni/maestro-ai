@@ -1,4 +1,4 @@
-import type { QueryInterpretation } from './query.js';
+import { querySubjectConcepts, querySubjectTerms, type QueryInterpretation } from './query.js';
 
 export type RetrievalPass = 1 | 2;
 export type RetrievalFusionPolicy = 'reciprocal-rank-fusion-v1' | 'normalized-weighted-fusion-v1';
@@ -85,8 +85,6 @@ const RETRIEVAL_STOP_WORDS = new Set([
   'a',
   'an',
   'and',
-  'agent',
-  'agents',
   'are',
   'as',
   'at',
@@ -139,6 +137,7 @@ function words(value: string): string[] {
 
 function roots(value: string): string[] {
   const result = new Set([value]);
+  if (value.endsWith('ly') && value.length > 4) result.add(value.slice(0, -2));
   if (value.endsWith('ies') && value.length > 4) result.add(`${value.slice(0, -3)}y`);
   if (value.endsWith('ing') && value.length > 5) {
     result.add(value.slice(0, -3));
@@ -198,7 +197,7 @@ function similarity(left: string, right: string): number {
 
 function searchableQueryTerms(interpretation: QueryInterpretation): string[] {
   return unique(
-    interpretation.terms
+    querySubjectTerms(interpretation)
       .flatMap(words)
       .filter((term) => !RETRIEVAL_STOP_WORDS.has(term) && term.length >= 2),
   );
@@ -339,11 +338,10 @@ function conceptRanking(
   interpretation: QueryInterpretation,
 ): RetrievalRanking {
   const queryTerms = searchableQueryTerms(interpretation);
-  const directIds = new Set(interpretation.resolvedConcepts.map((concept) => concept.conceptId));
+  const subjectConcepts = querySubjectConcepts(interpretation);
+  const directIds = new Set(subjectConcepts.map((concept) => concept.conceptId));
   const relatedIds = new Set(
-    interpretation.resolvedConcepts.flatMap((concept) =>
-      concept.relations.map((relation) => relation.conceptId),
-    ),
+    subjectConcepts.flatMap((concept) => concept.relations.map((relation) => relation.conceptId)),
   );
   const requestedClasses = new Set(interpretation.requestedEntityClasses);
   const provisional = documents.flatMap((document) => {
@@ -353,12 +351,14 @@ function conceptRanking(
       .map((concept) => ({ concept, terms: conceptLabelMatches(concept.label, queryTerms) }))
       .filter((match) => match.terms.length);
     const classMatch = requestedClasses.has(document.entityClass);
-    const score =
+    const semanticScore =
       direct.length * 12 +
       related.length * 7 +
-      lexical.reduce((sum, match) => sum + match.terms.length * 2.5, 0) +
-      Number(classMatch) * 4;
-    if (!score) return [];
+      lexical.reduce((sum, match) => sum + match.terms.length * 2.5, 0);
+    // Entity class is a compatibility constraint and a tie-break boost, never evidence that the
+    // candidate addresses the query subject.
+    if (!semanticScore) return [];
+    const score = semanticScore + Number(classMatch) * 4;
     const matchedConcepts = unique([
       ...direct.map((concept) => concept.conceptId),
       ...related.map((concept) => concept.conceptId),
@@ -389,22 +389,26 @@ function gapRanking(
   interpretation: QueryInterpretation,
   firstPass: RetrievalPassResult,
 ): RetrievalRanking {
-  const resolvedIds = new Set(interpretation.resolvedConcepts.map((concept) => concept.conceptId));
-  const lexicalConceptIds = new Set(
-    firstPass.hits
-      .filter((hit) => hit.retrieverKey === 'concept-neighborhood-v1')
-      .slice(0, 20)
-      .flatMap((hit) => hit.matchedConceptIds),
+  const queryTerms = searchableQueryTerms(interpretation);
+  const minimumLexicalMatches = Math.max(1, Math.ceil(queryTerms.length * 0.5));
+  const resolvedIds = new Set(
+    querySubjectConcepts(interpretation).map((concept) => concept.conceptId),
   );
   const anchorDocuments = documents.filter(
     (document) =>
       firstPass.rankings
         .filter((ranking) => ranking.retrieverKey === 'lexical-token-v1')
-        .flatMap((ranking) => ranking.hits.slice(0, 8))
+        .flatMap((ranking) =>
+          ranking.hits
+            .filter(
+              (hit) =>
+                new Set(hit.matchedTerms.filter((term) => queryTerms.includes(term))).size >=
+                minimumLexicalMatches,
+            )
+            .slice(0, 8),
+        )
         .some((hit) => hit.candidateKey === document.candidateKey) ||
-      document.concepts.some(
-        (concept) => resolvedIds.has(concept.conceptId) || lexicalConceptIds.has(concept.conceptId),
-      ),
+      document.concepts.some((concept) => resolvedIds.has(concept.conceptId)),
   );
   const bridgeCounts = new Map<string, number>();
   for (const document of anchorDocuments) {
@@ -422,12 +426,16 @@ function gapRanking(
   const provisional = documents.flatMap((document) => {
     const bridges = document.concepts.filter((concept) => bridgeIds.has(concept.conceptId));
     if (!bridges.length) return [];
+    const fields = tokenSet(document);
+    const matchedTerms = queryTerms.filter((term) => bestFieldMatch(term, fields).score > 0);
+    const minimumGapMatches = Math.max(1, Math.ceil(queryTerms.length * 0.25));
+    if (matchedTerms.length < minimumGapMatches) return [];
     const incrementalBoost = firstPassKeys.has(document.candidateKey) ? 0 : 3;
     return [
       {
         candidateKey: document.candidateKey,
         nativeScore: bridges.length * 5 + incrementalBoost,
-        matchedTerms: [],
+        matchedTerms,
         matchedConceptIds: bridges.map((concept) => concept.conceptId),
         reason: `Second pass followed ${bridges.map((concept) => concept.label).join(', ')} through co-assigned domain concepts.`,
       },
@@ -600,7 +608,12 @@ export function structuredRerank(
   const queryTerms = searchableQueryTerms(interpretation);
   const exactEntityIds = new Set(interpretation.exactEntities.map((entity) => entity.entityId));
   const directConceptIds = new Set(
-    interpretation.resolvedConcepts.map((concept) => concept.conceptId),
+    querySubjectConcepts(interpretation).map((concept) => concept.conceptId),
+  );
+  const relatedConceptIds = new Set(
+    querySubjectConcepts(interpretation).flatMap((concept) =>
+      concept.relations.map((relation) => relation.conceptId),
+    ),
   );
   const maximumFused = Math.max(0, ...fused.map((candidate) => candidate.fusedScore));
   return fused
@@ -615,9 +628,28 @@ export function structuredRerank(
       const directConcepts = document.concepts.filter((concept) =>
         directConceptIds.has(concept.conceptId),
       );
+      const relatedConceptCount = candidate.matchedConceptIds.filter((conceptId) =>
+        relatedConceptIds.has(conceptId),
+      ).length;
       const indirectConceptCount = candidate.matchedConceptIds.filter(
         (conceptId) => !directConceptIds.has(conceptId),
       ).length;
+      const matchedQueryTermCount = new Set(
+        candidate.matchedTerms.filter((term) => queryTerms.includes(term)),
+      ).size;
+      const minimumLexicalMatches = Math.max(1, Math.ceil(queryTerms.length * 0.5));
+      const boundedGapPath = candidate.contributions.some(
+        (contribution) => contribution.retrieverKey === 'concept-gap-v1',
+      );
+      if (
+        !exactIdentity &&
+        !directConcepts.length &&
+        !relatedConceptCount &&
+        !boundedGapPath &&
+        matchedQueryTermCount < minimumLexicalMatches
+      ) {
+        return [];
+      }
       const requestedClass = interpretation.requestedEntityClasses.some(
         (entityClass) =>
           entityClass === document.entityClass ||

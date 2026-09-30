@@ -104,7 +104,7 @@ describe('knowledge-driven query interpretation', () => {
     const acronym = interpretQuery('oe', {}, knowledge);
     expect(full).toMatchObject({
       intentMode: 'broad_landscape',
-      interpretationMethod: 'deterministic-v3',
+      interpretationMethod: 'deterministic-v4',
       coverageState: 'maintained',
     });
     expect(full.canonicalConcepts).toContain('Ocean engineering');
@@ -114,6 +114,43 @@ describe('knowledge-driven query interpretation', () => {
         stableKey: 'domain:ocean-engineering',
         matchMethod: 'acronym',
       }),
+    );
+  });
+
+  it('resolves a unique acronym inside a longer landscape query', () => {
+    const artificialIntelligence = concept(
+      'domain:artificial-intelligence',
+      'domain',
+      'Artificial intelligence',
+    );
+    const result = interpretQuery(
+      'map reusable systems in the AI developer tool landscape',
+      {},
+      { ...knowledge, concepts: [...knowledge.concepts, artificialIntelligence] },
+    );
+    expect(result).toMatchObject({ intentMode: 'broad_landscape' });
+    expect(result.subjectConcepts).toContainEqual(
+      expect.objectContaining({
+        stableKey: 'domain:artificial-intelligence',
+        matchMethod: 'acronym',
+      }),
+    );
+  });
+
+  it('uses generic morphology when resolving curated alternate concept labels', () => {
+    const localRuntime = concept(
+      'capability:local-model-runtime',
+      'capability',
+      'Local model runtime',
+      { labels: ['Local model runtime', 'Local inference runtime'] },
+    );
+    const result = interpretQuery(
+      'run model inference locally through a developer interface',
+      {},
+      { ...knowledge, concepts: [...knowledge.concepts, localRuntime] },
+    );
+    expect(result.subjectConcepts).toContainEqual(
+      expect.objectContaining({ stableKey: 'capability:local-model-runtime' }),
     );
   });
 
@@ -140,7 +177,7 @@ describe('knowledge-driven query interpretation', () => {
     expect(result.coverageState).toBe('outside_maintained_coverage');
     expect(result.capabilityGroups).toEqual([]);
     expect(result.mechanismTerms).toEqual(
-      expect.arrayContaining(['mycology field notebook', 'field notebook comparison']),
+      expect.arrayContaining(['mycology field notebook', 'field notebook']),
     );
     expect(result.sourceRoutingHints).toEqual(
       expect.arrayContaining(['local_index', 'general_web', 'implementation_forge']),
@@ -161,6 +198,38 @@ describe('knowledge-driven query interpretation', () => {
     });
   });
 
+  it('uses generic result types as constraints rather than subject relevance', () => {
+    const result = interpretQuery('xylophagous beetle stridulation framework', {}, knowledge);
+    expect(result.subjectTerms).toEqual(['xylophagous', 'beetle', 'stridulation']);
+    expect(result.subjectConcepts).toEqual([]);
+    expect(
+      lexicalRelevance(result, {
+        name: 'General web framework',
+        aliases: ['Framework library'],
+        capabilities: ['framework'],
+        searchText: 'A framework for web applications.',
+      }).ordinal,
+    ).toBe('no_match');
+  });
+
+  it('preserves source syntax before normalization and distinguishes local-first from locality', () => {
+    const localFirst = interpretQuery('CRDT local-first database research article', {}, knowledge);
+    expect(localFirst.sourceText).toBe('CRDT local-first database research article');
+    expect(localFirst.subjectTerms).toEqual(['crdt', 'local', 'first', 'database']);
+    expect(localFirst.explicitFacets).not.toContainEqual(
+      expect.objectContaining({ key: 'locality' }),
+    );
+
+    const constrained = interpretQuery('local offline vector database without API key');
+    expect(constrained.subjectTerms).toEqual(['vector', 'database']);
+    expect(constrained.explicitFacets).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ key: 'locality', value: 'offline' }),
+        expect.objectContaining({ key: 'network_constraint', value: 'no_network' }),
+      ]),
+    );
+  });
+
   it('does not treat a one-word interface inside an unseen subject as maintained coverage', () => {
     const result = interpretQuery('xylophagous beetle stridulation library', {}, knowledge);
     expect(result.resolvedConcepts).toContainEqual(
@@ -171,6 +240,33 @@ describe('knowledge-driven query interpretation', () => {
     expect(interpretQuery('MCP server interoperability', {}, knowledge).coverageState).toBe(
       'maintained',
     );
+    const language = concept('interface:language', 'interface', 'Language');
+    expect(
+      interpretQuery(
+        'agglutinative dialect morphology language',
+        {},
+        {
+          ...knowledge,
+          concepts: [...knowledge.concepts, language],
+        },
+      ).coverageState,
+    ).toBe('outside_maintained_coverage');
+
+    const plugin = concept('interface:plugin', 'interface', 'Plugin');
+    expect(
+      interpretQuery(
+        'plugins',
+        {},
+        {
+          ...knowledge,
+          concepts: [...knowledge.concepts, plugin],
+        },
+      ),
+    ).toMatchObject({
+      subjectTerms: ['plugins'],
+      subjectConcepts: [expect.objectContaining({ stableKey: 'interface:plugin' })],
+      coverageState: 'maintained',
+    });
   });
 
   it('separates exact identity, typed, temporal, constrained, and ambiguous intent', () => {
@@ -216,6 +312,39 @@ describe('knowledge-driven query interpretation', () => {
       intentMode: 'knowledge_discovery',
       typedTarget: 'standard',
       requestedEntityClasses: ['standard'],
+    });
+    expect(
+      interpretQuery(
+        'open standard connecting tools to assistants',
+        {},
+        {
+          ...knowledge,
+          concepts: [
+            ...knowledge.concepts,
+            concept('document-type:standard', 'document_type', 'Standard document', {
+              labels: ['Standard document', 'Standard'],
+            }),
+          ],
+        },
+      ),
+    ).toMatchObject({
+      intentMode: 'knowledge_discovery',
+      typedTarget: 'standard',
+      requestedEntityClasses: ['document'],
+    });
+
+    const researchType = concept('document-type:research', 'document_type', 'Research');
+    const withResearch = { ...knowledge, concepts: [...knowledge.concepts, researchType] };
+    expect(
+      interpretQuery('research article about marine robotics', {}, withResearch),
+    ).toMatchObject({
+      intentMode: 'knowledge_discovery',
+      typedTarget: 'article',
+      requestedEntityClasses: ['document'],
+    });
+    expect(interpretQuery('metasearch API for tool research', {}, withResearch)).toMatchObject({
+      typedTarget: null,
+      requestedEntityClasses: [],
     });
   });
 
@@ -280,6 +409,31 @@ describe('knowledge-driven query interpretation', () => {
     ).not.toBe('no_match');
   });
 
+  it('does not let one broad concept satisfy a multi-part subject query', () => {
+    const artificialIntelligence = concept(
+      'domain:artificial-intelligence',
+      'domain',
+      'Artificial intelligence',
+      { labels: ['Artificial intelligence', 'AI'] },
+    );
+    const interpretation = interpretQuery(
+      'AI context reduction',
+      {},
+      {
+        ...knowledge,
+        concepts: [...knowledge.concepts, artificialIntelligence],
+      },
+    );
+    expect(
+      lexicalRelevance(interpretation, {
+        name: 'Artificial Intelligence Roadmap',
+        aliases: ['AI roadmap'],
+        capabilities: ['Artificial intelligence'],
+        searchText: 'A general collection of artificial intelligence resources.',
+      }).ordinal,
+    ).toBe('no_match');
+  });
+
   it('keeps compiled bulk matching identical to one-off matching', () => {
     const interpretation = interpretQuery('prompt compression tool', {}, knowledge);
     const document = {
@@ -316,8 +470,8 @@ describe('bounded research planning', () => {
     const interpretation = interpretQuery('MCP server interoperability', {}, knowledge);
     const plan = buildDiscoveryPlan('MCP server interoperability', interpretation);
     expect(plan).toMatchObject({
-      policyVersion: 'research-plan-v2',
-      interpretationVersion: 'deterministic-v3',
+      policyVersion: 'research-plan-v3',
+      interpretationVersion: 'deterministic-v4',
       budgets: { maximumPasses: 2, maximumVariantsPerSource: 2 },
       stopReason: 'planning_complete',
     });
@@ -327,6 +481,23 @@ describe('bounded research planning', () => {
       disclosure: { privateProjectContextIncluded: false },
     });
     expect(plan.routes.every((item) => item.callLimit <= 1 && item.passIndex === 1)).toBe(true);
+  });
+
+  it('compiles bounded source-native subject queries instead of forwarding every modifier', () => {
+    const supplyChain = interpretQuery('software supply chain SBOM signing and provenance');
+    const supplyPlan = buildDiscoveryPlan(
+      'software supply chain SBOM signing and provenance',
+      supplyChain,
+    );
+    expect(supplyPlan.routes.find((route) => route.adapterKey === 'github')?.variant).toBe(
+      'supply chain sbom',
+    );
+
+    const rust = interpretQuery('Rust async web framework with observability');
+    const rustPlan = buildDiscoveryPlan('Rust async web framework with observability', rust);
+    expect(rustPlan.routes.find((route) => route.adapterKey === 'github')?.variant).toBe(
+      'rust async observability',
+    );
   });
 
   it('plans one bounded targeted second pass from measured gaps', () => {

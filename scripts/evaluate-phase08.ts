@@ -268,7 +268,7 @@ async function runLocalEvaluation(pool: Pool) {
         .filter((route) => route.state === 'planned')
         .map((route) => route.adapterKey),
       coherentPlan:
-        plan.policyVersion === 'research-plan-v2' &&
+        plan.policyVersion === 'research-plan-v3' &&
         result.page.resultSet.interpretation.coverageState === item.expectedPlan.expectedCoverage &&
         result.page.resultSet.retrievalPasses >= item.expectedPlan.minimumPasses &&
         plan.routes.some((route) => route.state === 'planned'),
@@ -443,7 +443,7 @@ async function main(): Promise<void> {
       }),
       configuration: {
         retrieval:
-          'deterministic-v3 + retrieval-fabric-v5 + normalized-weighted-fusion-v1 + structured-rerank-v1',
+          'deterministic-v4 + retrieval-fabric-v6 + normalized-weighted-fusion-v1 + structured-rerank-v1',
         signal: 'intrinsic-signal-v3 (not a relevance input)',
         externalPrivateContextSent: false,
         productionImportsQrels: false,

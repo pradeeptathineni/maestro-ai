@@ -1,5 +1,5 @@
 import { hashCanonical } from './canonical.js';
-import type { QueryInterpretation } from './query.js';
+import { querySubjectConcepts, querySubjectTerms, type QueryInterpretation } from './query.js';
 
 export type DiscoveryAdapterKey = 'github' | 'mcp_registry' | 'searxng' | 'hacker_news';
 export type DiscoveryRouteState = 'planned' | 'skipped' | 'unsupported';
@@ -48,7 +48,7 @@ export interface ResearchCandidateSummary {
 }
 
 export interface DiscoveryPlan {
-  policyVersion: 'research-plan-v2';
+  policyVersion: 'research-plan-v2' | 'research-plan-v3';
   interpretationVersion: QueryInterpretation['interpretationMethod'];
   intentMode: QueryInterpretation['intentMode'];
   requiredCoverage: {
@@ -87,6 +87,54 @@ function boundedVariant(value: string): string {
 
 function normalizeForComparison(value: string): string {
   return value.normalize('NFKC').trim().toLocaleLowerCase('en-US').replace(/\s+/g, ' ');
+}
+
+function variantWords(value: string): string[] {
+  return (
+    value
+      .normalize('NFKC')
+      .match(/[\p{L}\p{N}+#.-]+/gu)
+      ?.map((word) => word.replace(/^[.-]+|[.-]+$/g, ''))
+      .filter(Boolean) ?? []
+  );
+}
+
+function compactSourceVariant(interpretation: QueryInterpretation, maximumTerms: number): string {
+  const subjectTerms = querySubjectTerms(interpretation);
+  const acronymConcept = querySubjectConcepts(interpretation).find(
+    (concept) => concept.matchMethod === 'acronym',
+  );
+  if (acronymConcept && subjectTerms.length <= 2) {
+    return boundedVariant(acronymConcept.preferredLabel);
+  }
+  const sourceTokens = variantWords(interpretation.sourceText ?? interpretation.normalizedText);
+  const technicalTerms = sourceTokens
+    .filter(
+      (word) =>
+        (/^[A-Z][A-Z\d+#.-]+$/.test(word) || /\p{Ll}\p{Lu}/u.test(word)) && word.length >= 2,
+    )
+    .map(normalizeForComparison)
+    .filter((word) => subjectTerms.includes(word));
+  const priorities = [
+    ...subjectTerms.slice(0, 2),
+    ...technicalTerms,
+    ...[...subjectTerms].sort(
+      (left, right) =>
+        right.length - left.length || subjectTerms.indexOf(left) - subjectTerms.indexOf(right),
+    ),
+  ];
+  const selected = [...new Set(priorities)].slice(0, maximumTerms);
+  return boundedVariant(selected.join(' ') || interpretation.normalizedText);
+}
+
+function targetedSourceVariant(
+  interpretation: QueryInterpretation,
+  gapTerms: string[],
+  maximumTerms: number,
+): string {
+  const base = variantWords(compactSourceVariant(interpretation, 3)).map(normalizeForComparison);
+  const gaps = gapTerms.flatMap(variantWords).map(normalizeForComparison);
+  return boundedVariant([...new Set([...base, ...gaps])].slice(0, maximumTerms).join(' '));
 }
 
 function route(input: Omit<DiscoveryPlanRoute, 'id' | 'disclosure'>): DiscoveryPlanRoute {
@@ -192,17 +240,16 @@ export function assessResearchCoverage(
   };
 }
 
-function firstPassRoutes(
-  normalized: string,
-  interpretation: QueryInterpretation,
-): DiscoveryPlanRoute[] {
+function firstPassRoutes(interpretation: QueryInterpretation): DiscoveryPlanRoute[] {
   const exactLabel = interpretation.exactEntities[0]?.preferredLabel;
-  const conceptLabels = interpretation.resolvedConcepts
-    .slice(0, 2)
-    .map((concept) => concept.preferredLabel)
-    .join(' ');
-  const identityVariant = exactLabel ? boundedVariant(`"${exactLabel}"`) : normalized;
-  const conceptVariant = boundedVariant(`${normalized} ${conceptLabels}`);
+  const identityVariant = exactLabel
+    ? boundedVariant(`"${exactLabel}"`)
+    : compactSourceVariant(interpretation, 3);
+  const implementationVariant = compactSourceVariant(interpretation, 3);
+  const webVariant = exactLabel
+    ? boundedVariant(`"${exactLabel}"`)
+    : compactSourceVariant(interpretation, 5);
+  const communityVariant = compactSourceVariant(interpretation, 4);
   const implementationRelevant = interpretation.sourceRoutingHints.includes('implementation_forge');
   const registryRelevant = interpretation.sourceRoutingHints.includes('technology_registry');
   const communityRelevant = interpretation.sourceRoutingHints.includes('community');
@@ -214,7 +261,7 @@ function firstPassRoutes(
       passIndex: 1,
       variantIndex: 1,
       state: implementationRelevant ? 'planned' : 'skipped',
-      variant: implementationRelevant ? conceptVariant : null,
+      variant: implementationRelevant ? implementationVariant : null,
       reason: implementationRelevant
         ? 'Seek concrete implementations under the requested entity-class and concept constraints.'
         : 'An implementation forge is not a primary route for the requested knowledge type.',
@@ -242,7 +289,7 @@ function firstPassRoutes(
       passIndex: 1,
       variantIndex: 1,
       state: 'planned',
-      variant: boundedVariant(`${identityVariant} documentation research`),
+      variant: webVariant,
       reason: 'Search public primary, research, standards, and explanatory sources.',
       expectedEvidenceValue: 'Cross-source leads requiring identity resolution and corroboration.',
       callLimit: 1,
@@ -254,7 +301,7 @@ function firstPassRoutes(
       passIndex: 1,
       variantIndex: 1,
       state: communityRelevant ? 'planned' : 'skipped',
-      variant: communityRelevant ? normalized : null,
+      variant: communityRelevant ? communityVariant : null,
       reason: communityRelevant
         ? 'Collect bounded community-origin terminology and attention leads; corroboration remains required.'
         : 'Community search is reserved for broad, temporal, or explicitly community intent.',
@@ -265,7 +312,6 @@ function firstPassRoutes(
 }
 
 function secondPassRoutes(
-  normalized: string,
   interpretation: QueryInterpretation,
   coverage: ResearchCoverageAssessment | null,
 ): DiscoveryPlanRoute[] {
@@ -273,7 +319,7 @@ function secondPassRoutes(
     ? coverage.missingBranches.slice(0, 3)
     : interpretation.mechanismTerms.slice(0, 3);
   if (!gapTerms.length) return [];
-  const targetedVariant = boundedVariant(`${normalized} ${gapTerms.join(' ')}`);
+  const targetedVariant = targetedSourceVariant(interpretation, gapTerms, 5);
   const routes = [
     route({
       adapterKey: 'searxng',
@@ -320,8 +366,8 @@ export function buildDiscoveryPlan(
   const normalized = boundedVariant(publicQuery);
   if (!normalized) throw new TypeError('A public discovery query is required.');
   const coverageAssessment = options.coverageAssessment ?? null;
-  const routes = firstPassRoutes(normalized, interpretation);
-  const secondRoutes = secondPassRoutes(normalized, interpretation, coverageAssessment);
+  const routes = firstPassRoutes(interpretation);
+  const secondRoutes = secondPassRoutes(interpretation, coverageAssessment);
   const secondPassState: DiscoveryPlan['secondPass']['state'] = coverageAssessment
     ? options.secondPassExecuted
       ? 'completed'
@@ -344,7 +390,7 @@ export function buildDiscoveryPlan(
               ? 'sufficient_local_coverage'
               : 'planning_complete';
   const withoutHash = {
-    policyVersion: 'research-plan-v2' as const,
+    policyVersion: 'research-plan-v3' as const,
     interpretationVersion: interpretation.interpretationMethod,
     intentMode: interpretation.intentMode,
     requiredCoverage: {

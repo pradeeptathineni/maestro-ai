@@ -75,11 +75,20 @@ export type QueryIntentMode =
   | 'ambiguous';
 
 export interface QueryInterpretation {
+  /**
+   * Whitespace-bounded public input before case and punctuation normalization. Version 3
+   * interpretations do not contain this field, so readers must tolerate its absence.
+   */
+  sourceText?: string;
   normalizedText: string;
   terms: string[];
+  /** Query terms that describe the subject, excluding generic result types and constraints. */
+  subjectTerms?: string[];
   expandedTerms: string[];
   canonicalConcepts: string[];
   resolvedConcepts: ResolvedQueryConcept[];
+  /** Subject-bearing concepts; generic entity/document types remain in resolvedConcepts only. */
+  subjectConcepts?: ResolvedQueryConcept[];
   exactEntities: ResolvedQueryEntity[];
   explicitFacets: QueryFacet[];
   inferredFacets: QueryFacet[];
@@ -100,7 +109,7 @@ export interface QueryInterpretation {
     | 'local_retrieval_evidence'
     | 'interpretation_caveat'
     | 'outside_maintained_coverage';
-  interpretationMethod: 'deterministic-v3';
+  interpretationMethod: 'deterministic-v3' | 'deterministic-v4';
   knowledgeStats: {
     availableConcepts: number;
     availableEntities: number;
@@ -135,6 +144,7 @@ const STOP_WORDS = new Set([
   'the',
   'these',
   'those',
+  'through',
   'to',
   'with',
 ]);
@@ -152,6 +162,7 @@ const TEMPORAL_WORDS = new Set([
 ]);
 
 const COMMUNITY_WORDS = new Set(['community', 'discussion', 'forum', 'people', 'social']);
+const LANDSCAPE_WORDS = new Set(['ecosystem', 'landscape', 'overview']);
 
 const PROBLEM_WORDS = new Set([
   'avoid',
@@ -166,6 +177,105 @@ const PROBLEM_WORDS = new Set([
 
 const AUTHORITY_WORDS = new Set(['deploy', 'execute', 'install', 'invoke', 'run']);
 const EXCLUSION_WORDS = new Set(['except', 'exclude', 'excluding', 'not', 'without']);
+
+// These tokens describe the shape of a desired result, not its subject. They remain available in
+// `terms`, resolved type facets, and typedTarget; removing them from `subjectTerms` prevents a
+// request for an arbitrary "library" or "model" from becoming a semantic match for every library
+// or model in the catalog.
+const GENERIC_RESULT_TYPE_WORDS = new Set([
+  'article',
+  'articles',
+  'document',
+  'documents',
+  'framework',
+  'frameworks',
+  'implementation',
+  'implementations',
+  'libraries',
+  'library',
+  'method',
+  'methods',
+  'model',
+  'models',
+  'paper',
+  'papers',
+  'plugin',
+  'plugins',
+  'practice',
+  'practices',
+  'protocol',
+  'protocols',
+  'research',
+  'resource',
+  'resources',
+  'software',
+  'solution',
+  'solutions',
+  'specification',
+  'specifications',
+  'standard',
+  'standards',
+  'study',
+  'studies',
+  'technology',
+  'technologies',
+  'tool',
+  'tools',
+  'workflow',
+  'workflows',
+]);
+
+const QUERY_FORM_WORDS = new Set([
+  'about',
+  'automatic',
+  'automatically',
+  'best',
+  'compare',
+  'comparison',
+  'find',
+  'good',
+  'locate',
+  'map',
+  'operate',
+  'recommend',
+  'rank',
+  'ranks',
+  'show',
+  'top',
+  'versus',
+  'vs',
+  'which',
+  'whichever',
+]);
+
+// These words commonly frame a request or describe how it was phrased. They are intentionally
+// separate from STOP_WORDS because they remain useful in the preserved public query and outbound
+// source variants, but they must not force every local candidate to match conversational grammar.
+const REQUEST_SCAFFOLD_WORDS = new Set([
+  'aimed',
+  'around',
+  'backed',
+  'designed',
+  'despite',
+  'doing',
+  'explicitly',
+  'first',
+  'inside',
+  'more',
+  'published',
+  'source',
+  'toward',
+  'understand',
+]);
+
+const GENERIC_CONCEPT_QUALIFIERS = new Set([
+  ...GENERIC_RESULT_TYPE_WORDS,
+  'cloud',
+  'hosted',
+  'local',
+  'managed',
+  'offline',
+]);
 
 function unique<T>(values: T[]): T[] {
   return [...new Set(values)];
@@ -190,8 +300,118 @@ function normalizedPhrase(value: string): string {
   return normalizedWords(value.replaceAll('-', ' ')).join(' ');
 }
 
+function meaningfulConceptWords(value: string): string[] {
+  return normalizedWords(value).filter(
+    (word) => !STOP_WORDS.has(word) && !GENERIC_CONCEPT_QUALIFIERS.has(word),
+  );
+}
+
+function selectSubjectConcepts(
+  concepts: ResolvedQueryConcept[],
+  allowTypeOnlyInterface = false,
+): ResolvedQueryConcept[] {
+  return concepts.filter((concept) => {
+    if (['domain', 'capability'].includes(concept.facetKey)) return true;
+    if (!['interface', 'service_model'].includes(concept.facetKey)) return false;
+    const words = meaningfulConceptWords(concept.matchedLabel);
+    return (
+      concept.matchMethod === 'acronym' ||
+      words.length >= 2 ||
+      (allowTypeOnlyInterface &&
+        concept.facetKey === 'interface' &&
+        normalizedWords(concept.matchedLabel).some((word) => GENERIC_RESULT_TYPE_WORDS.has(word)))
+    );
+  });
+}
+
+/**
+ * Returns the discriminative subject terms for both current and historical interpretations.
+ * Version 3 rows predate subjectTerms and therefore intentionally fall back to their original
+ * terms so old receipts remain replayable.
+ */
+export function querySubjectTerms(interpretation: QueryInterpretation): string[] {
+  return interpretation.subjectTerms?.length ? interpretation.subjectTerms : interpretation.terms;
+}
+
+/** Version 3 rows retain their original all-resolved-concepts behavior during replay. */
+export function querySubjectConcepts(interpretation: QueryInterpretation): ResolvedQueryConcept[] {
+  if (interpretation.subjectConcepts) return interpretation.subjectConcepts;
+  if (interpretation.interpretationMethod === 'deterministic-v3') {
+    return interpretation.resolvedConcepts;
+  }
+  return selectSubjectConcepts(interpretation.resolvedConcepts);
+}
+
+function extractSubjectTerms(input: {
+  meaningfulTerms: string[];
+  exclusions: string[];
+  explicitFacets: QueryFacet[];
+  protectedCompoundTerms: string[];
+}): string[] {
+  const excludedTerms = new Set(input.exclusions.flatMap(normalizedWords));
+  const protectedCompoundTerms = new Set(input.protectedCompoundTerms);
+  const constrainedTerms = new Set<string>();
+  for (const facet of input.explicitFacets) {
+    if (facet.key === 'locality') {
+      constrainedTerms.add('local');
+      constrainedTerms.add('offline');
+    }
+    if (facet.key === 'temporal') constrainedTerms.add(normalizedPhrase(facet.value));
+    if (facet.key === 'credential') {
+      constrainedTerms.add('key');
+      constrainedTerms.add('no');
+    }
+    if (facet.key === 'network_constraint') {
+      constrainedTerms.add('network');
+      constrainedTerms.add('no');
+    }
+  }
+  const subjectTerms = unique(
+    input.meaningfulTerms.filter(
+      (word) =>
+        !TEMPORAL_WORDS.has(word) &&
+        !COMMUNITY_WORDS.has(word) &&
+        !EXCLUSION_WORDS.has(word) &&
+        !AUTHORITY_WORDS.has(word) &&
+        (!QUERY_FORM_WORDS.has(word) || protectedCompoundTerms.has(word)) &&
+        (!REQUEST_SCAFFOLD_WORDS.has(word) || protectedCompoundTerms.has(word)) &&
+        !GENERIC_RESULT_TYPE_WORDS.has(word) &&
+        !excludedTerms.has(word) &&
+        !constrainedTerms.has(word),
+    ),
+  );
+  if (subjectTerms.length) return subjectTerms;
+  // A type-only query such as "models" is still a legitimate broad browse request. Retaining a
+  // fallback term avoids turning it into an empty query while type facets continue to constrain it.
+  const typeTerms = unique(
+    input.meaningfulTerms.filter((word) => GENERIC_RESULT_TYPE_WORDS.has(word)),
+  );
+  if (typeTerms.length) return typeTerms;
+  return unique(
+    input.meaningfulTerms.filter(
+      (word) =>
+        !TEMPORAL_WORDS.has(word) &&
+        !COMMUNITY_WORDS.has(word) &&
+        !EXCLUSION_WORDS.has(word) &&
+        !AUTHORITY_WORDS.has(word) &&
+        (!QUERY_FORM_WORDS.has(word) || protectedCompoundTerms.has(word)) &&
+        (!REQUEST_SCAFFOLD_WORDS.has(word) || protectedCompoundTerms.has(word)) &&
+        !excludedTerms.has(word),
+    ),
+  );
+}
+
 function wordVariants(word: string): Set<string> {
   const variants = new Set([word]);
+  if (word.endsWith('ly') && word.length > 4) variants.add(word.slice(0, -2));
+  if (word.endsWith('ing') && word.length > 5) {
+    variants.add(word.slice(0, -3));
+    variants.add(`${word.slice(0, -3)}e`);
+  }
+  if (word.endsWith('ed') && word.length > 4) {
+    variants.add(word.slice(0, -2));
+    variants.add(word.slice(0, -1));
+  }
   if (word.endsWith('ies') && word.length > 4) variants.add(`${word.slice(0, -3)}y`);
   if (word.endsWith('es') && word.length > 4) variants.add(word.slice(0, -2));
   if (word.endsWith('s') && word.length > 3) variants.add(word.slice(0, -1));
@@ -245,6 +465,13 @@ function resolveConcepts(
   meaningfulTerms: string[],
   concepts: QueryConceptKnowledge[],
 ): ResolvedQueryConcept[] {
+  const acronymCounts = new Map<string, number>();
+  for (const concept of concepts) {
+    const preferredAcronym = acronym(concept.preferredLabel);
+    if (preferredAcronym) {
+      acronymCounts.set(preferredAcronym, (acronymCounts.get(preferredAcronym) ?? 0) + 1);
+    }
+  }
   const matches: Array<ResolvedQueryConcept & { specificity: number }> = [];
   for (const concept of concepts) {
     const labels = conceptLabels(concept);
@@ -255,7 +482,7 @@ function resolveConcepts(
     const acronymMatch =
       !labelMatch &&
       preferredAcronym &&
-      meaningfulTerms.length <= 4 &&
+      acronymCounts.get(preferredAcronym) === 1 &&
       meaningfulTerms.includes(preferredAcronym)
         ? preferredAcronym
         : null;
@@ -394,18 +621,14 @@ function extractExclusions(words: string[]): string[] {
   return unique(exclusions);
 }
 
-function extractMechanisms(words: string[], resolvedConcepts: ResolvedQueryConcept[]): string[] {
+function extractMechanisms(
+  subjectTerms: string[],
+  resolvedConcepts: ResolvedQueryConcept[],
+): string[] {
   const conceptWords = new Set(
     resolvedConcepts.flatMap((concept) => normalizedWords(concept.matchedLabel)),
   );
-  const candidates = words.filter(
-    (word) =>
-      !STOP_WORDS.has(word) &&
-      !TEMPORAL_WORDS.has(word) &&
-      !COMMUNITY_WORDS.has(word) &&
-      !EXCLUSION_WORDS.has(word) &&
-      !conceptWords.has(word),
-  );
+  const candidates = subjectTerms.filter((word) => !conceptWords.has(word));
   const phrases: string[] = [];
   for (const size of [3, 2]) {
     for (let index = 0; index <= candidates.length - size; index += 1) {
@@ -420,10 +643,41 @@ function typedTargetFor(
   resolvedConcepts: ResolvedQueryConcept[],
   explicitFacets: QueryFacet[],
   meaningfulTerms: string[],
+  normalizedText: string,
 ): { typedTarget: string | null; requestedEntityClasses: string[] } {
   const suppliedEntityClass = explicitFacets
     .filter((facet) => facet.key === 'entity_class' || facet.key === 'entityClass')
     .map((facet) => normalizedPhrase(facet.value).replaceAll(' ', '-'));
+  const documentTypes = resolvedConcepts.filter((concept) => concept.facetKey === 'document_type');
+  const explicitDocumentType = documentTypes
+    .filter((concept) => {
+      const key = concept.stableKey.replace(/^document-type:/, '');
+      if (['article', 'specification', 'standard'].includes(key)) return true;
+      if (key === 'research') {
+        return (
+          /\bresearch (?:article|document|paper|report|study)\b/u.test(normalizedText) ||
+          /^(?:find |show )?research (?:about|on)\b/u.test(normalizedText)
+        );
+      }
+      return false;
+    })
+    .sort((left, right) => {
+      const order = ['specification', 'standard', 'article', 'research'];
+      return (
+        order.indexOf(left.stableKey.replace(/^document-type:/, '')) -
+        order.indexOf(right.stableKey.replace(/^document-type:/, ''))
+      );
+    })[0];
+  // A document-type noun describes the requested artifact even when the same query mentions
+  // implementations as its subject (for example, "a standard connecting tools"). Explicitly
+  // supplied entity-class filters remain authoritative.
+  if (explicitDocumentType && !suppliedEntityClass.length) {
+    const key = explicitDocumentType.stableKey.replace(/^document-type:/, '');
+    return {
+      typedTarget: ['standard', 'specification'].includes(key) ? 'standard' : 'article',
+      requestedEntityClasses: ['document'],
+    };
+  }
   const entityClasses = resolvedConcepts
     .filter((concept) => concept.facetKey === 'entity_class')
     .filter((concept) => {
@@ -469,9 +723,8 @@ function typedTargetFor(
     const first = requestedEntityClasses[0]!;
     return { typedTarget: first === 'document' ? 'article' : first, requestedEntityClasses };
   }
-  const documentType = resolvedConcepts.find((concept) => concept.facetKey === 'document_type');
-  if (!documentType) return { typedTarget: null, requestedEntityClasses };
-  const key = documentType.stableKey.replace(/^document-type:/, '');
+  if (!explicitDocumentType) return { typedTarget: null, requestedEntityClasses };
+  const key = explicitDocumentType.stableKey.replace(/^document-type:/, '');
   return {
     typedTarget: ['standard', 'specification'].includes(key) ? 'standard' : 'article',
     requestedEntityClasses: ['document'],
@@ -491,6 +744,7 @@ function inferIntent(input: {
   if (input.temporalTerms.length) return 'temporal_discovery';
   if (input.meaningfulTerms.some((term) => COMMUNITY_WORDS.has(term))) return 'social_discovery';
   if (input.explicitFacets.length || input.exclusions.length) return 'constrained_discovery';
+  if (input.meaningfulTerms.some((term) => LANDSCAPE_WORDS.has(term))) return 'broad_landscape';
   if (input.typedTarget === 'article' || input.typedTarget === 'standard') {
     return 'knowledge_discovery';
   }
@@ -522,9 +776,18 @@ export function interpretQuery(
   suppliedFacetValues: Record<string, string> = {},
   knowledge: QueryKnowledge = { concepts: [], entities: [] },
 ): QueryInterpretation {
-  const normalizedText = normalizedPhrase(query).slice(0, 1000);
+  const sourceText = bounded(query, 1000);
+  const normalizedText = normalizedPhrase(sourceText).slice(0, 1000);
   if (!normalizedText) throw new TypeError('A query must contain searchable text.');
   const words = normalizedWords(normalizedText);
+  // Syntax-sensitive qualifiers are read before phrase normalization. `local-first`, for example,
+  // is a subject phrase rather than the standalone `local` deployment constraint.
+  const sourceWords = normalizedWords(sourceText);
+  const protectedCompoundTerms = unique(
+    sourceWords
+      .filter((word) => word.includes('-'))
+      .flatMap((word) => normalizedWords(word.replaceAll('-', ' '))),
+  );
   const meaningfulTerms = words.filter((word) => !STOP_WORDS.has(word));
   const supplied = suppliedFacets(suppliedFacetValues);
   const suppliedTerms = supplied.flatMap((facet) => normalizedWords(facet.value));
@@ -535,7 +798,7 @@ export function interpretQuery(
   const temporalTerms = unique(words.filter((word) => TEMPORAL_WORDS.has(word)));
 
   const detectedFacets: QueryFacet[] = [];
-  if (words.includes('github')) {
+  if (sourceWords.includes('github')) {
     detectedFacets.push({
       key: 'distribution',
       label: 'Distribution',
@@ -543,11 +806,11 @@ export function interpretQuery(
       origin: 'explicit',
     });
   }
-  if (words.some((word) => word === 'local' || word === 'offline')) {
+  if (sourceWords.some((word) => word === 'local' || word === 'offline')) {
     detectedFacets.push({
       key: 'locality',
       label: 'Locality',
-      value: words.includes('offline') ? 'offline' : 'local',
+      value: sourceWords.includes('offline') ? 'offline' : 'local',
       origin: 'explicit',
     });
   }
@@ -559,7 +822,7 @@ export function interpretQuery(
       origin: 'explicit',
     });
   }
-  if (normalizedPhrasePresent(normalizedText, 'no network') || words.includes('offline')) {
+  if (normalizedPhrasePresent(normalizedText, 'no network') || sourceWords.includes('offline')) {
     detectedFacets.push({
       key: 'network_constraint',
       label: 'Network constraint',
@@ -588,10 +851,21 @@ export function interpretQuery(
     ...detectedFacets.filter((facet) => !suppliedKeys.has(`${facet.key}:${facet.value}`)),
     ...supplied,
   ];
+  const subjectTerms = extractSubjectTerms({
+    meaningfulTerms,
+    exclusions,
+    explicitFacets,
+    protectedCompoundTerms,
+  });
+  const subjectConcepts = selectSubjectConcepts(
+    resolvedConcepts,
+    subjectTerms.length > 0 && subjectTerms.every((term) => GENERIC_RESULT_TYPE_WORDS.has(term)),
+  );
   const { typedTarget, requestedEntityClasses } = typedTargetFor(
     resolvedConcepts,
     explicitFacets,
     meaningfulTerms,
+    normalizedText,
   );
   const intentMode = inferIntent({
     meaningfulTerms,
@@ -602,9 +876,9 @@ export function interpretQuery(
     exclusions,
     temporalTerms,
   });
-  const mechanismTerms = extractMechanisms(words, resolvedConcepts);
+  const mechanismTerms = extractMechanisms(subjectTerms, subjectConcepts);
   const related = unique(
-    resolvedConcepts.flatMap((concept) =>
+    subjectConcepts.flatMap((concept) =>
       concept.relations
         .filter((relation) =>
           ['narrower', 'related', 'close_match', 'exact_match'].includes(relation.relationType),
@@ -613,7 +887,7 @@ export function interpretQuery(
     ),
   ).slice(0, 16);
   const expandedTerms = unique([
-    ...resolvedConcepts.flatMap((concept) => [
+    ...subjectConcepts.flatMap((concept) => [
       concept.preferredLabel,
       ...concept.relations.slice(0, 12).map((relation) => relation.label),
     ]),
@@ -628,7 +902,7 @@ export function interpretQuery(
     origin: 'inferred' as const,
   }));
   if (
-    words.includes('github') &&
+    sourceWords.includes('github') &&
     !explicitFacets.some((facet) => facet.key === 'integration_target')
   ) {
     inferredFacets.push({
@@ -639,7 +913,7 @@ export function interpretQuery(
     });
   }
   const missingContext: QueryFacet[] = [];
-  if (words.some((word) => word === 'local' || word === 'offline')) {
+  if (sourceWords.some((word) => word === 'local' || word === 'offline')) {
     missingContext.push({
       key: 'hardware',
       label: 'Missing context',
@@ -680,7 +954,7 @@ export function interpretQuery(
 
   const sourceRoutingHints = unique([
     'local_index',
-    ...(resolvedConcepts.length ? ['concept_neighborhood'] : []),
+    ...(subjectConcepts.length ? ['concept_neighborhood'] : []),
     ...(exactEntities.length ? ['exact_identity'] : []),
     'general_web',
     ...(['article', 'standard'].includes(typedTarget ?? '') ||
@@ -691,7 +965,7 @@ export function interpretQuery(
     ...(!['article', 'standard', 'document'].includes(typedTarget ?? '')
       ? ['implementation_forge', 'package_registry']
       : []),
-    ...(resolvedConcepts.some(
+    ...(subjectConcepts.some(
       (concept) => concept.facetKey === 'interface' && concept.stableKey.endsWith('mcp-server'),
     )
       ? ['technology_registry']
@@ -701,31 +975,26 @@ export function interpretQuery(
       : []),
   ]);
   const canonicalConcepts = resolvedConcepts.map((concept) => concept.preferredLabel);
-  const subjectCoverageConcepts = resolvedConcepts.filter((concept) => {
-    if (['domain', 'capability'].includes(concept.facetKey)) return true;
-    if (!['interface', 'service_model'].includes(concept.facetKey)) return false;
-    return (
-      concept.matchMethod === 'acronym' ||
-      normalizedWords(concept.matchedLabel).filter((word) => !STOP_WORDS.has(word)).length >= 2
-    );
-  });
   const capabilityGroups = unique(
     resolvedConcepts
       .filter((concept) => concept.facetKey === 'domain' || concept.facetKey === 'capability')
       .map((concept) => concept.preferredLabel),
   );
   const initialCoverageState =
-    subjectCoverageConcepts.length || exactEntities.length
+    subjectConcepts.length || exactEntities.length
       ? 'maintained'
       : intentMode === 'ambiguous'
         ? 'partial'
         : 'outside_maintained_coverage';
   return {
+    sourceText,
     normalizedText,
     terms,
+    subjectTerms,
     expandedTerms,
     canonicalConcepts,
     resolvedConcepts,
+    subjectConcepts,
     exactEntities,
     explicitFacets,
     inferredFacets,
@@ -747,7 +1016,7 @@ export function interpretQuery(
         : initialCoverageState === 'partial'
           ? 'interpretation_caveat'
           : 'outside_maintained_coverage',
-    interpretationMethod: 'deterministic-v3',
+    interpretationMethod: 'deterministic-v4',
     knowledgeStats: {
       availableConcepts: knowledge.concepts.length,
       availableEntities: knowledge.availableEntityCount ?? knowledge.entities.length,
@@ -774,9 +1043,13 @@ export interface LexicalRelevanceResult {
 export function compileLexicalRelevance(
   interpretation: QueryInterpretation,
 ): (document: LexicalDocument) => LexicalRelevanceResult {
-  const explicitTerms = unique(interpretation.terms.map(normalizedPhrase)).filter(Boolean);
+  const explicitTerms = unique(querySubjectTerms(interpretation).map(normalizedPhrase)).filter(
+    Boolean,
+  );
+  const subjectConcepts = querySubjectConcepts(interpretation);
+  const subjectConceptLabels = subjectConcepts.map((concept) => concept.preferredLabel);
   const expandedTerms = unique(
-    [...interpretation.expandedTerms, ...interpretation.canonicalConcepts]
+    [...interpretation.expandedTerms, ...subjectConceptLabels]
       .map(normalizedPhrase)
       .filter(Boolean),
   );
@@ -802,8 +1075,14 @@ export function compileLexicalRelevance(
       .filter((field) => termMatches.some((match) => match.fields.includes(field.key)))
       .map((field) => field.key);
     const explicitMatched = explicitTerms.filter((term) => matchedTerms.includes(term));
-    const conceptDirect = interpretation.canonicalConcepts.some((label) =>
+    const conceptDirect = subjectConceptLabels.some((label) =>
       fields.some((field) => normalizedPhrasePresent(field.value, label)),
+    );
+    const specificConceptDirect = subjectConcepts.some(
+      (concept) =>
+        (meaningfulConceptWords(concept.matchedLabel).length >= 2 ||
+          (concept.matchMethod === 'acronym' && explicitTerms.length === 1)) &&
+        fields.some((field) => normalizedPhrasePresent(field.value, concept.preferredLabel)),
     );
     const exactEntity = interpretation.exactEntities.some((entity) =>
       [document.name, ...document.aliases].some(
@@ -819,16 +1098,20 @@ export function compileLexicalRelevance(
       : conceptDirect || exactEntity
         ? 1
         : 0;
-    if (!interpretation.resolvedConcepts.length && !exactEntity && explicitRatio < 0.5) {
+    if (!exactEntity && !specificConceptDirect && explicitRatio < 0.5) {
       return { ordinal: 'no_match', value: 0, matchedFields: [], matchedTerms: [] };
     }
     const strongField = matchedFields.some((field) =>
       ['name', 'alias', 'capability'].includes(field),
     );
-    if (exactEntity || (explicitRatio === 1 && strongField) || (conceptDirect && strongField)) {
+    if (
+      exactEntity ||
+      (explicitRatio === 1 && strongField) ||
+      (specificConceptDirect && strongField)
+    ) {
       return { ordinal: 'direct', value: 100, matchedFields, matchedTerms };
     }
-    if (explicitRatio >= 0.6 || (conceptDirect && explicitMatched.length > 0)) {
+    if (explicitRatio >= 0.6 || specificConceptDirect) {
       return { ordinal: 'partial', value: 75, matchedFields, matchedTerms };
     }
     if (matchedFields.some((field) => field === 'capability' || field === 'knowledge')) {

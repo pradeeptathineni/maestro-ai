@@ -404,7 +404,7 @@ async function main(): Promise<void> {
       candidatePoolControl:
         'All three policies are replayed over each query result set identified by one candidate-pool hash.',
       configuration: {
-        retrieval: `deterministic-v3 + retrieval-fabric-v5 + ${fusionPolicy} + structured-rerank-v1`,
+        retrieval: `deterministic-v4 + retrieval-fabric-v6 + ${fusionPolicy} + structured-rerank-v1`,
         fusionPolicy,
         currentSignalPolicy: 'intrinsic-signal-v3',
         compatibilityQuerySignalPolicy: 'query-signal-v2',

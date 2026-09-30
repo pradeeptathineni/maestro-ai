@@ -4,6 +4,8 @@ import {
   compileLexicalRelevance,
   hashCanonical,
   interpretQuery,
+  querySubjectConcepts,
+  querySubjectTerms,
   type QueryInterpretation,
 } from '../../domain/src/index.js';
 import {
@@ -307,16 +309,17 @@ async function loadCorpus(
   const candidateSelectionApplied = Boolean(interpretation && total > corpusCandidateThreshold);
   const candidateTerms = interpretation
     ? uniqueCandidateTerms([
-        interpretation.terms,
+        querySubjectTerms(interpretation),
         interpretation.expandedTerms,
-        interpretation.canonicalConcepts,
+        querySubjectConcepts(interpretation).map((concept) => concept.preferredLabel),
         interpretation.mechanismTerms,
       ])
     : [];
   const tsQuery = postgresPrefixTsQuery(candidateTerms);
   const exactEntityIds = interpretation?.exactEntities.map((entity) => entity.entityId) ?? [];
-  const resolvedConceptIds =
-    interpretation?.resolvedConcepts.map((concept) => concept.conceptId) ?? [];
+  const resolvedConceptIds = interpretation
+    ? querySubjectConcepts(interpretation).map((concept) => concept.conceptId)
+    : [];
   const result = await pool.query<CorpusRow>(
     `WITH priority_projection_ids AS (
        SELECT kp.id,
@@ -459,7 +462,8 @@ async function loadCorpus(
             'document'::text AS "entityClass",
             NULL::text AS "providerId", kd.id::text AS "documentId", kd.title AS name,
             kd.summary, kd.document_kind AS kind, kd.publication_state AS state,
-            kd.aliases, kd.mechanism_keys AS capabilities, kd.search_text AS "searchText",
+            kd.aliases, kd.mechanism_keys AS capabilities,
+            concat_ws(' ', kd.search_text, kd.summary) AS "searchText",
             ARRAY[s.source_type] AS sources, kd.canonical_uri AS "canonicalUri",
             kd.observed_at::text AS "observedAt", kd.value_profile AS "valueProfile",
             NULL::float8 AS "cachedValueConservative",
@@ -596,7 +600,7 @@ export async function listResearchCorpus(
     scoringApplied: normalizedQuery !== null,
     corpusCount: corpusSelection.total,
     candidateSelection: {
-      policyVersion: 'postgres-lexical-candidates-v1',
+      policyVersion: 'postgres-lexical-candidates-v2',
       applied: corpusSelection.candidateSelectionApplied,
       assessedCount: corpus.length,
       limit: corpusSelection.candidateSelectionApplied ? corpusCandidateLimit : null,

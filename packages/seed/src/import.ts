@@ -21,6 +21,7 @@ import { catalogSeedV1 } from './catalog-v1.js';
 import type { SeedProvider } from './types.js';
 import { importPhase06Knowledge } from './phase06-corpus.js';
 import { importKnowledgeDocuments } from './knowledge-documents.js';
+import { importConceptVocabulary } from './concept-vocabulary.js';
 
 const namespace = 'maestro-ai:seed:v1';
 const scorePolicyId = stableUuid(namespace, 'score-policy:consideration-v1');
@@ -889,6 +890,7 @@ export async function importSeed(connectionString?: string): Promise<SeedImportR
     await importReferenceWorkspace(client, importedProviders);
     await importPhase06Knowledge(client);
     await importKnowledgeDocuments(client);
+    await importConceptVocabulary(client);
     await client.query(
       `INSERT INTO ops.audit_events
          (id, actor_type, action, object_type, object_id, correlation_id, after_hash,

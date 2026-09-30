@@ -125,6 +125,49 @@ describe('retrieval fabric', () => {
     expect(first.hits.some((hit) => hit.candidateKey === 'implementation:gamma')).toBe(false);
   });
 
+  it('does not retrieve a candidate from a generic entity-class concept alone', () => {
+    const genericType = {
+      conceptId: 'concept-library',
+      schemeKey: 'test',
+      schemeVersion: 1,
+      stableKey: 'entity-class:implementation',
+      facetKey: 'entity_class',
+      preferredLabel: 'Implementation',
+      matchedLabel: 'library',
+      matchMethod: 'alternate_label' as const,
+      relations: [],
+    };
+    const query = interpretation({
+      normalizedText: 'xylophagous beetle library',
+      terms: ['xylophagous', 'beetle', 'library'],
+      subjectTerms: ['xylophagous', 'beetle'],
+      canonicalConcepts: ['Implementation'],
+      resolvedConcepts: [genericType],
+      subjectConcepts: [],
+      requestedEntityClasses: ['implementation'],
+    });
+    const typeOnly: RetrievalDocument = {
+      candidateKey: 'implementation:type-only',
+      subjectType: 'implementation',
+      entityId: 'type-only',
+      entityClass: 'implementation',
+      kind: 'library',
+      name: 'General utility',
+      aliases: [],
+      searchText: 'A reusable programming utility.',
+      strongIdentityKeys: ['github:example/utility'],
+      concepts: [
+        {
+          conceptId: genericType.conceptId,
+          stableKey: genericType.stableKey,
+          facetKey: genericType.facetKey,
+          label: genericType.preferredLabel,
+        },
+      ],
+    };
+    expect(retrieveFirstPass([typeOnly], query).hits).toEqual([]);
+  });
+
   it('uses a bounded second pass to follow co-assigned domain concepts', () => {
     const first = retrieveFirstPass(documents, interpretation());
     const second = retrieveSecondPass(documents, interpretation(), first);
@@ -133,6 +176,44 @@ describe('retrieval fabric', () => {
       retrieverKey: 'concept-gap-v1',
       passIndex: 2,
     });
+  });
+
+  it('does not open a graph second pass from a one-term incidental anchor', () => {
+    const weakQuery = interpretation({
+      normalizedText: 'quantum error correction',
+      terms: ['quantum', 'error', 'correction'],
+      subjectTerms: ['quantum', 'error', 'correction'],
+      expandedTerms: [],
+      canonicalConcepts: [],
+      resolvedConcepts: [],
+      subjectConcepts: [],
+    });
+    const weakAnchor: RetrievalDocument = {
+      ...documents[2]!,
+      candidateKey: 'implementation:error-handler',
+      entityId: 'error-handler',
+      name: 'Application Error Handler',
+      searchText: 'application reliability error reporting',
+      concepts: [
+        {
+          conceptId: 'domain-reliability',
+          stableKey: 'domain:reliability',
+          facetKey: 'domain',
+          label: 'Reliability engineering',
+        },
+      ],
+    };
+    const bridgeOnly: RetrievalDocument = {
+      ...documents[2]!,
+      candidateKey: 'implementation:reliability-dashboard',
+      entityId: 'reliability-dashboard',
+      name: 'Reliability Dashboard',
+      concepts: weakAnchor.concepts,
+    };
+    const first = retrieveFirstPass([weakAnchor, bridgeOnly], weakQuery);
+    expect(retrieveSecondPass([weakAnchor, bridgeOnly], weakQuery, first).hits).toEqual([]);
+    const fused = fuseRetrievalRankings(first.rankings, 'normalized-weighted-fusion-v1');
+    expect(structuredRerank(fused, [weakAnchor, bridgeOnly], weakQuery)).toEqual([]);
   });
 
   it('compares rank-only RRF with normalized weighted fusion', () => {
