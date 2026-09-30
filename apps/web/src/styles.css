@@ -2718,6 +2718,12 @@ tbody td small {
   padding-top: 1rem;
 }
 
+.corpus-filters > label,
+.corpus-filters select {
+  min-width: 0;
+  max-width: 100%;
+}
+
 .corpus-summary {
   display: grid;
   grid-template-columns: repeat(3, minmax(8rem, auto)) minmax(18rem, 1fr);
