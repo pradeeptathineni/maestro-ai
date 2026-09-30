@@ -1266,6 +1266,68 @@ describe('Phase 06 explorer and authoring contracts', () => {
     expect(disposition.json()).toMatchObject({ disposition: 'reviewed' });
   });
 
+  it('watches concepts, queries, and canonical entities with explicit refresh policy', async () => {
+    const targets = await pool.query<{
+      conceptId: string;
+      querySessionId: string;
+      entityId: string;
+    }>(
+      `
+      SELECT
+        (SELECT id FROM catalog.concepts WHERE status = 'active' ORDER BY id LIMIT 1) AS "conceptId",
+        (SELECT id FROM workspace.query_sessions
+          WHERE workspace_id = $1 AND deleted_at IS NULL
+          ORDER BY created_at DESC LIMIT 1) AS "querySessionId",
+        (SELECT id FROM catalog.knowledge_entities ORDER BY id LIMIT 1) AS "entityId"
+    `,
+      [localWorkspaceId],
+    );
+    const target = targets.rows[0]!;
+    const concept = await app.inject({
+      method: 'POST',
+      url: '/api/v1/watches',
+      headers: mutationHeaders,
+      payload: { conceptId: target.conceptId, cadence: 'adaptive', priority: 60 },
+    });
+    expect(concept.statusCode).toBe(201);
+    expect(concept.json()).toMatchObject({
+      conceptId: target.conceptId,
+      cadence: 'adaptive',
+      cadenceHours: 168,
+      cadencePolicyVersion: 'refresh-cadence-v1',
+    });
+    const query = await app.inject({
+      method: 'POST',
+      url: '/api/v1/watches',
+      headers: mutationHeaders,
+      payload: { querySessionId: target.querySessionId, cadence: 'manual', priority: 50 },
+    });
+    expect(query.statusCode).toBe(201);
+    expect(query.json()).toMatchObject({ querySessionId: target.querySessionId });
+    const entity = await app.inject({
+      method: 'POST',
+      url: '/api/v1/watches',
+      headers: mutationHeaders,
+      payload: { knowledgeEntityId: target.entityId, cadence: 'manual', priority: 50 },
+    });
+    expect(entity.statusCode).toBe(201);
+    expect(entity.json()).toMatchObject({ knowledgeEntityId: target.entityId });
+
+    const listed = await app.inject({
+      method: 'GET',
+      url: '/api/v1/watches',
+      headers: hostHeaders,
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.json<{ items: Array<{ targetKind: string }> }>().items).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ targetKind: 'concept' }),
+        expect.objectContaining({ targetKind: 'query' }),
+        expect.objectContaining({ targetKind: 'entity' }),
+      ]),
+    );
+  });
+
   it('recovers due schedules idempotently and preserves explicit disable state', async () => {
     const provider = await pool.query<{ id: string }>(
       `SELECT p.id FROM catalog.providers p

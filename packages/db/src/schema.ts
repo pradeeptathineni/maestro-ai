@@ -977,6 +977,92 @@ export const intrinsicSignalRuns = catalog.table(
   ],
 );
 
+export const sourceReliabilityAssessments = catalog.table(
+  'source_reliability_assessments',
+  {
+    id: uuid().primaryKey(),
+    sourceId: uuid('source_id')
+      .notNull()
+      .references(() => sources.id),
+    policyVersion: text('policy_version').notNull(),
+    authorityClass: text('authority_class').notNull(),
+    availabilityState: text('availability_state').notNull(),
+    rightsState: text('rights_state').notNull(),
+    reliabilityScore: numeric('reliability_score', { precision: 5, scale: 4 }),
+    evidenceBasis: jsonb('evidence_basis').notNull(),
+    sourceObservationIds: uuid('source_observation_ids').array().notNull().default([]),
+    observedAt: timestamp('observed_at', { withTimezone: true }).notNull(),
+    predecessorId: uuid('predecessor_id'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.sourceId, table.policyVersion, table.observedAt)],
+);
+
+export const entityMetricObservations = catalog.table(
+  'entity_metric_observations',
+  {
+    id: uuid().primaryKey(),
+    knowledgeEntityId: uuid('knowledge_entity_id')
+      .notNull()
+      .references(() => knowledgeEntities.id),
+    metricKey: text('metric_key').notNull(),
+    rawValue: numeric('raw_value'),
+    rawUnit: text('raw_unit').notNull(),
+    normalizedValue: numeric('normalized_value', { precision: 9, scale: 6 }),
+    cohortKey: text('cohort_key').notNull(),
+    normalizationPolicyVersion: text('normalization_policy_version').notNull(),
+    normalizationDetail: jsonb('normalization_detail').notNull(),
+    windowStart: timestamp('window_start', { withTimezone: true }).notNull(),
+    windowEnd: timestamp('window_end', { withTimezone: true }).notNull(),
+    independenceGroup: text('independence_group').notNull(),
+    sourceObservationId: uuid('source_observation_id')
+      .notNull()
+      .references(() => sourceObservations.id),
+    observedAt: timestamp('observed_at', { withTimezone: true }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    unique().on(
+      table.knowledgeEntityId,
+      table.metricKey,
+      table.sourceObservationId,
+      table.windowStart,
+      table.windowEnd,
+    ),
+  ],
+);
+
+export const corroborationAssessments = catalog.table(
+  'corroboration_assessments',
+  {
+    id: uuid().primaryKey(),
+    knowledgeEntityId: uuid('knowledge_entity_id')
+      .notNull()
+      .references(() => knowledgeEntities.id),
+    policyVersion: text('policy_version').notNull(),
+    predicate: text().notNull(),
+    applicabilityScope: text('applicability_scope').notNull(),
+    state: text().notNull(),
+    primarySourceCount: integer('primary_source_count').notNull(),
+    independentSourceCount: integer('independent_source_count').notNull(),
+    communitySourceCount: integer('community_source_count').notNull(),
+    sourceObservationIds: uuid('source_observation_ids').array().notNull().default([]),
+    evidenceItemIds: uuid('evidence_item_ids').array().notNull().default([]),
+    rationale: text().notNull(),
+    observedAt: timestamp('observed_at', { withTimezone: true }).notNull(),
+    predecessorId: uuid('predecessor_id'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    unique().on(
+      table.knowledgeEntityId,
+      table.predicate,
+      table.applicabilityScope,
+      table.observedAt,
+    ),
+  ],
+);
+
 export const entityFacetAssignments = catalog.table(
   'entity_facet_assignments',
   {
@@ -1431,22 +1517,28 @@ export const discoveryAttempts = ops.table('discovery_attempts', {
   finishedAt: timestamp('finished_at', { withTimezone: true }),
 });
 
-export const discoveryCandidates = ops.table('discovery_candidates', {
-  id: uuid().primaryKey(),
-  operationId: uuid('operation_id').notNull(),
-  workspaceId: uuid('workspace_id').notNull(),
-  adapterKey: text('adapter_key').notNull(),
-  externalId: text('external_id').notNull(),
-  canonicalUri: text('canonical_uri').notNull(),
-  title: text().notNull(),
-  summary: text().notNull(),
-  kindHint: text('kind_hint'),
-  sourcePayloadHash: text('source_payload_hash').notNull(),
-  sourcePayload: jsonb('source_payload').notNull(),
-  provenance: jsonb().notNull(),
-  reviewState: text('review_state').notNull(),
-  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-});
+export const discoveryCandidates = ops.table(
+  'discovery_candidates',
+  {
+    id: uuid().primaryKey(),
+    operationId: uuid('operation_id').notNull(),
+    workspaceId: uuid('workspace_id').notNull(),
+    adapterKey: text('adapter_key').notNull(),
+    externalId: text('external_id').notNull(),
+    canonicalUri: text('canonical_uri').notNull(),
+    title: text().notNull(),
+    summary: text().notNull(),
+    kindHint: text('kind_hint'),
+    sourcePayloadHash: text('source_payload_hash').notNull(),
+    sourcePayload: jsonb('source_payload').notNull(),
+    provenance: jsonb().notNull(),
+    reviewState: text('review_state').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    unique().on(table.workspaceId, table.adapterKey, table.externalId, table.sourcePayloadHash),
+  ],
+);
 
 export const discoveryAdmissions = ops.table('discovery_admissions', {
   id: uuid().primaryKey(),
@@ -1489,7 +1581,12 @@ export const watches = workspace.table('watches', {
   providerId: uuid('provider_id'),
   sourceId: uuid('source_id'),
   querySessionId: uuid('query_session_id'),
+  conceptId: uuid('concept_id'),
+  knowledgeEntityId: uuid('knowledge_entity_id'),
   cadence: text().notNull(),
+  cadenceHours: integer('cadence_hours'),
+  cadencePolicyVersion: text('cadence_policy_version').notNull().default('legacy-fixed-v1'),
+  cadenceReason: text('cadence_reason').notNull().default('Historical fixed-cadence watch.'),
   priority: integer().notNull().default(50),
   state: text().notNull(),
   lastCheckedAt: timestamp('last_checked_at', { withTimezone: true }),
@@ -1539,3 +1636,40 @@ export const sourceHealthEvents = ops.table('source_health_events', {
   checkedAt: timestamp('checked_at', { withTimezone: true }).notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
+
+export const adapterYieldObservations = ops.table('adapter_yield_observations', {
+  id: uuid().primaryKey(),
+  adapterKey: text('adapter_key').notNull(),
+  sourceValuePolicyVersion: text('source_value_policy_version').notNull(),
+  intent: text().notNull(),
+  attemptedCalls: integer('attempted_calls').notNull(),
+  successfulCalls: integer('successful_calls').notNull(),
+  returnedCandidates: integer('returned_candidates').notNull(),
+  uniqueCandidates: integer('unique_candidates').notNull(),
+  admittedCandidates: integer('admitted_candidates').notNull().default(0),
+  corroboratedCandidates: integer('corroborated_candidates').notNull().default(0),
+  durationMs: integer('duration_ms').notNull(),
+  costState: text('cost_state').notNull(),
+  costAmount: numeric('cost_amount', { precision: 12, scale: 6 }),
+  healthState: text('health_state').notNull(),
+  windowStart: timestamp('window_start', { withTimezone: true }).notNull(),
+  windowEnd: timestamp('window_end', { withTimezone: true }).notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const discoveryCandidateOrigins = ops.table(
+  'discovery_candidate_origins',
+  {
+    id: uuid().primaryKey(),
+    discoveryCandidateId: uuid('discovery_candidate_id').notNull(),
+    workspaceId: uuid('workspace_id').notNull(),
+    originClass: text('origin_class').notNull(),
+    retrievedVia: text('retrieved_via').notNull(),
+    originUri: text('origin_uri').notNull(),
+    primarySourceUri: text('primary_source_uri'),
+    corroborationState: text('corroboration_state').notNull(),
+    provenanceDetail: jsonb('provenance_detail').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.discoveryCandidateId, table.originUri, table.retrievedVia)],
+);

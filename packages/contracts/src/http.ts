@@ -317,11 +317,47 @@ export const BundleExportBodySchema = Type.Object({
 });
 export type BundleExportBody = Static<typeof BundleExportBodySchema>;
 
-export const WatchBodySchema = Type.Object({
-  providerId: Type.String({ format: 'uuid' }),
-  cadence: Type.Union([Type.Literal('manual'), Type.Literal('daily'), Type.Literal('weekly')]),
-  priority: Type.Optional(Type.Integer({ minimum: 0, maximum: 100 })),
-});
+const WatchCadenceSchema = Type.Union([
+  Type.Literal('manual'),
+  Type.Literal('daily'),
+  Type.Literal('weekly'),
+  Type.Literal('adaptive'),
+]);
+const WatchPrioritySchema = Type.Optional(Type.Integer({ minimum: 0, maximum: 100 }));
+export const WatchBodySchema = Type.Union([
+  Type.Object(
+    {
+      providerId: Type.String({ format: 'uuid' }),
+      cadence: WatchCadenceSchema,
+      priority: WatchPrioritySchema,
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      querySessionId: Type.String({ format: 'uuid' }),
+      cadence: WatchCadenceSchema,
+      priority: WatchPrioritySchema,
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      conceptId: Type.String({ format: 'uuid' }),
+      cadence: WatchCadenceSchema,
+      priority: WatchPrioritySchema,
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      knowledgeEntityId: Type.String({ format: 'uuid' }),
+      cadence: WatchCadenceSchema,
+      priority: WatchPrioritySchema,
+    },
+    { additionalProperties: false },
+  ),
+]);
 export type WatchBody = Static<typeof WatchBodySchema>;
 
 export const WatchStateBodySchema = Type.Object({

@@ -13,6 +13,12 @@ import {
 import { testDatabaseUrl } from '../../test-fixtures/src/database.js';
 import { listProviders, replayStoredScores } from './catalog-repository.js';
 import { createPool } from './client.js';
+import {
+  getEntityCorpusIntelligence,
+  recordCorroboration,
+  recordEntityMetricObservation,
+  recordSourceReliability,
+} from './corpus-intelligence-repository.js';
 import { migrate } from './migrate.js';
 import { checkSchemaDefinitions } from './schema-check.js';
 import { requestDiscovery } from './discovery-repository.js';
@@ -62,6 +68,7 @@ describe('reviewed PostgreSQL contract', () => {
       '0017_research_planner.sql',
       '0018_retrieval_fabric.sql',
       '0019_intrinsic_signal.sql',
+      '0020_corpus_intelligence.sql',
     ]);
     expect(migrations.rows.every((row) => /^[a-f0-9]{64}$/.test(row.sha256))).toBe(true);
   });
@@ -172,7 +179,7 @@ describe('reviewed PostgreSQL contract', () => {
   });
 
   it('keeps reviewed SQL and Drizzle table/column declarations aligned', async () => {
-    expect(await checkSchemaDefinitions(pool)).toEqual({ checkedTables: 91, errors: [] });
+    expect(await checkSchemaDefinitions(pool)).toEqual({ checkedTables: 96, errors: [] });
   });
 
   it('projects every historical provider and document into the faceted knowledge model', async () => {
@@ -216,6 +223,106 @@ describe('reviewed PostgreSQL contract', () => {
         expect.objectContaining({ facetKey: 'document_type', total: 5 }),
       ]),
     );
+  });
+
+  it('keeps source assessments, trend history, and corroboration append-only', async () => {
+    const fixture = await pool.query<{
+      entityId: string;
+      sourceId: string;
+      observationId: string;
+      evidenceId: string;
+    }>(`
+      SELECT entity.id AS "entityId", observation.source_id AS "sourceId",
+             observation.id AS "observationId", evidence.id AS "evidenceId"
+      FROM catalog.knowledge_entities entity
+      JOIN catalog.provider_evidence_bindings binding ON binding.provider_id = entity.provider_id
+      JOIN catalog.evidence_items evidence ON evidence.id = binding.evidence_item_id
+      JOIN catalog.source_observations observation ON observation.id = evidence.source_observation_id
+      ORDER BY entity.id, observation.observed_at DESC LIMIT 1
+    `);
+    const item = fixture.rows[0]!;
+    const reliabilityId = await recordSourceReliability(pool, {
+      sourceId: item.sourceId,
+      authorityClass: 'primary',
+      availabilityState: 'available',
+      rightsState: 'allowed',
+      reliabilityScore: 0.8,
+      evidenceBasis: { basis: 'integration fixture, not a live source claim' },
+      sourceObservationIds: [item.observationId],
+      observedAt: new Date('2026-09-01T00:00:00.000Z'),
+    });
+    await recordEntityMetricObservation(pool, {
+      knowledgeEntityId: item.entityId,
+      metricKey: 'attention',
+      rawValue: 10,
+      rawUnit: 'mentions',
+      normalizedValue: 35,
+      cohortKey: 'fixture:implementations',
+      normalizationPolicyVersion: 'fixture-percentile-v1',
+      normalizationDetail: { method: 'fixture' },
+      windowStart: new Date('2026-07-01T00:00:00.000Z'),
+      windowEnd: new Date('2026-08-01T00:00:00.000Z'),
+      independenceGroup: 'fixture-primary',
+      sourceObservationId: item.observationId,
+      observedAt: new Date('2026-08-01T00:00:00.000Z'),
+    });
+    await recordEntityMetricObservation(pool, {
+      knowledgeEntityId: item.entityId,
+      metricKey: 'attention',
+      rawValue: 20,
+      rawUnit: 'mentions',
+      normalizedValue: 65,
+      cohortKey: 'fixture:implementations',
+      normalizationPolicyVersion: 'fixture-percentile-v1',
+      normalizationDetail: { method: 'fixture' },
+      windowStart: new Date('2026-08-01T00:00:00.000Z'),
+      windowEnd: new Date('2026-09-01T00:00:00.000Z'),
+      independenceGroup: 'fixture-primary',
+      sourceObservationId: item.observationId,
+      observedAt: new Date('2026-09-01T00:00:00.000Z'),
+    });
+    const corroboration = await recordCorroboration(pool, {
+      knowledgeEntityId: item.entityId,
+      predicate: 'fixture-capability',
+      applicabilityScope: 'integration fixture only',
+      evidence: [
+        {
+          sourceId: item.sourceId,
+          independenceGroup: 'publisher',
+          role: 'primary',
+          direction: 'supports',
+        },
+        {
+          sourceId: 'fixture-independent',
+          independenceGroup: 'independent-lab',
+          role: 'independent',
+          direction: 'supports',
+        },
+      ],
+      sourceObservationIds: [item.observationId],
+      evidenceItemIds: [item.evidenceId],
+      observedAt: new Date('2026-09-01T00:00:01.000Z'),
+    });
+    expect(corroboration.state).toBe('corroborated');
+    const intelligence = (await getEntityCorpusIntelligence(pool, item.entityId)) as {
+      trendHistory: unknown[];
+      corroboration: Array<{ state: string }>;
+      sourceReliability: Array<{ authorityClass: string }>;
+    };
+    expect(intelligence.trendHistory).toHaveLength(2);
+    expect(intelligence.corroboration).toContainEqual(
+      expect.objectContaining({ state: 'corroborated' }),
+    );
+    expect(intelligence.sourceReliability).toContainEqual(
+      expect.objectContaining({ authorityClass: 'primary' }),
+    );
+    await expect(
+      pool.query(
+        `UPDATE catalog.source_reliability_assessments
+         SET reliability_score = 0.9 WHERE id = $1`,
+        [reliabilityId],
+      ),
+    ).rejects.toThrow(/immutable/i);
   });
 
   it('persists a bounded open-world plan for an unseen domain without a query-specific rule', async () => {

@@ -11,6 +11,7 @@ import {
   interpretQuery,
   lexicalRelevance,
   newOpaqueId,
+  rankSourcesByMeasuredValue,
   type DiscoveryPlan,
   type DiscoveryRouteState,
   type QueryInterpretation,
@@ -186,6 +187,10 @@ export async function listAdapterStatus(pool: Pool): Promise<unknown[]> {
            COALESCE(budget.denied_calls, 0) AS "deniedCallsToday",
            latest.state AS "healthState", latest.safe_detail AS "healthDetail",
            latest.checked_at AS "lastCheckedAt"
+           ,yield_window.attempted_calls AS "measuredCalls",
+           yield_window.unique_candidates AS "measuredUniqueCandidates",
+           yield_window.admitted_candidates AS "measuredAdmissions",
+           yield_window.corroborated_candidates AS "measuredCorroborations"
     FROM ops.source_adapter_configs config
     LEFT JOIN LATERAL (
       SELECT * FROM ops.source_health_events health
@@ -193,6 +198,15 @@ export async function listAdapterStatus(pool: Pool): Promise<unknown[]> {
     ) latest ON true
     LEFT JOIN ops.adapter_daily_budgets budget
       ON budget.adapter_key = config.adapter_key AND budget.budget_date = current_date
+    LEFT JOIN LATERAL (
+      SELECT COALESCE(sum(attempted_calls), 0)::int AS attempted_calls,
+             COALESCE(sum(unique_candidates), 0)::int AS unique_candidates,
+             COALESCE(sum(admitted_candidates), 0)::int AS admitted_candidates,
+             COALESCE(sum(corroborated_candidates), 0)::int AS corroborated_candidates
+      FROM ops.adapter_yield_observations measured
+      WHERE measured.adapter_key = config.adapter_key
+        AND measured.window_end >= now() - interval '30 days'
+    ) yield_window ON true
     ORDER BY config.adapter_key
   `);
   return result.rows.map((row) => ({
@@ -441,8 +455,43 @@ export async function requestEnabledDiscovery(
   const plan =
     session.rows[0]!.plan ??
     buildDiscoveryPlan(approvedPublicQuery, session.rows[0]!.interpretation);
+  const measured = await pool.query<{
+    adapterKey: string;
+    attemptedCalls: number;
+    successfulCalls: number;
+    uniqueCandidates: number;
+    admittedCandidates: number;
+    corroboratedCandidates: number;
+    durationMs: number;
+    health: 'healthy' | 'partial' | 'failed' | 'unknown';
+  }>(`
+    SELECT adapter_key AS "adapterKey", attempted_calls AS "attemptedCalls",
+           successful_calls AS "successfulCalls", unique_candidates AS "uniqueCandidates",
+           admitted_candidates AS "admittedCandidates",
+           corroborated_candidates AS "corroboratedCandidates", duration_ms AS "durationMs",
+           health_state AS health
+    FROM ops.adapter_yield_observations
+    WHERE window_end >= now() - interval '30 days'
+    ORDER BY window_end DESC
+  `);
+  const values = rankSourcesByMeasuredValue(
+    plan.routes.map((route) => route.adapterKey),
+    measured.rows,
+  );
+  const preference = new Map(values.map((value, index) => [value.adapterKey, index]));
+  const orderedRoutes = plan.routes
+    .map((route, index) => ({ route, index }))
+    .sort(
+      (left, right) =>
+        left.route.passIndex - right.route.passIndex ||
+        Number(right.route.state === 'planned') - Number(left.route.state === 'planned') ||
+        (preference.get(left.route.adapterKey) ?? values.length) -
+          (preference.get(right.route.adapterKey) ?? values.length) ||
+        left.index - right.index,
+    )
+    .map(({ route }) => route);
   const operations: unknown[] = [];
-  for (const route of plan.routes) {
+  for (const route of orderedRoutes) {
     operations.push(
       await requestDiscovery(
         pool,
@@ -588,6 +637,7 @@ export async function processDiscoveryOperation(
 ): Promise<void> {
   const claimed = await pool.query<{
     adapterKey: string;
+    intent: 'explore' | 'deepen';
     baseUrl: string | null;
     timeoutMs: number;
     responseByteLimit: number;
@@ -600,7 +650,8 @@ export async function processDiscoveryOperation(
      FROM ops.source_adapter_configs config
      WHERE operation.id = $1 AND operation.workspace_id = $2 AND operation.state = 'queued'
        AND config.adapter_key = operation.adapter_key AND config.enabled
-     RETURNING operation.adapter_key AS "adapterKey", config.base_url AS "baseUrl",
+     RETURNING operation.adapter_key AS "adapterKey", operation.intent,
+               config.base_url AS "baseUrl",
                config.timeout_ms AS "timeoutMs", config.response_byte_limit AS "responseByteLimit",
                operation.outbound_query AS query,
                operation.started_at AS "startedAt",
@@ -630,15 +681,17 @@ export async function processDiscoveryOperation(
       [payload.operationId, payload.workspaceId],
     );
     const cancelled = latest.rows[0]?.state === 'cancel_requested';
+    let uniqueCandidates = 0;
     for (const lead of result.leads) {
-      await client.query(
+      const candidateId = newOpaqueId();
+      const inserted = await client.query<{ id: string }>(
         `INSERT INTO ops.discovery_candidates
            (id, operation_id, workspace_id, adapter_key, external_id, canonical_uri,
             title, summary, kind_hint, source_payload_hash, source_payload, provenance, review_state)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'lead')
-         ON CONFLICT (adapter_key, external_id, source_payload_hash) DO NOTHING`,
+         ON CONFLICT (workspace_id, adapter_key, external_id, source_payload_hash) DO NOTHING`,
         [
-          newOpaqueId(),
+          candidateId,
           payload.operationId,
           payload.workspaceId,
           row.adapterKey,
@@ -649,6 +702,35 @@ export async function processDiscoveryOperation(
           lead.kindHint,
           hashCanonical(lead.payload),
           json(lead.payload),
+          json(lead.provenance),
+        ],
+      );
+      if (!inserted.rowCount) continue;
+      uniqueCandidates += 1;
+      const originClass =
+        row.adapterKey === 'github'
+          ? 'repository'
+          : row.adapterKey === 'mcp_registry'
+            ? 'structured_registry'
+            : row.adapterKey === 'hacker_news'
+              ? 'community'
+              : 'general_web';
+      const primarySourceUri =
+        row.adapterKey === 'github' || row.adapterKey === 'mcp_registry' ? lead.canonicalUri : null;
+      await client.query(
+        `INSERT INTO ops.discovery_candidate_origins
+           (id, discovery_candidate_id, workspace_id, origin_class, retrieved_via,
+            origin_uri, primary_source_uri, corroboration_state, provenance_detail)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [
+          newOpaqueId(),
+          candidateId,
+          payload.workspaceId,
+          originClass,
+          row.adapterKey,
+          lead.canonicalUri,
+          primarySourceUri,
+          primarySourceUri ? 'primary_only' : 'unverified_lead',
           json(lead.provenance),
         ],
       );
@@ -726,6 +808,27 @@ export async function processDiscoveryOperation(
           : 'Bounded discovery request completed.',
       ],
     );
+    const finishedAt = new Date();
+    await client.query(
+      `INSERT INTO ops.adapter_yield_observations
+         (id, adapter_key, source_value_policy_version, intent, attempted_calls,
+          successful_calls, returned_candidates, unique_candidates, duration_ms,
+          cost_state, health_state, window_start, window_end)
+       VALUES ($1, $2, 'source-value-v1', $3, 1, $4, $5, $6, $7,
+               'unavailable', $8, $9, $10)`,
+      [
+        newOpaqueId(),
+        row.adapterKey,
+        row.intent,
+        result.state === 'failed' ? 0 : 1,
+        result.leads.length,
+        uniqueCandidates,
+        Math.max(0, finishedAt.getTime() - row.startedAt.getTime()),
+        result.state === 'complete' ? 'healthy' : result.state,
+        row.startedAt,
+        finishedAt,
+      ],
+    );
   });
 }
 
@@ -736,13 +839,14 @@ export async function admitDiscoveryCandidate(
   input: DiscoveryAdmissionBody,
 ): Promise<unknown> {
   const candidate = await pool.query<{
+    adapterKey: string;
     title: string;
     summary: string;
     canonicalUri: string;
     kindHint: string | null;
     admissionId: string | null;
   }>(
-    `SELECT dc.title, dc.summary, dc.canonical_uri AS "canonicalUri",
+    `SELECT dc.adapter_key AS "adapterKey", dc.title, dc.summary, dc.canonical_uri AS "canonicalUri",
             dc.kind_hint AS "kindHint", da.id AS "admissionId"
      FROM ops.discovery_candidates dc
      LEFT JOIN ops.discovery_admissions da ON da.discovery_candidate_id = dc.id
@@ -792,6 +896,15 @@ export async function admitDiscoveryCandidate(
       input.rationale,
       hashCanonical({ candidateId, input, providerId: furnished.id }),
     ],
+  );
+  await pool.query(
+    `INSERT INTO ops.adapter_yield_observations
+       (id, adapter_key, source_value_policy_version, intent, attempted_calls,
+        successful_calls, returned_candidates, unique_candidates, admitted_candidates,
+        duration_ms, cost_state, health_state, window_start, window_end)
+     VALUES ($1, $2, 'source-value-v1', 'deepen', 0, 0, 0, 0, 1,
+             0, 'zero', 'unknown', now(), now())`,
+    [newOpaqueId(), candidate.rows[0]!.adapterKey],
   );
   return {
     id: admissionId,

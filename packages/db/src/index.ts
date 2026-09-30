@@ -4,6 +4,7 @@ export * from './catalog-repository.js';
 export * from './config.js';
 export * from './coverage-repository.js';
 export * from './corpus-repository.js';
+export * from './corpus-intelligence-repository.js';
 export * from './discovery-repository.js';
 export * from './errors.js';
 export * from './explorer-repository.js';
