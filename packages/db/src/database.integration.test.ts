@@ -70,6 +70,7 @@ describe('reviewed PostgreSQL contract', () => {
       '0019_intrinsic_signal.sql',
       '0020_corpus_intelligence.sql',
       '0021_history_chain_integrity.sql',
+      '0022_current_knowledge_views.sql',
     ]);
     expect(migrations.rows.every((row) => /^[a-f0-9]{64}$/.test(row.sha256))).toBe(true);
   });
@@ -94,6 +95,119 @@ describe('reviewed PostgreSQL contract', () => {
     );
     expect(documentSubjects.rows[0]!.total).toBe(documentSubjects.rows[0]!.logical);
     expect(documentSubjects.rows[0]!.total).toBeGreaterThan(0);
+  });
+
+  it('projects one effective current row while retaining append-only predecessors', async () => {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const assignment = await client.query<{
+        id: string;
+        entityId: string;
+        facetKey: string;
+        replacementConceptId: string;
+      }>(`
+        SELECT assignment.id, assignment.entity_id AS "entityId",
+               assignment.facet_key AS "facetKey",
+               replacement.id AS "replacementConceptId"
+        FROM catalog.current_entity_facet_assignments assignment
+        JOIN catalog.concepts replacement
+          ON replacement.facet_key = assignment.facet_key
+         AND replacement.id <> assignment.concept_id
+        ORDER BY assignment.id, replacement.id
+        LIMIT 1
+      `);
+      expect(assignment.rowCount).toBe(1);
+      const successorAssignmentId = randomUUID();
+      await client.query(
+        `INSERT INTO catalog.entity_facet_assignments
+           (id, entity_id, concept_id, facet_key, origin, confidence, rationale,
+            source_observation_id, evidence_item_ids, valid_from, supersedes_id)
+         SELECT $1, entity_id, $2, facet_key, 'manual', confidence,
+                'Append-only current-view integration fixture.', source_observation_id,
+                evidence_item_ids, now() - interval '1 second', id
+         FROM catalog.entity_facet_assignments WHERE id = $3`,
+        [successorAssignmentId, assignment.rows[0]!.replacementConceptId, assignment.rows[0]!.id],
+      );
+      const currentAssignments = await client.query<{ id: string }>(
+        `SELECT id FROM catalog.current_entity_facet_assignments
+         WHERE id = ANY($1::uuid[]) ORDER BY id`,
+        [[assignment.rows[0]!.id, successorAssignmentId]],
+      );
+      expect(currentAssignments.rows).toEqual([{ id: successorAssignmentId }]);
+
+      const entities = await client.query<{ id: string }>(
+        'SELECT id FROM catalog.knowledge_entities ORDER BY id LIMIT 2',
+      );
+      const predecessorRelationshipId = randomUUID();
+      const successorRelationshipId = randomUUID();
+      await client.query(
+        `INSERT INTO catalog.knowledge_relationships
+           (id, subject_entity_id, relation_type, object_entity_id, direction,
+            evidence_basis, confidence, revision_scope, valid_from, state)
+         VALUES ($1, $2, 'fixture_relation', $3, 'directed', $4, 0.5, $5,
+                 now() - interval '2 seconds', 'proposed')`,
+        [
+          predecessorRelationshipId,
+          entities.rows[0]!.id,
+          entities.rows[1]!.id,
+          JSON.stringify({ fixture: true }),
+          JSON.stringify({ fixture: true }),
+        ],
+      );
+      await client.query(
+        `INSERT INTO catalog.knowledge_relationships
+           (id, subject_entity_id, relation_type, object_entity_id, direction,
+            evidence_basis, confidence, revision_scope, valid_from, state, supersedes_id)
+         VALUES ($1, $2, 'fixture_relation', $3, 'directed', $4, 0.75, $5,
+                 now() - interval '1 second', 'reviewed', $6)`,
+        [
+          successorRelationshipId,
+          entities.rows[0]!.id,
+          entities.rows[1]!.id,
+          JSON.stringify({ fixture: true, correction: true }),
+          JSON.stringify({ fixture: true }),
+          predecessorRelationshipId,
+        ],
+      );
+      const currentRelationships = await client.query<{ id: string }>(
+        `SELECT id FROM catalog.current_knowledge_relationships
+         WHERE id = ANY($1::uuid[]) ORDER BY id`,
+        [[predecessorRelationshipId, successorRelationshipId]],
+      );
+      expect(currentRelationships.rows).toEqual([{ id: successorRelationshipId }]);
+
+      const scheme = await client.query<{
+        id: string;
+        schemeKey: string;
+        version: number;
+        title: string;
+      }>(`
+        SELECT id, scheme_key AS "schemeKey", version, title
+        FROM catalog.current_concept_schemes ORDER BY scheme_key LIMIT 1
+      `);
+      const successorSchemeId = randomUUID();
+      await client.query(
+        `INSERT INTO catalog.concept_schemes
+           (id, scheme_key, version, title, status, supersedes_id)
+         VALUES ($1, $2, $3, $4, 'active', $5)`,
+        [
+          successorSchemeId,
+          scheme.rows[0]!.schemeKey,
+          scheme.rows[0]!.version + 1,
+          scheme.rows[0]!.title,
+          scheme.rows[0]!.id,
+        ],
+      );
+      const currentScheme = await client.query<{ id: string }>(
+        'SELECT id FROM catalog.current_concept_schemes WHERE scheme_key = $1',
+        [scheme.rows[0]!.schemeKey],
+      );
+      expect(currentScheme.rows).toEqual([{ id: successorSchemeId }]);
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release();
+    }
   });
 
   it('replays every stored score without a mismatch', async () => {

@@ -70,8 +70,7 @@ export async function listTaxonomyFacets(pool: Pool): Promise<{
       GROUP BY entity_class_concept_id
       UNION ALL
       SELECT concept_id, count(DISTINCT entity_id)::int AS entity_count
-      FROM catalog.entity_facet_assignments
-      WHERE valid_to IS NULL
+      FROM catalog.current_entity_facet_assignments
       GROUP BY concept_id
     ), combined_counts AS (
       SELECT concept_id, sum(entity_count)::int AS entity_count
@@ -88,8 +87,8 @@ export async function listTaxonomyFacets(pool: Pool): Promise<{
     FROM catalog.facet_definitions facet
     LEFT JOIN catalog.concepts concept
       ON concept.facet_key = facet.facet_key AND concept.status = 'active'
-    LEFT JOIN catalog.concept_schemes scheme
-      ON scheme.id = concept.concept_scheme_id AND scheme.status = 'active'
+    LEFT JOIN catalog.current_concept_schemes scheme
+      ON scheme.id = concept.concept_scheme_id
     LEFT JOIN combined_counts counts ON counts.concept_id = concept.id
     WHERE concept.id IS NULL OR scheme.id IS NOT NULL
     ORDER BY facet.display_order, COALESCE(counts.entity_count, 0) DESC,
@@ -144,9 +143,9 @@ export async function loadQueryKnowledge(
              COALESCE(array_agg(DISTINCT label.label ORDER BY label.label)
                FILTER (WHERE label.id IS NOT NULL), '{}') AS labels
       FROM catalog.concepts concept
-      JOIN catalog.concept_schemes scheme ON scheme.id = concept.concept_scheme_id
+      JOIN catalog.current_concept_schemes scheme ON scheme.id = concept.concept_scheme_id
       LEFT JOIN catalog.concept_labels label ON label.concept_id = concept.id
-      WHERE concept.status = 'active' AND scheme.status = 'active'
+      WHERE concept.status = 'active'
       GROUP BY concept.id, scheme.scheme_key, scheme.version
       ORDER BY concept.facet_key, concept.preferred_label, concept.id
     `);

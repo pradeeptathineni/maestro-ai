@@ -301,10 +301,9 @@ async function loadRetrievalIndex(
         AND (
           entity.id = ANY($3::uuid[])
           OR EXISTS (
-            SELECT 1 FROM catalog.entity_facet_assignments selected_assignment
+            SELECT 1 FROM catalog.current_entity_facet_assignments selected_assignment
             WHERE selected_assignment.entity_id = entity.id
               AND selected_assignment.concept_id = ANY($4::uuid[])
-              AND selected_assignment.valid_to IS NULL
           )
         )
     ), lexical_projection_ids AS (
@@ -387,9 +386,9 @@ async function loadRetrievalIndex(
                'facetKey', concept.facet_key,
                'label', concept.preferred_label
              ) ORDER BY concept.facet_key, concept.stable_key, concept.id) AS concepts
-      FROM catalog.entity_facet_assignments assignment
+      FROM catalog.current_entity_facet_assignments assignment
       JOIN catalog.concepts concept ON concept.id = assignment.concept_id
-      WHERE assignment.entity_id = entity.id AND assignment.valid_to IS NULL
+      WHERE assignment.entity_id = entity.id
     ) facets ON true
     ORDER BY selected.selection_priority, selected.lexical_rank DESC,
              kp.preferred_label, kp.provider_id
@@ -422,10 +421,9 @@ async function loadRetrievalIndex(
              CASE WHEN NOT $1::boolean THEN 2
                   WHEN entity.id = ANY($3::uuid[]) THEN 0
                   WHEN EXISTS (
-                    SELECT 1 FROM catalog.entity_facet_assignments selected_assignment
+                    SELECT 1 FROM catalog.current_entity_facet_assignments selected_assignment
                     WHERE selected_assignment.entity_id = entity.id
                       AND selected_assignment.concept_id = ANY($4::uuid[])
-                      AND selected_assignment.valid_to IS NULL
                   ) THEN 1 ELSE 2 END AS selection_priority,
              ts_rank_cd(
                to_tsvector(
@@ -441,10 +439,9 @@ async function loadRetrievalIndex(
           NOT $1::boolean
           OR entity.id = ANY($3::uuid[])
           OR EXISTS (
-            SELECT 1 FROM catalog.entity_facet_assignments selected_assignment
+            SELECT 1 FROM catalog.current_entity_facet_assignments selected_assignment
             WHERE selected_assignment.entity_id = entity.id
               AND selected_assignment.concept_id = ANY($4::uuid[])
-              AND selected_assignment.valid_to IS NULL
           )
           OR document.aliases && $6::text[]
           OR document.mechanism_keys && $6::text[]
@@ -482,9 +479,9 @@ async function loadRetrievalIndex(
                'facetKey', concept.facet_key,
                'label', concept.preferred_label
              ) ORDER BY concept.facet_key, concept.stable_key, concept.id) AS concepts
-      FROM catalog.entity_facet_assignments assignment
+      FROM catalog.current_entity_facet_assignments assignment
       JOIN catalog.concepts concept ON concept.id = assignment.concept_id
-      WHERE assignment.entity_id = entity.id AND assignment.valid_to IS NULL
+      WHERE assignment.entity_id = entity.id
     ) facets ON true
     ORDER BY selected.selection_priority, selected.lexical_rank DESC,
              document.title, document.id

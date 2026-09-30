@@ -78,12 +78,24 @@ reference.
 The readiness gate checks the ordered repository migrations; catalog cardinality remains diagnostic
 data rather than readiness.
 
-Drizzle declarations mirror queryable concepts but do not replace reviewed SQL. Startup never uses
-schema push. Corrections to immutable evidence, score, context, and decision records require a new
-revision or explicit supersession.
+Drizzle declarations mirror base-table contracts but do not replace reviewed SQL; derived current
+views remain explicit migrations and raw repository queries. Startup never uses schema push.
+Corrections to immutable evidence, score, context, and decision records require a new revision or
+explicit supersession.
+
+Migration `0020` records append-only source reliability, metric history, corroboration, refresh
+policy, and typed concept/query/entity watches. Query deletion disables its watches in the same
+transaction; refresh attempts retain their target, lease, source-attempt, change, and stop-reason
+lineage.
 
 Migration `0021` binds predecessor and supersession foreign keys to their logical owner. A revision
 cannot cite a row from another entity, document, source, query session, provider, facet, or
 relationship subject merely because the referenced UUID exists. Source-reliability and
 corroboration writers also serialize appends on the logical history key so concurrent writes form
 one lineage.
+
+Migration `0022` adds indexed current-state projections over immutable histories. The current
+concept-scheme view selects the newest active version per stable scheme key. Current facet and
+relationship views honor validity windows and exclude rows with an effective append-only
+successor. Historical base rows remain directly queryable and unchanged; current search and filter
+paths use the projections so a correction does not leave both predecessor and successor active.

@@ -329,10 +329,9 @@ async function loadCorpus(
          AND (
            entity.id = ANY($6::uuid[])
            OR EXISTS (
-             SELECT 1 FROM catalog.entity_facet_assignments selected_assignment
+             SELECT 1 FROM catalog.current_entity_facet_assignments selected_assignment
              WHERE selected_assignment.entity_id = entity.id
                AND selected_assignment.concept_id = ANY($7::uuid[])
-               AND selected_assignment.valid_to IS NULL
            )
          )
      ), lexical_projection_ids AS (

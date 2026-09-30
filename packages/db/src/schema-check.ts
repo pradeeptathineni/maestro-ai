@@ -27,11 +27,16 @@ export async function checkSchemaDefinitions(pool: Pool): Promise<SchemaCheckRes
     tableName: string;
     columnName: string;
   }>(`
-    SELECT table_schema AS "schemaName", table_name AS "tableName",
-           column_name AS "columnName"
-    FROM information_schema.columns
-    WHERE table_schema IN ('catalog', 'workspace', 'ops')
-    ORDER BY table_schema, table_name, ordinal_position
+    SELECT column_info.table_schema AS "schemaName",
+           column_info.table_name AS "tableName",
+           column_info.column_name AS "columnName"
+    FROM information_schema.columns column_info
+    JOIN information_schema.tables table_info
+      ON table_info.table_schema = column_info.table_schema
+     AND table_info.table_name = column_info.table_name
+     AND table_info.table_type = 'BASE TABLE'
+    WHERE column_info.table_schema IN ('catalog', 'workspace', 'ops')
+    ORDER BY column_info.table_schema, column_info.table_name, column_info.ordinal_position
   `);
   const actual = new Map<string, Set<string>>();
   for (const row of physical.rows) {
