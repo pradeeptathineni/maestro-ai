@@ -13,6 +13,7 @@ import {
   type WatchTargetKind,
 } from '../../domain/src/index.js';
 import { ConflictError, DomainValidationError, NotFoundError } from './errors.js';
+import { refreshExplorerSession } from './explorer-repository.js';
 import { inTransaction } from './transaction.js';
 
 type JsonRow = Record<string, unknown>;
@@ -30,6 +31,8 @@ interface WatchRow {
   state: 'active' | 'paused' | 'disabled';
   sourceWatermark: string | null;
   failureCount: number;
+  leaseToken: string | null;
+  leaseUntil: Date | null;
 }
 
 interface CheckOptions {
@@ -38,6 +41,8 @@ interface CheckOptions {
   adapterVersion: string;
   trustBoundary: 'remote_untrusted' | 'human_entered';
   excerpt?: string;
+  expectedLeaseToken?: string;
+  recordSourceObservation?: boolean;
 }
 
 function json(value: unknown): string {
@@ -58,6 +63,118 @@ function nextDue(
     ? Math.min(cadenceMs, 15 * 60 * 1000 * 2 ** Math.min(consecutiveFailures - 1, 10))
     : cadenceMs;
   return new Date(from.getTime() + delayMs);
+}
+
+async function localTargetWatermark(
+  client: Pool | PoolClient,
+  target: Pick<WatchRow, 'querySessionId' | 'conceptId' | 'knowledgeEntityId'>,
+): Promise<string | null> {
+  if (target.querySessionId) {
+    const result = await client.query<{ resultHash: string }>(
+      `SELECT result_hash AS "resultHash"
+       FROM workspace.query_result_sets
+       WHERE query_session_id = $1 ORDER BY revision DESC LIMIT 1`,
+      [target.querySessionId],
+    );
+    return result.rows[0]?.resultHash ?? null;
+  }
+  if (target.conceptId) {
+    const concept = await client.query<JsonRow>(
+      `SELECT id, concept_scheme_id AS "conceptSchemeId", facet_key AS "facetKey",
+              stable_key AS "stableKey", preferred_label AS "preferredLabel",
+              definition, status
+       FROM catalog.concepts WHERE id = $1`,
+      [target.conceptId],
+    );
+    const labels = await client.query<JsonRow>(
+      `SELECT label, normalized_label AS "normalizedLabel", label_kind AS "labelKind", locale,
+              source_observation_id AS "sourceObservationId"
+       FROM catalog.concept_labels WHERE concept_id = $1
+       ORDER BY normalized_label, label_kind, locale, id`,
+      [target.conceptId],
+    );
+    const relations = await client.query<JsonRow>(
+      `SELECT subject_concept_id AS "subjectConceptId", relation_type AS "relationType",
+              object_concept_id AS "objectConceptId", confidence::float8,
+              evidence_basis AS "evidenceBasis", valid_from AS "validFrom",
+              valid_to AS "validTo"
+       FROM catalog.concept_relations
+       WHERE subject_concept_id = $1 OR object_concept_id = $1
+       ORDER BY subject_concept_id, relation_type, object_concept_id, valid_from, id`,
+      [target.conceptId],
+    );
+    const assignments = await client.query<JsonRow>(
+      `SELECT entity_id AS "entityId", facet_key AS "facetKey", confidence::float8,
+              rationale, valid_from AS "validFrom", valid_to AS "validTo",
+              supersedes_id AS "supersedesId"
+       FROM catalog.entity_facet_assignments WHERE concept_id = $1
+       ORDER BY entity_id, valid_from, id`,
+      [target.conceptId],
+    );
+    if (!concept.rowCount) return null;
+    return hashCanonical({
+      concept: concept.rows[0],
+      labels: labels.rows,
+      relations: relations.rows,
+      assignments: assignments.rows,
+    });
+  }
+  if (target.knowledgeEntityId) {
+    const entity = await client.query<JsonRow>(
+      `SELECT id, source_kind AS "sourceKind", provider_id AS "providerId",
+              document_id AS "documentId"
+       FROM catalog.knowledge_entities WHERE id = $1`,
+      [target.knowledgeEntityId],
+    );
+    const revisions = await client.query<JsonRow>(
+      `SELECT revision, entity_class_concept_id AS "entityClassConceptId",
+              preferred_label AS "preferredLabel", summary, lifecycle_state AS "lifecycleState",
+              source_observation_id AS "sourceObservationId", predecessor_id AS "predecessorId",
+              content_hash AS "contentHash"
+       FROM catalog.knowledge_entity_revisions WHERE entity_id = $1
+       ORDER BY revision, id`,
+      [target.knowledgeEntityId],
+    );
+    const facets = await client.query<JsonRow>(
+      `SELECT concept_id AS "conceptId", facet_key AS "facetKey", origin,
+              confidence::float8, rationale, source_observation_id AS "sourceObservationId",
+              evidence_item_ids AS "evidenceItemIds", valid_from AS "validFrom",
+              valid_to AS "validTo", supersedes_id AS "supersedesId"
+       FROM catalog.entity_facet_assignments WHERE entity_id = $1
+       ORDER BY facet_key, concept_id, valid_from, id`,
+      [target.knowledgeEntityId],
+    );
+    const relationships = await client.query<JsonRow>(
+      `SELECT subject_entity_id AS "subjectEntityId", relation_type AS "relationType",
+              object_entity_id AS "objectEntityId", object_concept_id AS "objectConceptId",
+              direction, confidence::float8, revision_scope AS "revisionScope",
+              valid_from AS "validFrom", valid_to AS "validTo", state,
+              supersedes_id AS "supersedesId"
+       FROM catalog.knowledge_relationships
+       WHERE subject_entity_id = $1 OR object_entity_id = $1
+       ORDER BY subject_entity_id, relation_type, object_entity_id, object_concept_id,
+                valid_from, id`,
+      [target.knowledgeEntityId],
+    );
+    const documentRevisions = await client.query<JsonRow>(
+      `SELECT revision, predecessor_id AS "predecessorId",
+              supersedes_document_id AS "supersedesDocumentId", content_digest AS "contentDigest",
+              publication_state AS "publicationState", observed_at AS "observedAt", change_kind AS "changeKind"
+       FROM catalog.knowledge_document_revisions
+       WHERE document_id = (SELECT document_id FROM catalog.knowledge_entities WHERE id = $1)
+       ORDER BY revision, id`,
+      [target.knowledgeEntityId],
+    );
+    if (!entity.rowCount) return null;
+    return hashCanonical({
+      entity: entity.rows[0],
+      revisions: revisions.rows,
+      facets: facets.rows,
+      relationships: relationships.rows,
+      documentRevisions: documentRevisions.rows,
+    });
+  }
+  return null;
 }
 
 async function enqueueWatch(
@@ -91,7 +208,8 @@ async function readWatchForUpdate(
             watch.source_id AS "sourceId", watch.query_session_id AS "querySessionId",
             watch.concept_id AS "conceptId", watch.knowledge_entity_id AS "knowledgeEntityId",
             watch.cadence, watch.cadence_hours AS "cadenceHours", watch.state,
-            watch.source_watermark AS "sourceWatermark", watch.failure_count AS "failureCount"
+            watch.source_watermark AS "sourceWatermark", watch.failure_count AS "failureCount",
+            watch.lease_token AS "leaseToken", watch.lease_until AS "leaseUntil"
      FROM workspace.watches watch
      LEFT JOIN catalog.knowledge_entities entity ON entity.id = watch.knowledge_entity_id
      WHERE watch.id = $1 AND watch.workspace_id = $2 FOR UPDATE OF watch`,
@@ -196,6 +314,9 @@ export async function createWatch(
         : [providerId ?? conceptId ?? knowledgeEntityId],
     );
     if (!target.rowCount) throw new NotFoundError(`${targetKind} watch target not found.`);
+    const localWatermark = providerId
+      ? null
+      : await localTargetWatermark(client, { querySessionId, conceptId, knowledgeEntityId });
     const cadenceDecision = deriveRefreshCadence({
       targetKind,
       entityClass: target.rows[0]!.entityClass,
@@ -240,7 +361,7 @@ export async function createWatch(
         watchId,
         workspaceId,
         providerId,
-        target.rows[0]!.sourceId,
+        providerId ? target.rows[0]!.sourceId : null,
         querySessionId,
         conceptId,
         knowledgeEntityId,
@@ -251,7 +372,7 @@ export async function createWatch(
           ? cadenceDecision.reason
           : `Explicit ${input.cadence} cadence selected by the workspace actor.`,
         input.priority ?? 50,
-        target.rows[0]!.watermark,
+        providerId ? target.rows[0]!.watermark : localWatermark,
         initialDue,
       ],
     );
@@ -316,7 +437,8 @@ export async function setWatchState(
     const dueAt = input.state === 'active' && watch.cadence !== 'manual' ? new Date() : null;
     const result = await client.query<JsonRow>(
       `UPDATE workspace.watches
-       SET state = $3, next_due_at = $4, updated_at = now()
+       SET state = $3, next_due_at = $4, lease_token = NULL, lease_until = NULL,
+           updated_at = now()
        WHERE id = $1 AND workspace_id = $2
        RETURNING id, state, next_due_at AS "nextDueAt"`,
       [watchId, workspaceId, input.state, dueAt],
@@ -355,7 +477,29 @@ export async function recordWatchCheck(
 ): Promise<unknown> {
   return inTransaction(pool, async (client) => {
     const watch = await readWatchForUpdate(client, workspaceId, watchId);
+    if (options.expectedLeaseToken && watch.leaseToken !== options.expectedLeaseToken) {
+      return {
+        watchId,
+        outcome: 'superseded',
+        observationId: null,
+        materialChange: null,
+        nextDueAt: null,
+      };
+    }
     if (watch.state !== 'active') throw new ConflictError('Paused watches cannot record checks.');
+    if (
+      !options.expectedLeaseToken &&
+      watch.leaseToken &&
+      watch.leaseUntil &&
+      watch.leaseUntil > new Date()
+    ) {
+      throw new ConflictError('A scheduled refresh currently owns this watch.');
+    }
+    const recordSourceObservation =
+      options.recordSourceObservation ??
+      Boolean(
+        watch.sourceId && !watch.querySessionId && !watch.conceptId && !watch.knowledgeEntityId,
+      );
     if (input.outcome !== 'failed' && !input.watermark) {
       throw new DomainValidationError('Successful checks require a content watermark.');
     }
@@ -373,50 +517,61 @@ export async function recordWatchCheck(
     const failureCount = input.outcome === 'failed' ? Math.min(20, watch.failureCount + 1) : 0;
     const dueAt = nextDue(watch.cadence, watch.cadenceHours, checkedAt, failureCount);
     let observationId: string | null = null;
+    let priorObservationId: string | null = null;
     let change: JsonRow | null = null;
     if (input.outcome === 'changed') {
-      if (!watch.sourceId) {
-        throw new DomainValidationError('A changed source check requires a bound source.');
+      if (recordSourceObservation) {
+        if (!watch.sourceId) {
+          throw new DomainValidationError('A changed source check requires a bound source.');
+        }
+        const source = await client.query<{ uri: string }>(
+          `SELECT canonical_uri AS uri FROM catalog.sources WHERE id = $1`,
+          [watch.sourceId],
+        );
+        if (!source.rowCount) throw new NotFoundError('Watched source not found.');
+        const prior = await client.query<{ id: string }>(
+          `SELECT id FROM catalog.source_observations
+           WHERE source_id = $1 ORDER BY observed_at DESC, id DESC LIMIT 1`,
+          [watch.sourceId],
+        );
+        priorObservationId = prior.rows[0]?.id ?? null;
+        observationId = newOpaqueId();
+        await client.query(
+          `INSERT INTO catalog.source_observations
+             (id, source_id, requested_uri, final_uri, observed_at, retrieval_method,
+              adapter_version, content_digest, excerpt, media_type, trust_boundary,
+              handling_status)
+           VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8, 'application/json', $9, 'normalized')`,
+          [
+            observationId,
+            watch.sourceId,
+            source.rows[0]!.uri,
+            checkedAt,
+            options.retrievalMethod,
+            options.adapterVersion,
+            input.watermark,
+            options.excerpt ?? input.reason,
+            options.trustBoundary,
+          ],
+        );
       }
-      const source = await client.query<{ uri: string }>(
-        `SELECT canonical_uri AS uri FROM catalog.sources WHERE id = $1`,
-        [watch.sourceId],
-      );
-      if (!source.rowCount) throw new NotFoundError('Watched source not found.');
-      const prior = await client.query<{ id: string }>(
-        `SELECT id FROM catalog.source_observations
-         WHERE source_id = $1 ORDER BY observed_at DESC, id DESC LIMIT 1`,
-        [watch.sourceId],
-      );
-      observationId = newOpaqueId();
-      await client.query(
-        `INSERT INTO catalog.source_observations
-           (id, source_id, requested_uri, final_uri, observed_at, retrieval_method,
-            adapter_version, content_digest, excerpt, media_type, trust_boundary,
-            handling_status)
-         VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8, 'application/json', $9, 'normalized')`,
-        [
-          observationId,
-          watch.sourceId,
-          source.rows[0]!.uri,
-          checkedAt,
-          options.retrievalMethod,
-          options.adapterVersion,
-          input.watermark,
-          options.excerpt ?? input.reason,
-          options.trustBoundary,
-        ],
-      );
-      const affectedResult = watch.providerId
+      const affectedResult = watch.querySessionId
         ? await client.query<{ id: string }>(
-            `SELECT qri.result_set_id AS id
+            `SELECT id FROM workspace.query_result_sets
+             WHERE workspace_id = $1 AND query_session_id = $2
+             ORDER BY revision DESC LIMIT 1`,
+            [workspaceId, watch.querySessionId],
+          )
+        : watch.providerId
+          ? await client.query<{ id: string }>(
+              `SELECT qri.result_set_id AS id
              FROM workspace.query_result_items qri
              JOIN workspace.query_result_sets qrs ON qrs.id = qri.result_set_id
              WHERE qri.workspace_id = $1 AND qri.provider_id = $2
              ORDER BY qrs.created_at DESC LIMIT 1`,
-            [workspaceId, watch.providerId],
-          )
-        : { rows: [] };
+              [workspaceId, watch.providerId],
+            )
+          : { rows: [] };
       const affectedDecision = watch.providerId
         ? await client.query<{ id: string }>(
             `SELECT d.id
@@ -430,7 +585,8 @@ export async function recordWatchCheck(
         : { rows: [] };
       const changeHash = hashCanonical({
         watchId,
-        priorObservationId: prior.rows[0]?.id ?? null,
+        priorObservationId,
+        priorWatermark: watch.sourceWatermark,
         newWatermark: input.watermark,
         predicate: input.predicate ?? 'source-content',
         applicabilityScope: input.applicabilityScope ?? 'watched provider',
@@ -449,7 +605,7 @@ export async function recordWatchCheck(
           workspaceId,
           watchId,
           watch.providerId,
-          prior.rows[0]?.id ?? null,
+          priorObservationId,
           observationId,
           input.predicate ?? 'source-content',
           input.applicabilityScope ?? 'watched provider',
@@ -481,7 +637,7 @@ export async function recordWatchCheck(
       ],
     );
     const adapterKey = await adapterForSource(client, watch.sourceId);
-    if (adapterKey) {
+    if (adapterKey && recordSourceObservation) {
       await client.query(
         `INSERT INTO ops.source_health_events
            (id, adapter_key, source_id, state, safe_detail, observation_id, checked_at)
@@ -613,12 +769,18 @@ export async function processWatchRefresh(
   const target = await pool.query<{
     state: string;
     identity: string | null;
+    querySessionId: string | null;
+    conceptId: string | null;
+    knowledgeEntityId: string | null;
+    sourceWatermark: string | null;
   }>(
     `UPDATE workspace.watches w
      SET lease_token = $3, lease_until = now() + interval '5 minutes', updated_at = now()
      WHERE w.id = $1 AND w.workspace_id = $2 AND w.state = 'active'
        AND (w.lease_until IS NULL OR w.lease_until < now())
-     RETURNING w.state,
+     RETURNING w.state, w.query_session_id AS "querySessionId",
+       w.concept_id AS "conceptId", w.knowledge_entity_id AS "knowledgeEntityId",
+       w.source_watermark AS "sourceWatermark",
        (SELECT normalized_value
         FROM catalog.provider_identities
         WHERE provider_id = COALESCE(
@@ -631,7 +793,58 @@ export async function processWatchRefresh(
     [payload.watchId, payload.workspaceId, leaseToken],
   );
   if (!target.rowCount || target.rows[0]!.state !== 'active') return;
-  if (!target.rows[0]!.identity) {
+  const claimed = target.rows[0]!;
+  if (claimed.querySessionId || claimed.conceptId || claimed.knowledgeEntityId) {
+    if (claimed.querySessionId) {
+      await refreshExplorerSession(pool, payload.workspaceId, claimed.querySessionId);
+    }
+    const watermark = await localTargetWatermark(pool, claimed);
+    if (!watermark) {
+      await recordWatchCheck(
+        pool,
+        payload.workspaceId,
+        payload.watchId,
+        { outcome: 'failed', reason: 'The watched local target is no longer available.' },
+        {
+          actorType: 'system',
+          retrievalMethod: 'local_corpus_snapshot',
+          adapterVersion: 'local-watch-v1',
+          trustBoundary: 'human_entered',
+          expectedLeaseToken: leaseToken,
+          recordSourceObservation: false,
+        },
+      );
+      return;
+    }
+    const changed = claimed.sourceWatermark !== null && claimed.sourceWatermark !== watermark;
+    const targetKind = claimed.querySessionId ? 'query' : claimed.conceptId ? 'concept' : 'entity';
+    await recordWatchCheck(
+      pool,
+      payload.workspaceId,
+      payload.watchId,
+      {
+        outcome: changed ? 'changed' : 'unchanged',
+        watermark,
+        predicate: `${targetKind}-corpus-snapshot`,
+        applicabilityScope: `local ${targetKind} knowledge state`,
+        reason: changed
+          ? `The watched ${targetKind} changed in the local append-only corpus.`
+          : claimed.sourceWatermark
+            ? `The watched ${targetKind} is unchanged in the local append-only corpus.`
+            : `Established the initial ${targetKind} corpus watermark.`,
+      },
+      {
+        actorType: 'system',
+        retrievalMethod: 'local_corpus_snapshot',
+        adapterVersion: 'local-watch-v1',
+        trustBoundary: 'human_entered',
+        expectedLeaseToken: leaseToken,
+        recordSourceObservation: false,
+      },
+    );
+    return;
+  }
+  if (!claimed.identity) {
     await recordWatchCheck(
       pool,
       payload.workspaceId,
@@ -642,6 +855,7 @@ export async function processWatchRefresh(
         retrievalMethod: 'github_api',
         adapterVersion: adapter.version,
         trustBoundary: 'remote_untrusted',
+        expectedLeaseToken: leaseToken,
       },
     );
     return;
@@ -664,11 +878,12 @@ export async function processWatchRefresh(
         retrievalMethod: 'github_api',
         adapterVersion: adapter.version,
         trustBoundary: 'remote_untrusted',
+        expectedLeaseToken: leaseToken,
       },
     );
     return;
   }
-  const result = await adapter.fetch(target.rows[0]!.identity);
+  const result = await adapter.fetch(claimed.identity);
   await pool.query(
     `UPDATE ops.adapter_daily_budgets
      SET consumed_calls = consumed_calls + 1, updated_at = now()
@@ -691,16 +906,12 @@ export async function processWatchRefresh(
         retrievalMethod: 'github_api',
         adapterVersion: adapter.version,
         trustBoundary: 'remote_untrusted',
+        expectedLeaseToken: leaseToken,
       },
     );
     return;
   }
-  const current = await pool.query<{ watermark: string | null }>(
-    `SELECT source_watermark AS watermark FROM workspace.watches
-     WHERE id = $1 AND workspace_id = $2`,
-    [payload.watchId, payload.workspaceId],
-  );
-  const changed = current.rows[0]?.watermark !== result.digest;
+  const changed = claimed.sourceWatermark !== result.digest;
   await recordWatchCheck(
     pool,
     payload.workspaceId,
@@ -720,6 +931,7 @@ export async function processWatchRefresh(
       adapterVersion: adapter.version,
       trustBoundary: 'remote_untrusted',
       excerpt: json(result.metadata),
+      expectedLeaseToken: leaseToken,
     },
   );
 }

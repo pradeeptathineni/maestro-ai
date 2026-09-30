@@ -3,10 +3,13 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { Pool } from 'pg';
 import { verifyVerificationBundle } from '../../../packages/domain/src/index.js';
+import type { GitHubMetadataAdapter } from '../../../packages/adapters/src/index.js';
 import {
   createPool,
   processDiscoveryOperation,
   processSemanticInterpretation,
+  processWatchRefresh,
+  recordWatchCheck,
   recoverDueWatches,
 } from '../../../packages/db/src/index.js';
 import { localWorkspaceId, referenceProjectContextId } from '../../../packages/seed/src/import.js';
@@ -1245,6 +1248,13 @@ describe('Phase 06 explorer and authoring contracts', () => {
   it('redacts retained private query text through the supported delete control', async () => {
     const canary = `PRIVATE_QUERY_${randomUUID()}`;
     const session = await createSession(`${canary} ai`);
+    const watch = await app.inject({
+      method: 'POST',
+      url: '/api/v1/watches',
+      headers: mutationHeaders,
+      payload: { querySessionId: session.id, cadence: 'daily', priority: 50 },
+    });
+    expect(watch.statusCode).toBe(201);
     const response = await app.inject({
       method: 'DELETE',
       url: `/api/v1/explorer/sessions/${session.id}`,
@@ -1260,6 +1270,20 @@ describe('Phase 06 explorer and authoring contracts', () => {
     expect(stored.rows[0]).toMatchObject({ query: '[deleted by user]', intent: {} });
     expect(stored.rows[0]!.deletedAt).not.toBeNull();
     expect(JSON.stringify(stored.rows[0])).not.toContain(canary);
+    const disabledWatch = await pool.query<{
+      state: string;
+      nextDueAt: Date | null;
+      errorCode: string | null;
+    }>(
+      `SELECT state, next_due_at AS "nextDueAt", last_error_code AS "errorCode"
+       FROM workspace.watches WHERE id = $1`,
+      [watch.json<{ id: string }>().id],
+    );
+    expect(disabledWatch.rows[0]).toEqual({
+      state: 'disabled',
+      nextDueAt: null,
+      errorCode: 'target_deleted',
+    });
   });
 
   it('records unchanged, changed, and failed watch checks without inventing evidence', async () => {
@@ -1384,11 +1408,13 @@ describe('Phase 06 explorer and authoring contracts', () => {
       payload: { conceptId: target.conceptId, cadence: 'adaptive', priority: 60 },
     });
     expect(concept.statusCode).toBe(201);
-    expect(concept.json()).toMatchObject({
+    const conceptWatch = concept.json<{ id: string; sourceWatermark: string }>();
+    expect(conceptWatch).toMatchObject({
       conceptId: target.conceptId,
       cadence: 'adaptive',
       cadenceHours: 168,
       cadencePolicyVersion: 'refresh-cadence-v1',
+      sourceWatermark: expect.stringMatching(/^[a-f0-9]{64}$/),
     });
     const query = await app.inject({
       method: 'POST',
@@ -1405,7 +1431,66 @@ describe('Phase 06 explorer and authoring contracts', () => {
       payload: { knowledgeEntityId: target.entityId, cadence: 'manual', priority: 50 },
     });
     expect(entity.statusCode).toBe(201);
-    expect(entity.json()).toMatchObject({ knowledgeEntityId: target.entityId });
+    expect(entity.json()).toMatchObject({
+      knowledgeEntityId: target.entityId,
+      sourceWatermark: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+
+    const label = `watch refresh ${randomUUID()}`;
+    await pool.query(
+      `INSERT INTO catalog.concept_labels
+         (id, concept_id, label, normalized_label, label_kind, locale)
+       VALUES ($1, $2, $3, $3, 'alternate', 'en')`,
+      [randomUUID(), target.conceptId, label],
+    );
+    let adapterCalls = 0;
+    const unusedAdapter: GitHubMetadataAdapter = {
+      key: 'github-metadata',
+      version: 'github-metadata-v1',
+      async fetch() {
+        adapterCalls += 1;
+        return { kind: 'terminal_failure', code: 'unsupported_type' };
+      },
+    };
+    await processWatchRefresh(
+      pool,
+      { watchId: conceptWatch.id, workspaceId: localWorkspaceId },
+      unusedAdapter,
+    );
+    expect(adapterCalls).toBe(0);
+    const localRefresh = await pool.query<{
+      failureCount: number;
+      lastSucceededAt: Date | null;
+      sourceWatermark: string;
+      leaseToken: string | null;
+    }>(
+      `SELECT failure_count AS "failureCount", last_succeeded_at AS "lastSucceededAt",
+              source_watermark AS "sourceWatermark", lease_token AS "leaseToken"
+       FROM workspace.watches WHERE id = $1`,
+      [conceptWatch.id],
+    );
+    expect(localRefresh.rows[0]).toMatchObject({
+      failureCount: 0,
+      lastSucceededAt: expect.any(Date),
+      sourceWatermark: expect.stringMatching(/^[a-f0-9]{64}$/),
+      leaseToken: null,
+    });
+    expect(localRefresh.rows[0]!.sourceWatermark).not.toBe(conceptWatch.sourceWatermark);
+    const localChange = await pool.query<{
+      predicate: string;
+      oldObservationId: string | null;
+      newObservationId: string | null;
+    }>(
+      `SELECT predicate, old_observation_id AS "oldObservationId",
+              new_observation_id AS "newObservationId"
+       FROM workspace.material_changes WHERE watch_id = $1 ORDER BY created_at DESC LIMIT 1`,
+      [conceptWatch.id],
+    );
+    expect(localChange.rows[0]).toEqual({
+      predicate: 'concept-corpus-snapshot',
+      oldObservationId: null,
+      newObservationId: null,
+    });
 
     const listed = await app.inject({
       method: 'GET',
@@ -1463,6 +1548,63 @@ describe('Phase 06 explorer and authoring contracts', () => {
     });
     expect(disabled.statusCode).toBe(200);
     expect(disabled.json()).toMatchObject({ state: 'disabled', nextDueAt: null });
+  });
+
+  it('rejects a stale worker completion without clearing the current watch lease', async () => {
+    const provider = await pool.query<{ id: string }>(
+      `SELECT p.id FROM catalog.providers p
+       WHERE NOT EXISTS (
+         SELECT 1 FROM workspace.watches w
+         WHERE w.workspace_id = $1 AND w.provider_id = p.id AND w.cadence = 'manual'
+       )
+       ORDER BY p.id LIMIT 1`,
+      [localWorkspaceId],
+    );
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/v1/watches',
+      headers: mutationHeaders,
+      payload: { providerId: provider.rows[0]!.id, cadence: 'manual', priority: 50 },
+    });
+    expect(created.statusCode).toBe(201);
+    const watchId = created.json<{ id: string }>().id;
+    const currentLease = randomUUID();
+    await pool.query(
+      `UPDATE workspace.watches
+       SET lease_token = $2, lease_until = now() + interval '5 minutes'
+       WHERE id = $1`,
+      [watchId, currentLease],
+    );
+    await expect(
+      recordWatchCheck(
+        pool,
+        localWorkspaceId,
+        watchId,
+        { outcome: 'failed', reason: 'Stale worker fixture must not commit.' },
+        {
+          actorType: 'system',
+          retrievalMethod: 'github_api',
+          adapterVersion: 'github-metadata-v1',
+          trustBoundary: 'remote_untrusted',
+          expectedLeaseToken: randomUUID(),
+        },
+      ),
+    ).resolves.toMatchObject({ outcome: 'superseded' });
+    const retained = await pool.query<{
+      leaseToken: string | null;
+      lastCheckedAt: Date | null;
+      failureCount: number;
+    }>(
+      `SELECT lease_token AS "leaseToken", last_checked_at AS "lastCheckedAt",
+              failure_count AS "failureCount"
+       FROM workspace.watches WHERE id = $1`,
+      [watchId],
+    );
+    expect(retained.rows[0]).toEqual({
+      leaseToken: currentLease,
+      lastCheckedAt: null,
+      failureCount: 0,
+    });
   });
 
   it('binds new fit evidence relationally and rejects a cross-provider reference', async () => {

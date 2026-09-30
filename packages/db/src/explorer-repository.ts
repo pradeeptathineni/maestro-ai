@@ -2460,15 +2460,24 @@ export async function redactExplorerSession(
   workspaceId: string,
   sessionId: string,
 ): Promise<void> {
-  const result = await pool.query(
-    `UPDATE workspace.query_sessions SET
-       query_text = '[deleted by user]', normalized_intent = '{}'::jsonb,
-       explicit_facets = '{}'::jsonb, inferred_facets = '{}'::jsonb,
-       state = 'expired', deleted_at = now()
-     WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL`,
-    [sessionId, workspaceId],
-  );
-  if (!result.rowCount) throw new NotFoundError('Query session not found.');
+  await inTransaction(pool, async (client) => {
+    const result = await client.query(
+      `UPDATE workspace.query_sessions SET
+         query_text = '[deleted by user]', normalized_intent = '{}'::jsonb,
+         explicit_facets = '{}'::jsonb, inferred_facets = '{}'::jsonb,
+         state = 'expired', deleted_at = now()
+       WHERE id = $1 AND workspace_id = $2 AND deleted_at IS NULL`,
+      [sessionId, workspaceId],
+    );
+    if (!result.rowCount) throw new NotFoundError('Query session not found.');
+    await client.query(
+      `UPDATE workspace.watches
+       SET state = 'disabled', next_due_at = NULL, lease_token = NULL, lease_until = NULL,
+           last_error_code = 'target_deleted', updated_at = now()
+       WHERE workspace_id = $1 AND query_session_id = $2 AND state <> 'disabled'`,
+      [workspaceId, sessionId],
+    );
+  });
 }
 
 export async function exportExplorerBundle(

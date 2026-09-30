@@ -82,7 +82,11 @@ Adapters declare identity, supported routes, rights notes, credentials, safety p
 normalization behavior. Network access is explicit and bounded. Research leads remain provisional
 until admitted under a recorded policy. Source health is an observation, not evidence that a subject
 is absent. Watches target concepts, queries, or entities; refresh cadence is type-sensitive, leased,
-restart-recoverable, and recorded with source attempts and stop reasons.
+restart-recoverable, and recorded with source attempts and stop reasons. Provider watches may run a
+bounded source adapter; concept, query, and canonical-entity watches compare deterministic local
+corpus snapshots, with query watches first rebuilding their immutable result snapshot. Lease tokens
+are compare-and-set completion guards, so a stale worker cannot overwrite a newer refresh. Deleting
+a private query disables its watches in the same transaction.
 
 ## Security and privacy boundaries
 
