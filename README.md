@@ -1,16 +1,21 @@
 # Maestro AI
 
-Maestro v0 is a local-first technology search and evidence-to-decision workspace. Search starts
+> **Product direction:** the standalone technology-intelligence product is being developed under
+> the working title **Signals AI**. The repository and packages intentionally retain their Maestro
+> names until the recorded naming-collision gate receives a human decision.
+
+The current product is a local-first technology search and evidence-to-decision workspace. Search starts
 with a useful offline index, fans out to every source the operator has enabled, and gives every
 returned item a query-specific signal estimate with confidence, missing information, and source
 state shown separately. List, map, detail, compare, and export share one immutable local snapshot;
 live source results remain visibly preliminary and are saved into a separate research corpus. A
 reviewed admission—not collection alone—moves a lead into the indexed knowledge layer.
 
-It does **not** install, authorize, invoke, or orchestrate cataloged software. No
-model key is required. The narrow v0 establishes the policy, evidence, project-context, adapter,
-and receipt seams that later Maestro-owned orchestration can use without making an executor's
-ontology the core domain.
+It does **not** install, authorize, invoke, or orchestrate cataloged software. No model key is
+required. The narrow system establishes policy, evidence, project-context, adapter, and receipt
+seams without making an executor's ontology the core domain. A future product may consume this
+intelligence, but orchestration and execution are deliberately outside this repository's current
+scope.
 
 ## Prerequisites
 
@@ -122,8 +127,9 @@ claim to contain all technology knowledge.
 
 See [ADR-001](docs/architecture/ADR-001-v0-foundation.md),
 [ADR-002](docs/architecture/ADR-002-phase-06-intelligence-explorer.md), the
-[schema contract](docs/architecture/schema.md), and the adjacent authoritative planning workspace
-for the complete product decisions.
+[Phase 08 refoundation ADR](docs/architecture/ADR-004-intelligence-product-refoundation.md), the
+[living architecture](ARCHITECTURE.md), the [schema contract](docs/architecture/schema.md), and the
+adjacent authoritative planning workspace for the complete product decisions.
 
 ## Troubleshooting
 

@@ -6,7 +6,7 @@ Read `README.md`, `docs/architecture/ADR-001-v0-foundation.md`, the latest numbe
 
 - Maestro owns evidence, query/selection policy, project context, decisions and human-directed lifecycle state. Cataloged systems remain data unless a later approved execution phase adds typed authority.
 - Keep `catalog` public/shareable, `workspace` private, and `ops` operational. Public records must never depend on private workspace content.
-- No candidate installation or execution, arbitrary crawling, cloud/model fallback, hosted auth, sandbox, gateway or agent-runtime implementation is authorized by Phase 06.
+- No candidate installation or execution, arbitrary crawling, cloud/model fallback, hosted auth, sandbox, gateway or agent-runtime implementation is authorized by the current intelligence-product scope.
 - Preserve immutable records and old replay semantics. New corrections create revisions or append-only successors.
 
 ## Safe commands
