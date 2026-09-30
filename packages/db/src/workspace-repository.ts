@@ -16,29 +16,12 @@ import {
 } from '../../domain/src/index.js';
 import { calculateProjectFitV1, type PreferenceInput } from '../../scoring/src/index.js';
 import { ConflictError, DomainValidationError, NotFoundError } from './errors.js';
+import { inTransaction } from './transaction.js';
 
 type JsonRow = Record<string, unknown>;
 
 function json(value: unknown): string {
   return JSON.stringify(value);
-}
-
-async function inTransaction<T>(
-  pool: Pool,
-  callback: (client: PoolClient) => Promise<T>,
-): Promise<T> {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const result = await callback(client);
-    await client.query('COMMIT');
-    return result;
-  } catch (error) {
-    await client.query('ROLLBACK').catch(() => undefined);
-    throw error;
-  } finally {
-    client.release();
-  }
 }
 
 export async function listProjects(pool: Pool, workspaceId: string): Promise<JsonRow[]> {
@@ -426,11 +409,7 @@ async function assessCandidate(
         const stringValue = typeof fact?.value === 'string' ? fact.value : undefined;
         const raw =
           optionKind !== 'provider'
-            ? constraint.key === 'reversible-setup'
-              ? 100
-              : constraint.key === 'measurable-token-reduction'
-                ? 10
-                : 50
+            ? null
             : stringValue === 'yes' || stringValue === 'strong'
               ? 90
               : stringValue === 'no'
@@ -443,7 +422,7 @@ async function assessCandidate(
           label: constraint.label,
           weight: constraint.weight ?? 0,
           raw,
-          confidence: raw === null ? 0 : optionKind === 'provider' ? 0.65 : 0.8,
+          confidence: raw === null ? 0 : 0.65,
           state: raw === null ? 'missing' : 'present',
           reasons: [fact?.explanation ?? 'Deterministic baseline assessment.'],
           evidenceIds: fact?.evidenceIds ?? [],
@@ -459,6 +438,7 @@ async function assessCandidate(
     preferenceResult,
     policyVersion: 'project-fit-v1',
   });
+  const fitAssessmentId = newOpaqueId();
   await client.query(
     `INSERT INTO workspace.fit_assessments
        (id, workspace_id, candidate_id, need_id, project_context_id, policy_version,
@@ -467,7 +447,7 @@ async function assessCandidate(
      VALUES ($1, $2, $3, $4, $5, 'project-fit-v1', $6, $7, $8, $9, $10,
              $11, 'rule', 'reviewed', now())`,
     [
-      newOpaqueId(),
+      fitAssessmentId,
       workspaceId,
       candidateId,
       needId,
@@ -480,6 +460,15 @@ async function assessCandidate(
       inputHash,
     ],
   );
+  for (const evidenceId of evidenceIds) {
+    await client.query(
+      `INSERT INTO workspace.fit_assessment_evidence_bindings
+         (id, fit_assessment_id, workspace_id, candidate_id, catalog_evidence_id,
+          applicability_scope)
+       VALUES ($1, $2, $3, $4, $5, 'project-fit-v1')`,
+      [newOpaqueId(), fitAssessmentId, workspaceId, candidateId, evidenceId],
+    );
+  }
   const outcome =
     gateEvaluation.eligibility === 'ineligible'
       ? 'avoid'
@@ -526,10 +515,16 @@ export async function addCandidate(
   needId: string,
   input: CandidateBody,
 ): Promise<unknown> {
-  if (input.optionKind === 'provider' && !input.providerId) {
+  if (input.optionKind === 'provider' && (!input.providerId || input.providerIds)) {
     throw new DomainValidationError('Provider candidates require providerId.');
   }
-  if (input.optionKind !== 'provider' && input.providerId) {
+  if (input.optionKind === 'composition' && (!input.providerIds || input.providerId)) {
+    throw new DomainValidationError('Composition candidates require two to five providerIds.');
+  }
+  if (
+    !['provider', 'composition'].includes(input.optionKind) &&
+    (input.providerId || input.providerIds)
+  ) {
     throw new DomainValidationError(`${input.optionKind} candidates cannot fabricate a provider.`);
   }
   return inTransaction(pool, async (client) => {
@@ -540,32 +535,50 @@ export async function addCandidate(
       [needId, workspaceId],
     );
     if (!need.rowCount) throw new NotFoundError('Need not found.');
-    if (input.providerId) {
-      const provider = await client.query('SELECT id FROM catalog.providers WHERE id = $1', [
-        input.providerId,
-      ]);
-      if (!provider.rowCount) throw new NotFoundError('Provider not found.');
+    const componentIds = input.providerId ? [input.providerId] : (input.providerIds ?? []);
+    if (componentIds.length) {
+      const provider = await client.query<{ id: string }>(
+        'SELECT id FROM catalog.providers WHERE id = ANY($1::uuid[])',
+        [componentIds],
+      );
+      if (provider.rowCount !== componentIds.length) throw new NotFoundError('Provider not found.');
     }
     const candidateId = newOpaqueId();
     const created = await client.query<JsonRow>(
       `INSERT INTO workspace.candidates
          (id, workspace_id, need_id, option_kind, label, context_snapshot_hash,
-          discovery_origin)
-       VALUES ($1, $2, $3, $4, $5, $6, 'human')
-       RETURNING id, option_kind AS "optionKind", label`,
-      [candidateId, workspaceId, needId, input.optionKind, input.label, need.rows[0]!.snapshotHash],
+          discovery_origin, description, evidence_state)
+       VALUES ($1, $2, $3, $4, $5, $6, 'human', $7, $8)
+       RETURNING id, option_kind AS "optionKind", label, description, evidence_state AS "evidenceState"`,
+      [
+        candidateId,
+        workspaceId,
+        needId,
+        input.optionKind,
+        input.label,
+        need.rows[0]!.snapshotHash,
+        input.description ?? '',
+        componentIds.length ? 'source_backed' : 'unknown',
+      ],
     );
-    if (input.providerId) {
+    for (const [index, providerId] of componentIds.entries()) {
       const version = await client.query<{ id: string }>(
         `SELECT id FROM catalog.provider_versions WHERE provider_id = $1
          ORDER BY created_at DESC LIMIT 1`,
-        [input.providerId],
+        [providerId],
       );
       await client.query(
         `INSERT INTO workspace.candidate_components
            (id, workspace_id, candidate_id, provider_id, provider_version_id, role)
-         VALUES ($1, $2, $3, $4, $5, 'primary')`,
-        [newOpaqueId(), workspaceId, candidateId, input.providerId, version.rows[0]?.id ?? null],
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [
+          newOpaqueId(),
+          workspaceId,
+          candidateId,
+          providerId,
+          version.rows[0]?.id ?? null,
+          index === 0 ? 'primary' : 'supporting',
+        ],
       );
     }
     await assessCandidate(
@@ -574,7 +587,7 @@ export async function addCandidate(
       needId,
       candidateId,
       input.optionKind,
-      input.providerId,
+      input.optionKind === 'provider' ? input.providerId : undefined,
     );
     return created.rows[0];
   });
@@ -590,20 +603,45 @@ export async function recordDecision(
     const need = await client.query<{
       revision: number;
       projectId: string;
+      projectName: string;
+      needTitle: string;
       projectContextId: string;
       contextRevision: number;
       snapshotHash: string;
     }>(
-      `SELECT n.revision, pc.project_id AS "projectId", pc.id AS "projectContextId",
+      `SELECT n.revision, n.title AS "needTitle", p.name AS "projectName",
+              pc.project_id AS "projectId", pc.id AS "projectContextId",
               pc.revision AS "contextRevision", pc.snapshot_hash AS "snapshotHash"
        FROM workspace.needs n
        JOIN workspace.project_contexts pc ON pc.id = n.project_context_id
+       JOIN workspace.projects p ON p.id = pc.project_id
        WHERE n.id = $1 AND n.workspace_id = $2`,
       [needId, workspaceId],
     );
     if (!need.rowCount) throw new NotFoundError('Need not found.');
-    const candidates = await client.query<{ id: string }>(
-      `SELECT id FROM workspace.candidates WHERE need_id = $1 AND workspace_id = $2 ORDER BY id`,
+    const candidates = await client.query<{
+      id: string;
+      label: string;
+      optionKind: string;
+      components: Array<{
+        providerId: string;
+        providerDisplayRevision: number | null;
+        role: string;
+      }>;
+    }>(
+      `SELECT c.id, c.label, c.option_kind AS "optionKind",
+              COALESCE(jsonb_agg(jsonb_build_object(
+                'providerId', cc.provider_id,
+                'providerDisplayRevision', pdr.revision,
+                'role', cc.role
+              ) ORDER BY cc.role, cc.provider_id) FILTER (WHERE cc.id IS NOT NULL), '[]'::jsonb) AS components
+       FROM workspace.candidates c
+       LEFT JOIN workspace.candidate_components cc ON cc.candidate_id = c.id
+       LEFT JOIN catalog.providers p ON p.id = cc.provider_id
+       LEFT JOIN catalog.provider_display_revisions pdr
+         ON pdr.provider_id = p.id AND pdr.revision = p.revision
+       WHERE c.need_id = $1 AND c.workspace_id = $2
+       GROUP BY c.id ORDER BY c.id`,
       [needId, workspaceId],
     );
     if (input.outcome !== 'no_decision' && !input.selectedCandidateId) {
@@ -698,6 +736,35 @@ export async function recordDecision(
         decidedAt,
       ],
     );
+    const candidateLabels = candidates.rows.map((candidate) => ({
+      candidateId: candidate.id,
+      label: candidate.label,
+      optionKind: candidate.optionKind,
+      components: candidate.components,
+    }));
+    const displaySnapshot = {
+      projectName: needRow.projectName,
+      needTitle: needRow.needTitle,
+      candidateLabels,
+      evidenceManifest: receipt.evidenceIds,
+      captureState: 'captured',
+    };
+    await client.query(
+      `INSERT INTO workspace.decision_display_snapshots
+         (id, decision_id, workspace_id, project_name, need_title, candidate_labels,
+          evidence_manifest, capture_state, snapshot_hash)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'captured', $8)`,
+      [
+        newOpaqueId(),
+        decisionId,
+        workspaceId,
+        needRow.projectName,
+        needRow.needTitle,
+        json(candidateLabels),
+        json(receipt.evidenceIds),
+        hashCanonical(displaySnapshot),
+      ],
+    );
     await client.query(
       `INSERT INTO ops.audit_events
          (id, workspace_id, actor_type, action, object_type, object_id, correlation_id,
@@ -724,12 +791,21 @@ export async function getDecision(
   const result = await pool.query<JsonRow>(
     `SELECT d.id, d.outcome, d.selected_candidate_id AS "selectedCandidateId", d.rationale,
             d.conditions, d.receipt, d.input_hash AS "inputHash", d.decided_at AS "decidedAt",
-            n.title AS "needTitle", p.name AS "projectName", c.label AS "selectedCandidateLabel"
+            COALESCE(dds.need_title, n.title) AS "needTitle",
+            COALESCE(dds.project_name, p.name) AS "projectName",
+            COALESCE(
+              (SELECT entry->>'label' FROM jsonb_array_elements(dds.candidate_labels) entry
+               WHERE entry->>'candidateId' = d.selected_candidate_id::text LIMIT 1),
+              c.label
+            ) AS "selectedCandidateLabel",
+            dds.capture_state AS "displayCaptureState", dds.snapshot_hash AS "displaySnapshotHash"
      FROM workspace.decisions d
      JOIN workspace.needs n ON n.id = d.need_id
      JOIN workspace.project_contexts pc ON pc.id = d.project_context_id
      JOIN workspace.projects p ON p.id = pc.project_id
      LEFT JOIN workspace.candidates c ON c.id = d.selected_candidate_id
+     LEFT JOIN workspace.decision_display_snapshots dds
+       ON dds.decision_id = d.id AND dds.workspace_id = d.workspace_id
      WHERE d.id = $1 AND d.workspace_id = $2`,
     [decisionId, workspaceId],
   );

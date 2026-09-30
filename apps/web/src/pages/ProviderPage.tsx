@@ -37,7 +37,7 @@ export function ProviderPage() {
   return (
     <div className="page-shell">
       <div className="breadcrumb">
-        <Link to="/explore">Explore</Link>
+        <Link to="/explore">Search</Link>
         <span aria-hidden="true">/</span>
         {item.name}
       </div>

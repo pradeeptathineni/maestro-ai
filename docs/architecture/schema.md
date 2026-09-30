@@ -20,6 +20,18 @@ session advisory lock prevents two live processors from racing on the same intak
 Migration `0008` gives normalized strong identities a workspace-scoped unique boundary so URL
 variants and concurrent submissions cannot create duplicate intake histories.
 
+Phase 06 adds only intelligence-explorer records to these same schemas: public display and search
+projections plus relational evidence/score lineage in `catalog`; private query/result snapshots,
+project authoring, shortlists, watches and portable decision inputs in `workspace`; and bounded
+adapter configuration, discovery budgets/attempts and change notices in `ops`. It does not add the
+future general run/step/agent/grant/deployment schema. The numbered forward migration is the exact
+executable contract; this summary must not be used to infer a table that is not present.
+
+The Phase 06 contract is split across migrations `0009`–`0014`: integrity/authoring, explorer
+snapshots, bounded discovery, query privacy controls, query-value projection cache, and optional
+semantic-adapter configuration. The readiness gate requires all fourteen repository migrations;
+catalog cardinality is diagnostic data, not readiness.
+
 Drizzle declarations mirror queryable concepts but do not replace reviewed SQL. Startup never uses
 schema push. Corrections to immutable evidence, score, context, and decision records require a new
 revision or explicit supersession.

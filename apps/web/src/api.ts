@@ -20,6 +20,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
       ...init?.headers,
     },
   });
+  if (response.status === 204) return undefined as T;
   const body = (await response.json()) as T | ProblemDetails;
   if (!response.ok) throw new ApiError(body as ProblemDetails);
   return body as T;

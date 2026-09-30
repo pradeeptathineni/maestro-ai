@@ -1,6 +1,7 @@
 export interface ApiConfig {
   host: string;
   port: number;
+  rateLimitMax: number;
   allowedHosts: Set<string>;
   allowedOrigins: Set<string>;
 }
@@ -30,11 +31,15 @@ function loopbackOrigin(value: string): string {
 export function apiConfig(): ApiConfig {
   const host = process.env.MAESTRO_HOST ?? '127.0.0.1';
   const port = Number(process.env.MAESTRO_PORT ?? '4310');
+  const rateLimitMax = Number(process.env.MAESTRO_RATE_LIMIT_MAX ?? '120');
   if (!['127.0.0.1', '::1', 'localhost'].includes(host)) {
     throw new Error('MAESTRO_HOST must be a loopback host in v0.');
   }
   if (!Number.isInteger(port) || port < 1024 || port > 65_535) {
     throw new Error('MAESTRO_PORT must be an integer from 1024 through 65535.');
+  }
+  if (!Number.isInteger(rateLimitMax) || rateLimitMax < 1 || rateLimitMax > 10_000) {
+    throw new Error('MAESTRO_RATE_LIMIT_MAX must be an integer from 1 through 10000.');
   }
   const apiOrigins = [
     `http://127.0.0.1:${port}`,
@@ -46,6 +51,7 @@ export function apiConfig(): ApiConfig {
   return {
     host,
     port,
+    rateLimitMax,
     allowedHosts: new Set(hosts),
     allowedOrigins: new Set([...apiOrigins, webOrigin]),
   };

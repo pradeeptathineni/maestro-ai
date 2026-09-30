@@ -81,25 +81,3 @@ export function verificationFixture(value = 2): VerificationFactor[] {
     evidenceIds: [],
   }));
 }
-
-export const verificationSemanticExamples = {
-  python: {
-    summary: 'Low generic verification need; integration-specific checks remain.',
-    expectedGenericPriorityMaximum: 40,
-  },
-  terraform: {
-    summary:
-      'Generic maturity does not replace version, provider, state-backend, or license checks.',
-    expectedGenericPriorityMaximum: 40,
-  },
-  contextOptimizer: {
-    summary:
-      'Large publisher claim is bounded and reproducible, so additional verification is valuable.',
-    expectedPriorityMinimum: 70,
-  },
-  remoteOpaqueService: {
-    summary:
-      'Source review is not applicable; privacy, permission, and black-box modes remain available.',
-    expectedPriorityMinimum: 80,
-  },
-} as const;

@@ -1,0 +1,64 @@
+{
+  "output": {
+    "filePath": ".codex/context-cache/maestro-context.xml",
+    "style": "xml",
+    "filePathStyle": "target-relative",
+    "parsableStyle": true,
+    "headerText": "Disposable architecture map for Maestro. Source files, tests, migrations, bulk seed/evaluation records, client DTO mirrors, and established decision-detail pages remain authoritative; inspect them directly before work in those areas or before making a claim.",
+    "fileSummary": true,
+    "directoryStructure": true,
+    "compress": true,
+    "patterns": [
+      { "pattern": "AGENTS.md" },
+      { "pattern": "README.md" },
+      { "pattern": "package.json" },
+      { "pattern": "docs/architecture/**/*.md" }
+    ],
+    "topFilesLength": 10,
+    "truncateBase64": true,
+    "tokenBudget": 30000,
+    "git": {
+      "sortByChanges": true,
+      "sortByChangesMaxCommits": 100,
+      "includeDiffs": false,
+      "includeLogs": false
+    }
+  },
+  "include": [
+    "AGENTS.md",
+    "README.md",
+    "package.json",
+    "apps/**/*.ts",
+    "apps/**/*.tsx",
+    "packages/**/*.ts",
+    "scripts/**/*",
+    "docs/architecture/**/*.md"
+  ],
+  "ignore": {
+    "useGitignore": true,
+    "useDotIgnore": true,
+    "useDefaultPatterns": true,
+    "customPatterns": [
+      "**/*.test.ts",
+      "**/*.test.tsx",
+      "**/migrations/**",
+      "packages/seed/src/catalog-v1.ts",
+      "packages/seed/src/phase06-corpus.ts",
+      "packages/seed/src/phase06-evaluation.ts",
+      "apps/web/src/types.ts",
+      "apps/web/src/pages/DecidePage.tsx",
+      "apps/web/src/pages/DecisionPage.tsx",
+      "apps/web/src/pages/EvidencePage.tsx",
+      "apps/web/src/pages/NeedPage.tsx",
+      "apps/web/src/pages/ProviderPage.tsx",
+      "**/dist/**",
+      "**/node_modules/**"
+    ]
+  },
+  "security": {
+    "enableSecurityCheck": true
+  },
+  "tokenCount": {
+    "encoding": "o200k_base"
+  }
+}

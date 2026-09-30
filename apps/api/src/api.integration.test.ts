@@ -34,6 +34,7 @@ describe('local HTTP boundary and critical flows', () => {
       config: {
         host: '127.0.0.1',
         port: 4310,
+        rateLimitMax: 120,
         allowedHosts: new Set(['127.0.0.1:4310', 'localhost:4310']),
         allowedOrigins: new Set(['http://127.0.0.1:5173', 'http://127.0.0.1:4310']),
       },
@@ -57,8 +58,8 @@ describe('local HTTP boundary and critical flows', () => {
       items: Array<{ id: string; name: string }>;
       total: number;
     }>();
-    expect(catalogBody.total).toBe(12);
-    expect(catalogBody.items).toHaveLength(12);
+    expect(catalogBody.total).toBeGreaterThanOrEqual(20);
+    expect(catalogBody.items).toHaveLength(Math.min(50, catalogBody.total));
 
     const detail = await app.inject({
       method: 'GET',
@@ -95,15 +96,21 @@ describe('local HTTP boundary and critical flows', () => {
     );
   });
 
-  it('reports readiness only while the local worker heartbeat is current', async () => {
+  it('keeps core readiness independent of worker activity and catalog cardinality', async () => {
     await pool.query('DELETE FROM ops.worker_heartbeats');
     const unavailable = await app.inject({
       method: 'GET',
       url: '/api/v1/health/ready',
       headers: hostHeaders,
     });
-    expect(unavailable.statusCode).toBe(503);
-    expect(unavailable.json()).toMatchObject({ status: 'not_ready', workerActive: false });
+    expect(unavailable.statusCode).toBe(200);
+    expect(unavailable.json()).toMatchObject({
+      status: 'ready',
+      core: 'ready',
+      worker: 'inactive',
+      workerActive: false,
+      providers: expect.any(Number),
+    });
 
     await pool.query(
       `INSERT INTO ops.worker_heartbeats (worker_key, adapter_version, started_at, last_seen_at)
@@ -115,7 +122,13 @@ describe('local HTTP boundary and critical flows', () => {
       headers: hostHeaders,
     });
     expect(ready.statusCode).toBe(200);
-    expect(ready.json()).toMatchObject({ status: 'ready', workerActive: true, providers: 12 });
+    expect(ready.json()).toMatchObject({
+      status: 'ready',
+      core: 'ready',
+      worker: 'active',
+      workerActive: true,
+      providers: expect.any(Number),
+    });
   });
 
   it('enforces Host, Origin, JSON, and explicit mutation headers', async () => {
@@ -184,6 +197,38 @@ describe('local HTTP boundary and critical flows', () => {
       });
       expect(oversized.statusCode).toBe(400);
       expect(oversized.json()).toMatchObject({ code: 'request_validation_failed' });
+    }
+  });
+
+  it('preserves an explicit 429 response when the local request limit is reached', async () => {
+    const limitedApp = await buildApp({
+      pool,
+      logger: false,
+      config: {
+        host: '127.0.0.1',
+        port: 4310,
+        rateLimitMax: 1,
+        allowedHosts: new Set(['127.0.0.1:4310']),
+        allowedOrigins: new Set(['http://127.0.0.1:4310']),
+      },
+    });
+    await limitedApp.ready();
+    try {
+      const first = await limitedApp.inject({
+        method: 'GET',
+        url: '/api/v1/health/live',
+        headers: hostHeaders,
+      });
+      const limited = await limitedApp.inject({
+        method: 'GET',
+        url: '/api/v1/health/live',
+        headers: hostHeaders,
+      });
+      expect(first.statusCode).toBe(200);
+      expect(limited.statusCode).toBe(429);
+      expect(limited.json()).toMatchObject({ status: 429, code: 'rate_limit_exceeded' });
+    } finally {
+      await limitedApp.close();
     }
   });
 
@@ -570,22 +615,48 @@ describe('local HTTP boundary and critical flows', () => {
     const paths = Object.keys(response.json<{ paths: Record<string, unknown> }>().paths);
     expect(paths.sort()).toEqual(
       [
+        '/api/v1/changes',
+        '/api/v1/changes/{id}',
+        '/api/v1/corpus',
+        '/api/v1/corpus/search',
         '/api/v1/decisions/{id}',
+        '/api/v1/discovery/candidates/{id}/admit',
+        '/api/v1/discovery/operations/{id}',
+        '/api/v1/discovery/operations/{id}/cancel',
         '/api/v1/domains',
+        '/api/v1/explorer/result-sets/{id}',
+        '/api/v1/explorer/result-sets/{id}/compare',
+        '/api/v1/explorer/result-sets/{id}/export',
+        '/api/v1/explorer/result-sets/{id}/graph',
+        '/api/v1/explorer/result-sets/{id}/items/{itemId}',
+        '/api/v1/explorer/result-sets/{id}/shortlists',
+        '/api/v1/explorer/sessions',
+        '/api/v1/explorer/sessions/{id}',
+        '/api/v1/explorer/sessions/{id}/discovery',
+        '/api/v1/explorer/sessions/{id}/refresh',
+        '/api/v1/explorer/sessions/{id}/semantic-proposals',
         '/api/v1/health/live',
         '/api/v1/health/ready',
+        '/api/v1/integrations',
+        '/api/v1/integrations/{id}',
         '/api/v1/intakes',
         '/api/v1/intakes/{id}',
         '/api/v1/intakes/{id}/curate',
         '/api/v1/intakes/{id}/retry',
+        '/api/v1/knowledge/coverage',
         '/api/v1/needs',
         '/api/v1/needs/{id}',
         '/api/v1/needs/{id}/candidates',
         '/api/v1/needs/{id}/decisions',
+        '/api/v1/knowledge/options',
+        '/api/v1/projects/{id}/contexts',
         '/api/v1/providers',
         '/api/v1/providers/{id}',
         '/api/v1/score-runs/replay',
         '/api/v1/verification',
+        '/api/v1/watches',
+        '/api/v1/watches/{id}/checks',
+        '/api/v1/watches/{id}/state',
         '/api/v1/workspace',
         '/api/v1/workspaces/{workspaceId}/projects',
       ].sort(),

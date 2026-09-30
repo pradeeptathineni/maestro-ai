@@ -74,6 +74,8 @@ const ProviderSchema = Type.Object({
     Type.Literal('library'),
     Type.Literal('language'),
     Type.Literal('protocol'),
+    Type.Literal('practice'),
+    Type.Literal('standard'),
     Type.Literal('registry'),
     Type.Literal('workflow'),
     Type.Literal('other'),
@@ -154,8 +156,6 @@ export const SeedManifestSchema = Type.Object({
   }),
   providers: Type.Array(ProviderSchema, { minItems: 12, maxItems: 12 }),
 });
-
-export type SeedManifestShape = Static<typeof SeedManifestSchema>;
 
 export interface SeedProvider {
   key: string;

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Pool } from 'pg';
 import { hashCanonical, replayDecisionReceipt } from '../../domain/src/index.js';
+import { calculateQuerySignalV1, type QueryValueInput } from '../../scoring/src/index.js';
 import {
   importSeed,
   localWorkspaceId,
@@ -14,6 +15,8 @@ import { listProviders, replayStoredScores } from './catalog-repository.js';
 import { createPool } from './client.js';
 import { migrate } from './migrate.js';
 import { checkSchemaDefinitions } from './schema-check.js';
+import { requestDiscovery } from './discovery-repository.js';
+import { createExplorerSession } from './explorer-repository.js';
 import {
   addCandidate,
   createNeed,
@@ -48,28 +51,62 @@ describe('reviewed PostgreSQL contract', () => {
       '0006_guard_job_attempt_finalization.sql',
       '0007_independent_review_hardening.sql',
       '0008_strong_identity_intake_deduplication.sql',
+      '0009_phase06_integrity_authoring.sql',
+      '0010_intelligence_explorer.sql',
+      '0011_bounded_discovery.sql',
+      '0012_query_privacy_control.sql',
+      '0013_query_value_projection_cache.sql',
+      '0014_semantic_adapter_configuration.sql',
     ]);
     expect(migrations.rows.every((row) => /^[a-f0-9]{64}$/.test(row.sha256))).toBe(true);
   });
 
-  it('imports the source manifest idempotently with exact reviewed counts', async () => {
+  it('imports the source manifest idempotently while preserving additive authored data', async () => {
     const first = await importSeed(testDatabaseUrl());
     const second = await importSeed(testDatabaseUrl());
     expect(second).toEqual(first);
-    expect(second.counts).toMatchObject({
-      providers: 12,
-      sources: 27,
-      claims: 24,
-      evidence_items: 24,
-      score_runs: 12,
-      projects: 1,
-      needs: 1,
-      candidates: 3,
-    });
+    expect(second.counts.score_runs).toBe(12);
+    expect(second.counts.providers).toBeGreaterThanOrEqual(20);
+    expect(second.counts.sources).toBeGreaterThanOrEqual(35);
+    expect(second.counts.claims).toBeGreaterThanOrEqual(32);
+    expect(second.counts.evidence_items).toBeGreaterThanOrEqual(32);
+    expect(second.counts.projects).toBeGreaterThanOrEqual(1);
+    expect(second.counts.needs).toBeGreaterThanOrEqual(1);
+    expect(second.counts.candidates).toBeGreaterThanOrEqual(3);
   });
 
   it('replays every stored score without a mismatch', async () => {
     expect(await replayStoredScores(pool)).toEqual({ checked: 12, mismatches: [] });
+  });
+
+  it('keeps the generated query-value cache identical to query-signal-v1', async () => {
+    const projections = await pool.query<{
+      id: string;
+      valueProfile: QueryValueInput[];
+      valueConservative: number;
+      evidenceCoverage: number;
+      policyVersion: string;
+    }>(`
+      SELECT id, value_profile AS "valueProfile",
+             query_value_conservative::float8 AS "valueConservative",
+             query_evidence_coverage::float8 AS "evidenceCoverage",
+             query_value_policy_version AS "policyVersion"
+      FROM catalog.knowledge_projections
+      ORDER BY id
+    `);
+
+    expect(projections.rowCount).toBeGreaterThanOrEqual(61);
+    for (const projection of projections.rows) {
+      const calculated = calculateQuerySignalV1({
+        relevanceOrdinal: 'direct',
+        relevanceMethod: 'rule',
+        dimensions: projection.valueProfile,
+        provisional: false,
+      });
+      expect(projection.policyVersion).toBe('query-signal-v1');
+      expect(projection.valueConservative).toBeCloseTo(calculated.valueConservative, 6);
+      expect(projection.evidenceCoverage).toBeCloseTo(calculated.evidenceCoverage, 6);
+    }
   });
 
   it('detects a stored score whose input hash cannot be reproduced', async () => {
@@ -122,7 +159,7 @@ describe('reviewed PostgreSQL contract', () => {
   });
 
   it('keeps reviewed SQL and Drizzle table/column declarations aligned', async () => {
-    expect(await checkSchemaDefinitions(pool)).toEqual({ checkedTables: 43, errors: [] });
+    expect(await checkSchemaDefinitions(pool)).toEqual({ checkedTables: 72, errors: [] });
   });
 
   it('keeps the public catalog independent of private workspace foreign keys', async () => {
@@ -472,6 +509,67 @@ describe('reviewed PostgreSQL contract', () => {
     } finally {
       await client.query('ROLLBACK').catch(() => undefined);
       client.release();
+    }
+  });
+
+  it('atomically enforces the shared external-call boundary without intent quotas', async () => {
+    const workspaceId = randomUUID();
+    await pool.query('INSERT INTO workspace.workspaces (id, name) VALUES ($1, $2)', [
+      workspaceId,
+      'Discovery allocation integration fixture',
+    ]);
+    const session = (await createExplorerSession(pool, workspaceId, {
+      query: 'ai context engineering tools',
+    })) as { id: string };
+    await pool.query(
+      `UPDATE ops.source_adapter_configs
+       SET enabled = true, daily_call_limit = 100
+       WHERE adapter_key = 'github'`,
+    );
+    await pool.query('DELETE FROM ops.adapter_daily_budgets WHERE budget_date = current_date');
+
+    try {
+      const inputs = [
+        ...Array.from({ length: 37 }, (_, index) => ({ intent: 'deepen' as const, index })),
+        ...Array.from({ length: 17 }, (_, index) => ({ intent: 'explore' as const, index })),
+      ];
+      const results = (await Promise.all(
+        inputs.map(({ intent, index }) =>
+          requestDiscovery(pool, workspaceId, session.id, {
+            adapterKey: 'github',
+            approvedPublicQuery: `bounded ${intent} fixture ${index}`,
+            idempotencyKey: `${intent}-${index}-${randomUUID()}`,
+            intent,
+          }),
+        ),
+      )) as Array<{ state: string; intent: string }>;
+
+      expect(results.filter((result) => result.state === 'queued')).toHaveLength(50);
+      expect(results.filter((result) => result.state === 'budget_denied')).toHaveLength(4);
+
+      const budget = await pool.query<{ reserved: number; denied: number }>(
+        `SELECT reserved_calls AS reserved, denied_calls AS denied
+         FROM ops.adapter_daily_budgets
+         WHERE adapter_key = 'github' AND budget_date = current_date`,
+      );
+      expect(budget.rows[0]).toEqual({ reserved: 50, denied: 4 });
+      const operations = await pool.query<{ state: string; calls: number }>(
+        `SELECT state, sum(reserved_calls)::int AS calls
+         FROM ops.discovery_operations WHERE workspace_id = $1
+         GROUP BY state ORDER BY state`,
+        [workspaceId],
+      );
+      expect(operations.rows).toEqual(
+        expect.arrayContaining([
+          { state: 'queued', calls: 50 },
+          { state: 'budget_denied', calls: 0 },
+        ]),
+      );
+    } finally {
+      await pool.query(
+        `UPDATE ops.source_adapter_configs SET enabled = false, daily_call_limit = 20
+         WHERE adapter_key = 'github'`,
+      );
     }
   });
 });

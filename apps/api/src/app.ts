@@ -58,7 +58,10 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
         scriptSrc: ["'self'"],
         styleSrc: ["'self'", "'unsafe-inline'"],
         imgSrc: ["'self'", 'data:'],
-        connectSrc: ["'self'", ...config.allowedOrigins],
+        connectSrc: [
+          "'self'",
+          ...[...config.allowedOrigins].filter((origin) => !origin.includes('[::1]')),
+        ],
         frameAncestors: ["'none'"],
         objectSrc: ["'none'"],
       },
@@ -70,10 +73,10 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       callback(null, !origin || config.allowedOrigins.has(origin));
     },
     credentials: false,
-    methods: ['GET', 'POST', 'PUT', 'OPTIONS'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['content-type', 'x-maestro-request'],
   });
-  await app.register(rateLimit, { max: 120, timeWindow: '1 minute' });
+  await app.register(rateLimit, { max: config.rateLimitMax, timeWindow: '1 minute' });
 
   // Fastify snapshots the active error handler when routes are registered, so
   // install Maestro's stable problem-details boundary before route creation.
@@ -85,6 +88,14 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
         'validation' in error &&
         Boolean(error.validation)) ||
       (error as { code?: string }).code === 'FST_ERR_VALIDATION';
+    const declaredStatus = (error as { statusCode?: unknown }).statusCode;
+    const frameworkClientStatus =
+      typeof declaredStatus === 'number' &&
+      Number.isInteger(declaredStatus) &&
+      declaredStatus >= 400 &&
+      declaredStatus < 500
+        ? declaredStatus
+        : null;
     const status =
       error instanceof NotFoundError
         ? 404
@@ -94,7 +105,7 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
             ? 422
             : validation
               ? 400
-              : 500;
+              : (frameworkClientStatus ?? 500);
     const code =
       error instanceof NotFoundError
         ? error.code
@@ -104,14 +115,23 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
             ? error.code
             : validation
               ? 'request_validation_failed'
-              : status === 409
-                ? 'conflict'
-                : 'internal_error';
+              : status === 429
+                ? 'rate_limit_exceeded'
+                : status === 409
+                  ? 'conflict'
+                  : status < 500
+                    ? 'request_rejected'
+                    : 'internal_error';
     if (status >= 500)
       request.log.error({ err: knownError, correlationId: request.id }, 'request failed');
     return reply.code(status).send({
       type: 'about:blank',
-      title: status >= 500 ? 'Internal error' : 'Request rejected',
+      title:
+        status >= 500
+          ? 'Internal error'
+          : status === 429
+            ? 'Too many requests'
+            : 'Request rejected',
       status,
       code,
       detail:

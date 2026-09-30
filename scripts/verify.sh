@@ -7,6 +7,8 @@ npm run db:schema-check
 npm run format:check
 npm run lint
 npm run typecheck
+npm run context:verify
+npm run quality:structure
 npm test
 npm run test:integration
 npm run build

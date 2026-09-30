@@ -17,6 +17,8 @@ export const providerKinds = [
   'library',
   'language',
   'protocol',
+  'practice',
+  'standard',
   'registry',
   'workflow',
   'other',

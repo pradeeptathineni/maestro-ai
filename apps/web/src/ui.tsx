@@ -3,10 +3,9 @@ import { NavLink, Outlet } from 'react-router-dom';
 import { ApiError, label } from './api.js';
 
 const navigation = [
-  ['/decide', 'Decide'],
-  ['/explore', 'Explore'],
-  ['/consider', 'Consider'],
-  ['/evidence', 'Evidence'],
+  ['/explore', 'Search'],
+  ['/corpus', 'Corpus'],
+  ['/decide', 'Decisions'],
   ['/workspace', 'Workspace'],
 ] as const;
 
@@ -17,13 +16,13 @@ export function Shell(): ReactNode {
         Skip to content
       </a>
       <header className="app-header">
-        <NavLink className="brand" to="/decide" aria-label="Maestro home">
+        <NavLink className="brand" to="/explore" aria-label="Maestro home">
           <span className="brand-mark" aria-hidden="true">
             M
           </span>
           <span>
             <strong>Maestro</strong>
-            <small>Evidence to decision</small>
+            <small>Technology search</small>
           </span>
         </NavLink>
         <nav aria-label="Primary navigation">
@@ -33,13 +32,14 @@ export function Shell(): ReactNode {
             </NavLink>
           ))}
         </nav>
-        <span className="local-chip">Local workspace</span>
+        <span className="local-chip">Local-first</span>
       </header>
       <main id="main-content" tabIndex={-1}>
         <Outlet />
       </main>
       <footer>
-        Maestro v0 records evidence and decisions. It does not install or run cataloged software.
+        Maestro searches for existing technology, explains its signals, and records decisions. It
+        does not install or execute results.
       </footer>
     </>
   );

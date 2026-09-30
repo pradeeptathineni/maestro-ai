@@ -31,6 +31,8 @@ export default defineConfig({
       MAESTRO_ALLOW_NETWORK_FETCH: 'false',
       MAESTRO_HOST: '127.0.0.1',
       MAESTRO_PORT: '4310',
+      // The suite represents several independent users behind one loopback IP.
+      MAESTRO_RATE_LIMIT_MAX: '1000',
     },
   },
 });

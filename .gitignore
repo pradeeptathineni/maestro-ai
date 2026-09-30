@@ -3,7 +3,9 @@ dist/
 coverage/
 playwright-report/
 test-results/
+.codex/context-cache/
+.codex/context-compression/gain.jsonl
+.codex/context-compression/raw/
 .env
 *.log
 .DS_Store
-

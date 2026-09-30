@@ -6,7 +6,7 @@ import { fileURLToPath, URL } from 'node:url';
 const rootPath = fileURLToPath(new URL('../', import.meta.url));
 const manifest = JSON.parse(await readFile(join(rootPath, 'package.json'), 'utf8'));
 const direct = { ...manifest.dependencies, ...manifest.devDependencies };
-const allowedLicenses = new Set(['Apache-2.0', 'MIT', 'MPL-2.0']);
+const allowedLicenses = new Set(['Apache-2.0', 'ISC', 'MIT', 'MPL-2.0']);
 const errors = [];
 
 for (const [name, declaredVersion] of Object.entries(direct)) {

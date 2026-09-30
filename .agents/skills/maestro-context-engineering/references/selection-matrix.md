@@ -1,0 +1,22 @@
+# Context and agent-engineering selection matrix
+
+Reviewed: 2026-09-29. This is a working engineering disposition, not product evidence or an exhaustive market map. Re-run source and repo-specific checks before changing a disposition.
+
+| Functional junction             | Current mechanism                                      | Evidence posture                                                                      | Revisit trigger                                                         |
+| ------------------------------- | ------------------------------------------------------ | ------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| Narrow source retrieval         | `rg` plus bounded reads                                | Native, deterministic, lossless                                                       | Repeated navigation failures                                            |
+| Cross-cutting repository map    | Repomix compressed pack with a 30k token ceiling       | Locally measured pack size; source must be reopened                                   | Pack exceeds budget or misses needed relationships                      |
+| Noisy shell output              | CCA project hook with local raw recovery               | Deterministic fidelity gate; publisher benchmark remains non-independent              | Real task failure, poor savings, or a better current Codex hook adapter |
+| Progressive procedure           | Repo-scoped Codex skill                                | Official progressive-disclosure mechanism                                             | Skill is not discovered or becomes bloated                              |
+| Dead/duplicate code             | Knip and jscpd verification gates                      | Both found actionable repo issues before retention                                    | False positives or maintenance cost exceed value                        |
+| Output brevity                  | Caveman/Simple Man class                               | Researched, not adopted; style savings do not address input/tool context              | Controlled Maestro task trial improves cost without hiding rationale    |
+| Command rewriting               | tokf/RTK/sqz class                                     | Researched, not adopted; extra binary/rewriting risk and mixed independent RTK result | CCA misses a measured bottleneck and fidelity can be compared           |
+| Indexed externalization         | Context Mode/DTOC class                                | Researched, not installed; broader runtime and host-side effects                      | Repository scale or tool output makes targeted recovery inadequate      |
+| Semantic repo graph             | GitNexus/Aider-map class                               | Researched; GitNexus license/setup does not fit the current small repo                | Cross-package graph questions repeatedly defeat the bounded pack        |
+| Learned prompt compression      | LLMLingua/Paritok class                                | Researched, not adopted; model/runtime cost and quality loss need a benchmark         | Large retrieved documents dominate measured cost                        |
+| Runtime observability           | Playwright plus API/network observer; Reticle deferred | Native tests cover the current browser boundary                                       | Cross-agent browser debugging remains unobservable                      |
+| Multi-agent/model orchestration | Explicitly out of Phase 06 runtime scope               | D-026 boundary; catalog as knowledge only                                             | A later authorized execution phase defines typed authority              |
+| External action connectors      | Composio deferred                                      | Conflicts with no-execution boundary                                                  | Approved action phase with permission and audit model                   |
+| Hosted web builder              | Existing repo-native React app                         | No deployment authorization and no measured implementation gap                        | User authorizes a separate hosted surface or deployment                 |
+
+The maintained Maestro corpus and its coverage report own source-backed tool knowledge. This file only records why the repository itself currently composes or defers a class of tool.

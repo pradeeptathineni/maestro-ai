@@ -24,4 +24,17 @@ describe('v0 API configuration boundary', () => {
     process.env.MAESTRO_WEB_ORIGIN = origin;
     expect(() => apiConfig()).toThrow(/loopback HTTP origin/);
   });
+
+  it('accepts a bounded explicit request limit', () => {
+    process.env.MAESTRO_RATE_LIMIT_MAX = '1000';
+    expect(apiConfig().rateLimitMax).toBe(1000);
+  });
+
+  it.each(['0', '10001', '1.5', 'not-a-number'])(
+    'rejects an invalid request limit: %s',
+    (limit) => {
+      process.env.MAESTRO_RATE_LIMIT_MAX = limit;
+      expect(() => apiConfig()).toThrow(/integer from 1 through 10000/);
+    },
+  );
 });

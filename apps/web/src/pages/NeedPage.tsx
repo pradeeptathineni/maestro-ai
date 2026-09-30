@@ -21,12 +21,15 @@ interface ProvidersResponse {
   nextCursor: string | null;
 }
 
+type CandidateKind = 'provider' | 'composition' | 'status_quo' | 'build' | 'defer';
+
 export function NeedPage() {
   const { id = '' } = useParams();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [decisionError, setDecisionError] = useState('');
   const [candidateError, setCandidateError] = useState('');
+  const [candidateKind, setCandidateKind] = useState<CandidateKind>('provider');
   const [addCandidateOpen, setAddCandidateOpen] = useState(false);
   const [reviseOpen, setReviseOpen] = useState(false);
   const [reviseError, setReviseError] = useState('');
@@ -81,17 +84,45 @@ export function NeedPage() {
     event.preventDefault();
     setCandidateError('');
     const data = new FormData(event.currentTarget);
-    const selection = formString(data, 'candidate');
-    if (selection === 'status_quo') {
+    const description = formString(data, 'description').trim();
+    if (candidateKind === 'status_quo') {
       addCandidate.mutate({ optionKind: 'status_quo', label: 'Current workflow / no change' });
       return;
     }
-    const provider = providers.data?.items.find((item) => item.id === selection);
-    if (!provider) {
-      setCandidateError('Select a provider or the current-workflow baseline.');
+    if (candidateKind === 'provider') {
+      const selection = formString(data, 'providerId');
+      const provider = providers.data?.items.find((item) => item.id === selection);
+      if (!provider) {
+        setCandidateError('Select a catalog provider or practice.');
+        return;
+      }
+      addCandidate.mutate({
+        optionKind: 'provider',
+        providerId: provider.id,
+        label: provider.name,
+      });
       return;
     }
-    addCandidate.mutate({ optionKind: 'provider', providerId: provider.id, label: provider.name });
+    const customLabel = formString(data, 'label').trim();
+    if (candidateKind === 'composition') {
+      const providerIds = data.getAll('providerIds').map(String).filter(Boolean);
+      if (providerIds.length < 2 || providerIds.length > 5) {
+        setCandidateError('Select between two and five components.');
+        return;
+      }
+      addCandidate.mutate({
+        optionKind: 'composition',
+        providerIds,
+        label: customLabel || 'Composed option',
+        ...(description ? { description } : {}),
+      });
+      return;
+    }
+    addCandidate.mutate({
+      optionKind: candidateKind,
+      label: customLabel || (candidateKind === 'build' ? 'Build a bounded solution' : 'Defer'),
+      ...(description ? { description } : {}),
+    });
   }
 
   function submitDecision(event: FormEvent<HTMLFormElement>) {
@@ -153,6 +184,11 @@ export function NeedPage() {
       </div>
     );
   const item = need.data;
+  const providerOptions = providers.data?.items.map((provider) => (
+    <option value={provider.id} key={provider.id}>
+      {provider.name} · {label(provider.kind)}
+    </option>
+  ));
 
   return (
     <div className="page-shell">
@@ -238,24 +274,75 @@ export function NeedPage() {
       {addCandidateOpen ? (
         <section className="panel form-panel" aria-labelledby="add-candidate-heading">
           <h2 id="add-candidate-heading">Add a comparison candidate</h2>
-          <form onSubmit={submitCandidate} className="inline-form">
-            <label>
-              Candidate
-              <select name="candidate" defaultValue="" required>
-                <option value="" disabled>
-                  Select an option
-                </option>
-                <option value="status_quo">Current workflow / no change baseline</option>
-                {providers.data?.items.map((provider) => (
-                  <option value={provider.id} key={provider.id}>
-                    {provider.name} · {label(provider.kind)}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <button className="button" disabled={addCandidate.isPending}>
-              {addCandidate.isPending ? 'Assessing…' : 'Add and assess'}
-            </button>
+          <p className="section-intro">
+            Compare a cataloged provider or practice with a composition, a bounded build, deferral,
+            or the current workflow. Non-provider options remain unknown until evidence is added.
+          </p>
+          <form onSubmit={submitCandidate}>
+            <div className="form-grid two-column">
+              <label>
+                Option kind
+                <select
+                  aria-label="Candidate option kind"
+                  value={candidateKind}
+                  onChange={(event) => setCandidateKind(event.target.value as CandidateKind)}
+                >
+                  <option value="provider">Catalog provider or practice</option>
+                  <option value="composition">Composition of 2–5 providers</option>
+                  <option value="status_quo">Current workflow / no change</option>
+                  <option value="build">Build a bounded solution</option>
+                  <option value="defer">Defer the decision</option>
+                </select>
+              </label>
+              {candidateKind === 'provider' ? (
+                <label>
+                  Catalog option
+                  <select name="providerId" defaultValue="" required>
+                    <option value="" disabled>
+                      Select an option
+                    </option>
+                    {providerOptions}
+                  </select>
+                </label>
+              ) : null}
+              {candidateKind === 'composition' ? (
+                <label>
+                  Components <small>Select 2–5</small>
+                  <select name="providerIds" multiple required size={6}>
+                    {providerOptions}
+                  </select>
+                </label>
+              ) : null}
+              {candidateKind === 'composition' ||
+              candidateKind === 'build' ||
+              candidateKind === 'defer' ? (
+                <label>
+                  Option label
+                  <input
+                    name="label"
+                    maxLength={240}
+                    placeholder={
+                      candidateKind === 'composition'
+                        ? 'Local runtime + evaluation harness'
+                        : candidateKind === 'build'
+                          ? 'Build a small repository-native adapter'
+                          : 'Defer until evidence is available'
+                    }
+                  />
+                </label>
+              ) : null}
+            </div>
+            {candidateKind === 'composition' || candidateKind === 'build' ? (
+              <label>
+                Scope note <small>Optional; no capability is inferred from this prose</small>
+                <textarea name="description" rows={2} maxLength={2000} />
+              </label>
+            ) : null}
+            <div className="form-actions">
+              <button className="button" disabled={addCandidate.isPending}>
+                {addCandidate.isPending ? 'Assessing…' : 'Add and assess'}
+              </button>
+            </div>
             <InputError id="candidate-error">{candidateError}</InputError>
           </form>
         </section>

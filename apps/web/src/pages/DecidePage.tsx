@@ -2,15 +2,9 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { type FormEvent, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { api, formString } from '../api.js';
-import type { NeedSummary, Project } from '../types.js';
+import type { NeedSummary } from '../types.js';
 import { Empty, ErrorPanel, InputError, Loading, PageHeader, StateBadge } from '../ui.js';
-
-interface WorkspaceSummary {
-  id: string;
-  boundary: string;
-  modelRequired: boolean;
-  executionAvailable: boolean;
-}
+import { useWorkspaceProjects } from '../workspace-queries.js';
 
 interface NeedCreateResult {
   id: string;
@@ -21,18 +15,10 @@ export function DecidePage() {
   const [formError, setFormError] = useState('');
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const { projects } = useWorkspaceProjects();
   const needs = useQuery({
     queryKey: ['needs'],
     queryFn: () => api<{ items: NeedSummary[] }>('/api/v1/needs'),
-  });
-  const workspace = useQuery({
-    queryKey: ['workspace'],
-    queryFn: () => api<WorkspaceSummary>('/api/v1/workspace'),
-  });
-  const projects = useQuery({
-    queryKey: ['projects', workspace.data?.id],
-    enabled: Boolean(workspace.data?.id),
-    queryFn: () => api<{ items: Project[] }>(`/api/v1/workspaces/${workspace.data!.id}/projects`),
   });
   const createNeed = useMutation({
     mutationFn: (body: Record<string, unknown>) =>
@@ -54,6 +40,26 @@ export function DecidePage() {
       setFormError('Select a project.');
       return;
     }
+    const hardLabels = formString(data, 'hardConstraints')
+      .split('\n')
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const preferenceLabels = formString(data, 'preferences')
+      .split('\n')
+      .map((value) => value.trim())
+      .filter(Boolean);
+    if (!hardLabels.length) {
+      setFormError('Add at least one explicit hard constraint.');
+      return;
+    }
+    const constraintKey = (prefix: string, value: string, index: number) =>
+      `${prefix}-${
+        value
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '-')
+          .replace(/^-|-$/g, '')
+          .slice(0, 70) || index + 1
+      }`;
     createNeed.mutate({
       projectId,
       title: formString(data, 'title'),
@@ -67,38 +73,19 @@ export function DecidePage() {
         .map((value) => value.trim())
         .filter(Boolean),
       constraints: [
-        {
-          key: 'no-remote-source-transfer',
-          label: 'Source code must not be sent to a new remote service',
+        ...hardLabels.map((value, index) => ({
+          key: constraintKey('gate', value, index),
+          label: value,
           kind: 'hard_gate',
           unknownHandling: 'block',
-        },
-        {
-          key: 'macos',
-          label: 'macOS support is required',
-          kind: 'hard_gate',
-          unknownHandling: 'block',
-        },
-        {
-          key: 'no-automatic-workspace-writes',
-          label: 'No automatic workspace writes during evaluation',
-          kind: 'hard_gate',
-          unknownHandling: 'block',
-        },
-        {
-          key: 'measurable-token-reduction',
-          label: 'Measurable context reduction',
+        })),
+        ...preferenceLabels.map((value, index) => ({
+          key: constraintKey('preference', value, index),
+          label: value,
           kind: 'preference',
           unknownHandling: 'penalize',
-          weight: 0.6,
-        },
-        {
-          key: 'reversible-setup',
-          label: 'Reversible setup',
-          kind: 'preference',
-          unknownHandling: 'penalize',
-          weight: 0.4,
-        },
+          weight: 1 / preferenceLabels.length,
+        })),
       ],
     });
   }
@@ -121,8 +108,8 @@ export function DecidePage() {
           <p className="eyebrow">Guided setup</p>
           <h2 id="new-need-heading">Define a need</h2>
           <p className="section-intro">
-            This template makes the effect of each constraint explicit. You can revise the immutable
-            need later by creating a new revision.
+            State the project constraints that actually apply. Maestro does not silently assume an
+            operating system, data boundary, or preferred workflow. Revisions remain immutable.
           </p>
           <form onSubmit={submit}>
             <div className="form-grid two-column">
@@ -145,7 +132,7 @@ export function DecidePage() {
                   name="title"
                   required
                   maxLength={240}
-                  defaultValue="Reduce coding-agent context consumption"
+                  placeholder="Choose a private search capability"
                 />
               </label>
             </div>
@@ -156,7 +143,7 @@ export function DecidePage() {
                 required
                 maxLength={2000}
                 rows={3}
-                defaultValue="Reduce context consumption while preserving task quality and keeping source code local."
+                placeholder="Describe the outcome, without naming a preferred option."
               />
             </label>
             <label>
@@ -165,33 +152,44 @@ export function DecidePage() {
                 name="successCriteria"
                 required
                 rows={3}
-                defaultValue={
-                  'Measured context reduction on representative coding tasks\nNo new remote source transfer\nA reversible bounded trial'
+                placeholder={
+                  'One measurable outcome per line\nOne safety or reversibility criterion per line'
                 }
               />
             </label>
             <label>
               Required capability keys <small>Comma separated</small>
-              <input name="capabilities" defaultValue="context-efficiency, coding-assistance" />
+              <input name="capabilities" placeholder="local-search, retrieval, citation" />
             </label>
-            <fieldset>
-              <legend>Template constraints and preferences</legend>
-              <ul className="constraint-preview">
-                <li>
-                  <StateBadge state="unknown_blocked" /> Remote source transfer — unknown blocks
-                </li>
-                <li>
-                  <StateBadge state="unknown_blocked" /> macOS support — unknown blocks
-                </li>
-                <li>
-                  <StateBadge state="unknown_blocked" /> Automatic workspace writes — unknown blocks
-                </li>
-                <li>
-                  <StateBadge state="preference" /> Context reduction (60%) and reversible setup
-                  (40%)
-                </li>
-              </ul>
-            </fieldset>
+            <div className="form-grid two-column">
+              <label>
+                Hard constraints <small>One per line; unknown evidence blocks</small>
+                <textarea
+                  name="hardConstraints"
+                  required
+                  rows={4}
+                  placeholder={
+                    'Must work without public-network egress\nMust support the project runtime'
+                  }
+                />
+              </label>
+              <label>
+                Preferences{' '}
+                <small>One per line; weighted equally and never overrides a failed gate</small>
+                <textarea
+                  name="preferences"
+                  rows={4}
+                  placeholder={'Reversible setup\nLow maintenance burden'}
+                />
+              </label>
+            </div>
+            <div className="boundary-note">
+              <strong>No hidden project assumptions</strong>
+              <p>
+                Only the constraints written above enter this need. Inspect and revise them before
+                recording a decision.
+              </p>
+            </div>
             <InputError id="need-form-error">{formError}</InputError>
             <div className="form-actions">
               <button className="button" disabled={createNeed.isPending}>
@@ -249,7 +247,7 @@ export function DecidePage() {
                 <h2 id="active-heading">Resume a comparison</h2>
               </div>
               <Link className="text-link" to="/explore">
-                Explore a domain →
+                Search technologies →
               </Link>
             </div>
             {needs.data.items.length === 0 ? (

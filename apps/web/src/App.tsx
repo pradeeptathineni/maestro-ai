@@ -1,6 +1,7 @@
 import { Navigate, Route, Routes } from 'react-router-dom';
 import { Shell } from './ui.js';
 import { ConsiderPage } from './pages/ConsiderPage.js';
+import { CorpusPage } from './pages/CorpusPage.js';
 import { DecidePage } from './pages/DecidePage.js';
 import { DecisionPage } from './pages/DecisionPage.js';
 import { EvidencePage } from './pages/EvidencePage.js';
@@ -13,8 +14,9 @@ export function App() {
   return (
     <Routes>
       <Route element={<Shell />}>
-        <Route index element={<Navigate replace to="/decide" />} />
+        <Route index element={<Navigate replace to="/explore" />} />
         <Route path="decide" element={<DecidePage />} />
+        <Route path="corpus" element={<CorpusPage />} />
         <Route path="decide/:id" element={<NeedPage />} />
         <Route path="decisions/:id" element={<DecisionPage />} />
         <Route path="explore" element={<ExplorePage />} />
@@ -22,7 +24,7 @@ export function App() {
         <Route path="consider" element={<ConsiderPage />} />
         <Route path="evidence" element={<EvidencePage />} />
         <Route path="workspace" element={<WorkspacePage />} />
-        <Route path="*" element={<Navigate replace to="/decide" />} />
+        <Route path="*" element={<Navigate replace to="/explore" />} />
       </Route>
     </Routes>
   );

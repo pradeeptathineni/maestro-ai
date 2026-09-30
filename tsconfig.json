@@ -25,6 +25,7 @@
     "packages/**/*.ts",
     "tests/**/*.ts",
     "scripts/**/*.mjs",
+    "scripts/**/*.ts",
     "*.ts"
   ],
   "exclude": ["dist", "node_modules", "playwright-report", "test-results"]

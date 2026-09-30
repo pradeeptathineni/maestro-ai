@@ -349,6 +349,8 @@ export const scoreRuns = catalog.table('score_runs', {
   evidenceIds: uuid('evidence_ids').array().notNull().default([]),
   generatedAt: timestamp('generated_at', { withTimezone: true }).notNull(),
   supersededBy: uuid('superseded_by'),
+  predecessorId: uuid('predecessor_id'),
+  scopeKey: text('scope_key').notNull().default('general'),
 });
 
 export const dimensionScores = catalog.table('dimension_scores', {
@@ -468,6 +470,8 @@ export const candidates = workspace.table('candidates', {
   contextSnapshotHash: text('context_snapshot_hash').notNull(),
   discoveryOrigin: text('discovery_origin').notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  description: text().notNull().default(''),
+  evidenceState: text('evidence_state').notNull().default('unknown'),
 });
 
 export const candidateComponents = workspace.table('candidate_components', {
@@ -680,5 +684,416 @@ export const auditEvents = ops.table('audit_events', {
   beforeHash: text('before_hash'),
   afterHash: text('after_hash'),
   safeMetadata: jsonb('safe_metadata').notNull().default({}),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+// Phase 06 integrity and intelligence-explorer records. These declarations
+// intentionally mirror the additive SQL migrations so schema drift is caught.
+export const providerDisplayRevisions = catalog.table('provider_display_revisions', {
+  id: uuid().primaryKey(),
+  providerId: uuid('provider_id').notNull(),
+  revision: integer().notNull(),
+  kind: text().notNull(),
+  canonicalName: text('canonical_name').notNull(),
+  description: text().notNull(),
+  lifecycleState: text('lifecycle_state').notNull(),
+  sourceObservationId: uuid('source_observation_id'),
+  captureState: text('capture_state').notNull(),
+  displayHash: text('display_hash').notNull(),
+  effectiveAt: timestamp('effective_at', { withTimezone: true }).notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const providerEvidenceBindings = catalog.table('provider_evidence_bindings', {
+  id: uuid().primaryKey(),
+  providerId: uuid('provider_id').notNull(),
+  evidenceItemId: uuid('evidence_item_id').notNull(),
+  applicabilityScope: text('applicability_scope').notNull(),
+  bindingBasis: text('binding_basis').notNull(),
+  reviewedAt: timestamp('reviewed_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const scoreRunEvidenceBindings = catalog.table('score_run_evidence_bindings', {
+  scoreRunId: uuid('score_run_id').notNull(),
+  providerId: uuid('provider_id').notNull(),
+  evidenceItemId: uuid('evidence_item_id').notNull(),
+  applicabilityScope: text('applicability_scope').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const dimensionScoreEvidenceBindings = catalog.table('dimension_score_evidence_bindings', {
+  dimensionScoreId: uuid('dimension_score_id').notNull(),
+  scoreRunId: uuid('score_run_id').notNull(),
+  providerId: uuid('provider_id').notNull(),
+  evidenceItemId: uuid('evidence_item_id').notNull(),
+  applicabilityScope: text('applicability_scope').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const verificationEvidenceBindings = catalog.table('verification_evidence_bindings', {
+  verificationAssessmentId: uuid('verification_assessment_id').notNull(),
+  providerId: uuid('provider_id').notNull(),
+  evidenceItemId: uuid('evidence_item_id').notNull(),
+  applicabilityScope: text('applicability_scope').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const compatibilityEvidenceBindings = catalog.table('compatibility_evidence_bindings', {
+  compatibilityId: uuid('compatibility_id').notNull(),
+  providerId: uuid('provider_id').notNull(),
+  evidenceItemId: uuid('evidence_item_id').notNull(),
+  applicabilityScope: text('applicability_scope').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const knowledgeProjections = catalog.table('knowledge_projections', {
+  id: uuid().primaryKey(),
+  providerId: uuid('provider_id').notNull(),
+  providerRevision: integer('provider_revision').notNull(),
+  projectionVersion: text('projection_version').notNull(),
+  publicationState: text('publication_state').notNull(),
+  kindProfile: text('kind_profile').notNull(),
+  preferredLabel: text('preferred_label').notNull(),
+  summary: text().notNull(),
+  searchText: text('search_text').notNull(),
+  aliases: text().array().notNull().default([]),
+  capabilityKeys: text('capability_keys').array().notNull().default([]),
+  valueProfile: jsonb('value_profile').notNull(),
+  queryValuePolicyVersion: text('query_value_policy_version').notNull().default('query-signal-v1'),
+  queryValueConservative: numeric('query_value_conservative', { precision: 9, scale: 6 }),
+  queryEvidenceCoverage: numeric('query_evidence_coverage', { precision: 9, scale: 6 }),
+  projectionHash: text('projection_hash').notNull(),
+  indexedAt: timestamp('indexed_at', { withTimezone: true }).notNull(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const knowledgeProjectionSources = catalog.table('knowledge_projection_sources', {
+  projectionId: uuid('projection_id').notNull(),
+  sourceObservationId: uuid('source_observation_id').notNull(),
+  role: text().notNull(),
+  sourceAnchor: text('source_anchor'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const projectDisplayRevisions = workspace.table('project_display_revisions', {
+  id: uuid().primaryKey(),
+  workspaceId: uuid('workspace_id').notNull(),
+  projectId: uuid('project_id').notNull(),
+  revision: integer().notNull(),
+  name: text().notNull(),
+  lifecycleState: text('lifecycle_state').notNull(),
+  captureState: text('capture_state').notNull(),
+  displayHash: text('display_hash').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const fitAssessmentEvidenceBindings = workspace.table('fit_assessment_evidence_bindings', {
+  id: uuid().primaryKey(),
+  fitAssessmentId: uuid('fit_assessment_id').notNull(),
+  workspaceId: uuid('workspace_id').notNull(),
+  candidateId: uuid('candidate_id').notNull(),
+  catalogEvidenceId: uuid('catalog_evidence_id'),
+  privateEvidenceId: uuid('private_evidence_id'),
+  applicabilityScope: text('applicability_scope').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const decisionDisplaySnapshots = workspace.table('decision_display_snapshots', {
+  id: uuid().primaryKey(),
+  decisionId: uuid('decision_id').notNull(),
+  workspaceId: uuid('workspace_id').notNull(),
+  projectName: text('project_name').notNull(),
+  needTitle: text('need_title').notNull(),
+  candidateLabels: jsonb('candidate_labels').notNull(),
+  evidenceManifest: jsonb('evidence_manifest').notNull().default([]),
+  captureState: text('capture_state').notNull(),
+  snapshotHash: text('snapshot_hash').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const querySessions = workspace.table('query_sessions', {
+  id: uuid().primaryKey(),
+  workspaceId: uuid('workspace_id').notNull(),
+  projectContextId: uuid('project_context_id'),
+  queryText: text('query_text').notNull(),
+  queryHash: text('query_hash').notNull(),
+  normalizedIntent: jsonb('normalized_intent').notNull(),
+  explicitFacets: jsonb('explicit_facets').notNull().default({}),
+  inferredFacets: jsonb('inferred_facets').notNull().default({}),
+  interpretationMethod: text('interpretation_method').notNull(),
+  interpretationState: text('interpretation_state').notNull(),
+  retrievalPolicyVersion: text('retrieval_policy_version').notNull(),
+  indexRevision: text('index_revision').notNull(),
+  state: text().notNull(),
+  retentionUntil: timestamp('retention_until', { withTimezone: true }).notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  deletedAt: timestamp('deleted_at', { withTimezone: true }),
+});
+
+export const queryResultSets = workspace.table('query_result_sets', {
+  id: uuid().primaryKey(),
+  workspaceId: uuid('workspace_id').notNull(),
+  querySessionId: uuid('query_session_id').notNull(),
+  revision: integer().notNull(),
+  predecessorId: uuid('predecessor_id'),
+  status: text().notNull(),
+  retrievalPolicyVersion: text('retrieval_policy_version').notNull(),
+  signalPolicyVersion: text('signal_policy_version').notNull(),
+  indexRevision: text('index_revision').notNull(),
+  assessedCount: integer('assessed_count').notNull(),
+  availableCount: integer('available_count').notNull(),
+  truncatedCount: integer('truncated_count').notNull(),
+  diagnostics: jsonb().notNull().default({}),
+  resultHash: text('result_hash').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+});
+
+export const querySignalRuns = workspace.table('query_signal_runs', {
+  id: uuid().primaryKey(),
+  workspaceId: uuid('workspace_id').notNull(),
+  resultSetId: uuid('result_set_id').notNull(),
+  providerId: uuid('provider_id').notNull(),
+  providerRevision: integer('provider_revision').notNull(),
+  providerDisplayRevisionId: uuid('provider_display_revision_id').notNull(),
+  policyId: uuid('policy_id').notNull(),
+  policyVersion: text('policy_version').notNull(),
+  relevanceOrdinal: text('relevance_ordinal').notNull(),
+  relevanceValue: integer('relevance_value').notNull(),
+  relevanceMethod: text('relevance_method').notNull(),
+  relevanceAnchors: jsonb('relevance_anchors').notNull(),
+  valueInputs: jsonb('value_inputs').notNull(),
+  valueCentral: numeric('value_central', { precision: 9, scale: 6 }).notNull(),
+  valueUncertainty: numeric('value_uncertainty', { precision: 9, scale: 6 }).notNull(),
+  valueConservative: numeric('value_conservative', { precision: 9, scale: 6 }).notNull(),
+  evidenceCoverage: numeric('evidence_coverage', { precision: 9, scale: 6 }).notNull(),
+  signalUnrounded: numeric('signal_unrounded', { precision: 12, scale: 8 }),
+  signalDisplay: integer('signal_display'),
+  displayState: text('display_state').notNull(),
+  exclusions: text().array().notNull().default([]),
+  missing: text().array().notNull().default([]),
+  inputHash: text('input_hash').notNull(),
+  predecessorId: uuid('predecessor_id'),
+  generatedAt: timestamp('generated_at', { withTimezone: true }).notNull(),
+});
+
+export const querySignalEvidenceBindings = workspace.table('query_signal_evidence_bindings', {
+  querySignalRunId: uuid('query_signal_run_id').notNull(),
+  workspaceId: uuid('workspace_id').notNull(),
+  providerId: uuid('provider_id').notNull(),
+  evidenceItemId: uuid('evidence_item_id').notNull(),
+  dimensionKey: text('dimension_key').notNull(),
+  applicabilityScope: text('applicability_scope').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const queryResultItems = workspace.table('query_result_items', {
+  id: uuid().primaryKey(),
+  workspaceId: uuid('workspace_id').notNull(),
+  resultSetId: uuid('result_set_id').notNull(),
+  querySignalRunId: uuid('query_signal_run_id').notNull(),
+  providerId: uuid('provider_id').notNull(),
+  providerRevision: integer('provider_revision').notNull(),
+  position: integer().notNull(),
+  capabilityGroup: text('capability_group').notNull(),
+  matchedFields: text('matched_fields').array().notNull().default([]),
+  explanation: text().notNull(),
+  caveats: text().array().notNull().default([]),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const shortlists = workspace.table('shortlists', {
+  id: uuid().primaryKey(),
+  workspaceId: uuid('workspace_id').notNull(),
+  projectContextId: uuid('project_context_id').notNull(),
+  resultSetId: uuid('result_set_id').notNull(),
+  name: text().notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const shortlistItems = workspace.table('shortlist_items', {
+  shortlistId: uuid('shortlist_id').notNull(),
+  workspaceId: uuid('workspace_id').notNull(),
+  resultItemId: uuid('result_item_id').notNull(),
+  note: text(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const sourceAdapterConfigs = ops.table('source_adapter_configs', {
+  adapterKey: text('adapter_key').primaryKey(),
+  adapterVersion: text('adapter_version').notNull(),
+  sourceClass: text('source_class').notNull(),
+  baseUrl: text('base_url'),
+  allowedHosts: text('allowed_hosts').array().notNull().default([]),
+  dataDisclosureScope: text('data_disclosure_scope').notNull(),
+  credentialReference: text('credential_reference'),
+  rightsNotes: text('rights_notes').notNull(),
+  perOperationCallLimit: integer('per_operation_call_limit').notNull(),
+  dailyCallLimit: integer('daily_call_limit').notNull(),
+  timeoutMs: integer('timeout_ms').notNull(),
+  responseByteLimit: integer('response_byte_limit').notNull(),
+  maxAttempts: integer('max_attempts').notNull(),
+  modelIdentifier: text('model_identifier'),
+  maxInputTokens: integer('max_input_tokens').notNull().default(4096),
+  maxOutputTokens: integer('max_output_tokens').notNull().default(512),
+  enabled: boolean().notNull().default(false),
+  revision: integer().notNull().default(1),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const adapterDailyBudgets = ops.table('adapter_daily_budgets', {
+  adapterKey: text('adapter_key').notNull(),
+  budgetDate: text('budget_date').notNull(),
+  reservedCalls: integer('reserved_calls').notNull().default(0),
+  consumedCalls: integer('consumed_calls').notNull().default(0),
+  deniedCalls: integer('denied_calls').notNull().default(0),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const discoveryOperations = ops.table('discovery_operations', {
+  id: uuid().primaryKey(),
+  workspaceId: uuid('workspace_id').notNull(),
+  querySessionId: uuid('query_session_id').notNull(),
+  resultSetId: uuid('result_set_id'),
+  adapterKey: text('adapter_key').notNull(),
+  idempotencyKey: text('idempotency_key').notNull(),
+  intent: text().notNull(),
+  outboundQuery: text('outbound_query'),
+  outboundQueryHash: text('outbound_query_hash').notNull(),
+  disclosure: jsonb().notNull(),
+  state: text().notNull(),
+  reservedCalls: integer('reserved_calls').notNull(),
+  consumedCalls: integer('consumed_calls').notNull().default(0),
+  resultCount: integer('result_count').notNull().default(0),
+  errorCode: text('error_code'),
+  safeDetail: text('safe_detail'),
+  startedAt: timestamp('started_at', { withTimezone: true }),
+  finishedAt: timestamp('finished_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const discoveryAttempts = ops.table('discovery_attempts', {
+  id: uuid().primaryKey(),
+  operationId: uuid('operation_id').notNull(),
+  workspaceId: uuid('workspace_id').notNull(),
+  attempt: integer().notNull(),
+  requestHash: text('request_hash').notNull(),
+  state: text().notNull(),
+  httpStatus: integer('http_status'),
+  responseBytes: integer('response_bytes'),
+  resultCount: integer('result_count').notNull().default(0),
+  costState: text('cost_state').notNull(),
+  costAmount: numeric('cost_amount', { precision: 12, scale: 6 }),
+  errorCode: text('error_code'),
+  safeDetail: text('safe_detail'),
+  startedAt: timestamp('started_at', { withTimezone: true }).notNull(),
+  finishedAt: timestamp('finished_at', { withTimezone: true }),
+});
+
+export const discoveryCandidates = ops.table('discovery_candidates', {
+  id: uuid().primaryKey(),
+  operationId: uuid('operation_id').notNull(),
+  workspaceId: uuid('workspace_id').notNull(),
+  adapterKey: text('adapter_key').notNull(),
+  externalId: text('external_id').notNull(),
+  canonicalUri: text('canonical_uri').notNull(),
+  title: text().notNull(),
+  summary: text().notNull(),
+  kindHint: text('kind_hint'),
+  sourcePayloadHash: text('source_payload_hash').notNull(),
+  sourcePayload: jsonb('source_payload').notNull(),
+  provenance: jsonb().notNull(),
+  reviewState: text('review_state').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const discoveryAdmissions = ops.table('discovery_admissions', {
+  id: uuid().primaryKey(),
+  discoveryCandidateId: uuid('discovery_candidate_id').notNull(),
+  workspaceId: uuid('workspace_id').notNull(),
+  providerId: uuid('provider_id').notNull(),
+  providerRevision: integer('provider_revision').notNull(),
+  sourceObservationId: uuid('source_observation_id').notNull(),
+  evidenceItemId: uuid('evidence_item_id').notNull(),
+  projectionId: uuid('projection_id').notNull(),
+  actorType: text('actor_type').notNull(),
+  rationale: text().notNull(),
+  inputHash: text('input_hash').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const semanticProposals = ops.table('semantic_proposals', {
+  id: uuid().primaryKey(),
+  workspaceId: uuid('workspace_id').notNull(),
+  querySessionId: uuid('query_session_id'),
+  operationId: uuid('operation_id'),
+  taskKey: text('task_key').notNull(),
+  adapterKey: text('adapter_key').notNull(),
+  adapterVersion: text('adapter_version').notNull(),
+  modelIdentifier: text('model_identifier').notNull(),
+  schemaVersion: text('schema_version').notNull(),
+  inputHash: text('input_hash').notNull(),
+  outputHash: text('output_hash').notNull(),
+  output: jsonb().notNull(),
+  sourceAnchors: jsonb('source_anchors').notNull(),
+  usage: jsonb().notNull().default({}),
+  safetyChecks: jsonb('safety_checks').notNull(),
+  reviewState: text('review_state').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const watches = workspace.table('watches', {
+  id: uuid().primaryKey(),
+  workspaceId: uuid('workspace_id').notNull(),
+  providerId: uuid('provider_id'),
+  sourceId: uuid('source_id'),
+  querySessionId: uuid('query_session_id'),
+  cadence: text().notNull(),
+  priority: integer().notNull().default(50),
+  state: text().notNull(),
+  lastCheckedAt: timestamp('last_checked_at', { withTimezone: true }),
+  lastSucceededAt: timestamp('last_succeeded_at', { withTimezone: true }),
+  sourceWatermark: text('source_watermark'),
+  nextDueAt: timestamp('next_due_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const materialChanges = workspace.table('material_changes', {
+  id: uuid().primaryKey(),
+  workspaceId: uuid('workspace_id').notNull(),
+  watchId: uuid('watch_id'),
+  providerId: uuid('provider_id'),
+  oldObservationId: uuid('old_observation_id'),
+  newObservationId: uuid('new_observation_id'),
+  predicate: text().notNull(),
+  applicabilityScope: text('applicability_scope').notNull(),
+  reason: text().notNull(),
+  affectedResultSetId: uuid('affected_result_set_id'),
+  affectedDecisionId: uuid('affected_decision_id'),
+  changeHash: text('change_hash').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const changeNoticeStates = workspace.table('change_notice_states', {
+  changeId: uuid('change_id').notNull(),
+  workspaceId: uuid('workspace_id').notNull(),
+  seenAt: timestamp('seen_at', { withTimezone: true }),
+  disposition: text(),
+  note: text(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const sourceHealthEvents = ops.table('source_health_events', {
+  id: uuid().primaryKey(),
+  adapterKey: text('adapter_key').notNull(),
+  sourceId: uuid('source_id'),
+  state: text().notNull(),
+  safeDetail: text('safe_detail').notNull(),
+  observationId: uuid('observation_id'),
+  checkedAt: timestamp('checked_at', { withTimezone: true }).notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });

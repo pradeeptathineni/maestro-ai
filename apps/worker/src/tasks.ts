@@ -4,10 +4,25 @@ import {
   createGitHubMetadataAdapter,
   type GitHubMetadataAdapter,
 } from '../../../packages/adapters/src/index.js';
-import { processIntakeMetadata } from '../../../packages/db/src/index.js';
+import {
+  processDiscoveryOperation,
+  processIntakeMetadata,
+  processSemanticInterpretation,
+  processWatchRefresh,
+} from '../../../packages/db/src/index.js';
 
 interface IntakeTaskPayload {
   intakeId: string;
+  workspaceId: string;
+}
+
+interface DiscoveryTaskPayload {
+  operationId: string;
+  workspaceId: string;
+}
+
+interface WatchTaskPayload {
+  watchId: string;
   workspaceId: string;
 }
 
@@ -15,6 +30,18 @@ function isIntakePayload(value: unknown): value is IntakeTaskPayload {
   if (!value || typeof value !== 'object') return false;
   const record = value as Record<string, unknown>;
   return typeof record.intakeId === 'string' && typeof record.workspaceId === 'string';
+}
+
+function isDiscoveryPayload(value: unknown): value is DiscoveryTaskPayload {
+  if (!value || typeof value !== 'object') return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.operationId === 'string' && typeof record.workspaceId === 'string';
+}
+
+function isWatchPayload(value: unknown): value is WatchTaskPayload {
+  if (!value || typeof value !== 'object') return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.watchId === 'string' && typeof record.workspaceId === 'string';
 }
 
 export function createTaskList(
@@ -27,6 +54,18 @@ export function createTaskList(
     consider_url_metadata_v1: async (payload, helpers) => {
       if (!isIntakePayload(payload)) throw new Error('invalid_intake_job_payload');
       await processIntakeMetadata(pool, payload.intakeId, adapter, helpers.job.id);
+    },
+    phase06_discovery_v1: async (payload) => {
+      if (!isDiscoveryPayload(payload)) throw new Error('invalid_discovery_job_payload');
+      await processDiscoveryOperation(pool, payload);
+    },
+    phase06_semantic_v1: async (payload) => {
+      if (!isDiscoveryPayload(payload)) throw new Error('invalid_semantic_job_payload');
+      await processSemanticInterpretation(pool, payload);
+    },
+    phase06_refresh_watch_v1: async (payload) => {
+      if (!isWatchPayload(payload)) throw new Error('invalid_watch_job_payload');
+      await processWatchRefresh(pool, payload, adapter);
     },
   };
 }

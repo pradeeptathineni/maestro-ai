@@ -1,15 +1,4 @@
-export interface Domain {
-  id: string;
-  key: string;
-  label: string;
-  definition: string;
-  parentKey: string | null;
-  taxonomyKey: string;
-  taxonomyVersion: number;
-  providerCount: number;
-}
-
-export interface Dimension {
+interface Dimension {
   key: string;
   raw: number | null;
   adjusted: number | null;
@@ -52,7 +41,7 @@ export interface ProviderSummary {
   matchedFields: string[];
 }
 
-export interface ClaimEvidence {
+interface ClaimEvidence {
   direction: string;
   directness: string;
   strength: string;
@@ -67,7 +56,7 @@ export interface ClaimEvidence {
   reviewAfter: string | null;
 }
 
-export interface Claim {
+interface Claim {
   id: string;
   claimant: string;
   claimantRelation: string;
@@ -133,7 +122,7 @@ export interface ProviderDetail extends Omit<ProviderSummary, 'capabilities' | '
   executionAvailability: { available: false; explanation: string };
 }
 
-export interface GateResult {
+interface GateResult {
   constraintId: string;
   label: string;
   state: 'pass' | 'fail' | 'unknown';
@@ -142,7 +131,7 @@ export interface GateResult {
   explanation: string;
 }
 
-export interface Candidate {
+interface Candidate {
   id: string;
   optionKind: string;
   label: string;
@@ -177,7 +166,7 @@ export interface Candidate {
   nextVerification: Record<string, unknown> | null;
 }
 
-export interface DecisionSummary {
+interface DecisionSummary {
   id: string;
   outcome: string;
   selectedCandidateId: string | null;
@@ -298,4 +287,170 @@ export interface ProblemDetails {
   code: string;
   detail: string;
   correlationId: string;
+}
+
+interface ExplorerInterpretation {
+  normalizedText: string;
+  explicitFacets: Array<{ key: string; label: string; value: string; origin: string }>;
+  inferredFacets: Array<{ key: string; label: string; value: string; origin: string }>;
+  missingContext: Array<{ key: string; label: string; value: string; origin: string }>;
+  capabilityGroups: string[];
+  coverageState: 'maintained' | 'partial' | 'outside_maintained_coverage';
+}
+
+export interface ExplorerSession {
+  id: string;
+  resultSetId: string;
+  resultSetRevision: number;
+  status: string;
+  interpretation: ExplorerInterpretation;
+  counts: { assessed: number; available: number; truncated: number };
+  retentionUntil: string;
+  externalDiscovery: { attempted: boolean; state: string };
+  projectFit: { state: string; orderingApplied: boolean; explanation?: string };
+}
+
+export interface ExplorerRefresh {
+  state: 'unchanged' | 'refreshed';
+  resultSetId: string;
+  resultSetRevision: number;
+  predecessorId: string | null;
+  counts?: { assessed: number; available: number; truncated: number };
+}
+
+export interface ExplorerResultItem {
+  id: string;
+  position: number;
+  providerId: string;
+  providerRevision: number;
+  capabilityGroup: string;
+  matchedFields: string[];
+  explanation: string;
+  caveats: string[];
+  name: string;
+  kind: string;
+  description: string;
+  publicationState: string;
+  aliases: string[];
+  capabilities: string[];
+  relevanceOrdinal: string;
+  relevanceValue: number;
+  relevanceMethod: string;
+  valueCentral: number;
+  valueUncertainty: number;
+  valueConservative: number;
+  evidenceCoverage: number;
+  signalUnrounded: number;
+  signalDisplay: number | null;
+  displayState: string;
+  missing: string[];
+  policyVersion: string;
+}
+
+export interface ExplorerResultPage {
+  resultSet: {
+    id: string;
+    revision: number;
+    querySessionId: string;
+    query: string;
+    interpretation: ExplorerInterpretation;
+    projectContextId: string | null;
+    assessedCount: number;
+    availableCount: number;
+    truncatedCount: number;
+    diagnostics: {
+      coverageState: string;
+      externalDiscoveryAttempted: boolean;
+      projectFitState: 'unknown_blocked' | 'not_applicable';
+      projectContextAffectsSignal: false;
+    };
+    signalPolicyVersion: string;
+    retrievalPolicyVersion: string;
+    createdAt: string;
+    expiresAt: string;
+  };
+  activeOrdering: string;
+  filters: Record<string, unknown>;
+  filteredCount: number;
+  items: ExplorerResultItem[];
+  discoveryOperations: Array<{ id: string; adapterKey: string; state: string }>;
+  nextCursor: string | null;
+}
+
+export interface ExplorerItemDetail extends ExplorerResultItem {
+  resultSetId: string;
+  relevanceAnchors: Record<string, unknown>;
+  valueInputs: Array<{
+    key: string;
+    raw: number | null;
+    confidence: number;
+    coverage: number;
+    prior: number;
+    adjusted: number;
+    state: string;
+    reasons: string[];
+    missing: string[];
+  }>;
+  inputHash: string;
+  generatedAt: string;
+  evidence: Array<{
+    id: string;
+    evidenceType: string;
+    producer: string;
+    methodVersion: string;
+    independence: string;
+    applicabilityScope: string;
+    limitations: string[];
+    observedAt: string;
+    sourceTitle: string | null;
+    sourceOwner: string | null;
+    sourceUrl: string | null;
+    retrievalMethod: string | null;
+    handlingStatus: string | null;
+    dimensionKey: string;
+  }>;
+  relations: Array<{
+    type: string;
+    scope: string;
+    confidence: number;
+    targetProviderId: string;
+    targetName: string;
+    sourceUrl: string | null;
+    status: string;
+  }>;
+}
+
+export interface ExplorerGraphData {
+  resultSetId: string;
+  resultSetRevision: number;
+  filteredCount: number;
+  visibleCount: number;
+  hiddenCount: number;
+  nodes: Array<{
+    id: string;
+    resultItemId?: string;
+    providerId?: string;
+    type: 'provider' | 'capability_group';
+    label: string;
+    kind?: string;
+    group: string;
+    signalDisplay?: number | null;
+    displayState: string;
+  }>;
+  edges: Array<{
+    id: string;
+    source: string;
+    target: string;
+    type: string;
+    scope: string;
+    status: string;
+  }>;
+  accessibleItems: Array<{
+    id: string;
+    name: string;
+    kind: string;
+    group: string;
+    explanation: string;
+    relation: { type: string; scope: string; status: string };
+  }>;
 }
