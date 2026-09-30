@@ -7,571 +7,601 @@ export interface QueryFacet {
   origin: QueryFacetOrigin;
 }
 
+export type ConceptRelationType =
+  'broader' | 'narrower' | 'related' | 'exact_match' | 'close_match';
+
+export interface QueryConceptRelationKnowledge {
+  conceptId: string;
+  relationType: ConceptRelationType;
+  stableKey: string;
+  facetKey: string;
+  label: string;
+}
+
+export interface QueryConceptKnowledge {
+  conceptId: string;
+  schemeKey: string;
+  schemeVersion: number;
+  stableKey: string;
+  facetKey: string;
+  preferredLabel: string;
+  labels: string[];
+  relations: QueryConceptRelationKnowledge[];
+}
+
+export interface QueryEntityKnowledge {
+  entityId: string;
+  entityClass: string;
+  preferredLabel: string;
+  aliases: string[];
+}
+
+export interface QueryKnowledge {
+  concepts: QueryConceptKnowledge[];
+  entities: QueryEntityKnowledge[];
+}
+
+export interface ResolvedQueryConcept {
+  conceptId: string;
+  schemeKey: string;
+  schemeVersion: number;
+  stableKey: string;
+  facetKey: string;
+  preferredLabel: string;
+  matchedLabel: string;
+  matchMethod: 'preferred_label' | 'alternate_label' | 'acronym' | 'token_overlap';
+  relations: QueryConceptRelationKnowledge[];
+}
+
+export interface ResolvedQueryEntity {
+  entityId: string;
+  entityClass: string;
+  preferredLabel: string;
+  matchedLabel: string;
+  matchMethod: 'exact' | 'mentioned';
+}
+
+export type QueryIntentMode =
+  | 'exact_entity'
+  | 'broad_landscape'
+  | 'typed_discovery'
+  | 'problem_discovery'
+  | 'task_discovery'
+  | 'knowledge_discovery'
+  | 'constrained_discovery'
+  | 'social_discovery'
+  | 'temporal_discovery'
+  | 'ambiguous';
+
 export interface QueryInterpretation {
   normalizedText: string;
   terms: string[];
   expandedTerms: string[];
   canonicalConcepts: string[];
+  resolvedConcepts: ResolvedQueryConcept[];
+  exactEntities: ResolvedQueryEntity[];
   explicitFacets: QueryFacet[];
   inferredFacets: QueryFacet[];
   missingContext: QueryFacet[];
   capabilityGroups: string[];
   landscapeFacets: string[];
-  intentMode:
-    | 'broad_landscape'
-    | 'typed_discovery'
-    | 'task_discovery'
-    | 'knowledge_discovery'
-    | 'constrained_discovery'
-    | 'social_discovery'
-    | 'temporal_discovery'
-    | 'ambiguous';
+  mechanismTerms: string[];
+  exclusions: string[];
+  temporalTerms: string[];
+  intentMode: QueryIntentMode;
   typedTarget: string | null;
+  requestedEntityClasses: string[];
   sourceRoutingHints: string[];
   coverageState: 'maintained' | 'partial' | 'outside_maintained_coverage';
-  interpretationMethod: 'deterministic-v2';
+  interpretationMethod: 'deterministic-v3';
+  knowledgeStats: {
+    availableConcepts: number;
+    availableEntities: number;
+    resolvedConcepts: number;
+    resolvedEntities: number;
+  };
 }
 
 const STOP_WORDS = new Set([
   'a',
   'an',
   'and',
-  'across',
   'are',
-  'before',
-  'behind',
-  'better',
-  'build',
+  'as',
+  'at',
+  'be',
+  'by',
   'for',
-  'fix',
-  'fixes',
-  'help',
+  'from',
   'i',
-  'improve',
   'in',
   'is',
   'it',
-  'make',
   'me',
   'my',
-  'no',
   'of',
   'on',
   'or',
+  'please',
   'several',
+  'that',
   'the',
+  'these',
+  'those',
   'to',
-  'trying',
-  'while',
-  'understand',
   'with',
 ]);
 
-const CONCEPTS: Array<{
-  key: string;
-  label: string;
-  triggers: string[];
-  expansions: string[];
-}> = [
-  {
-    key: 'coding',
-    label: 'Coding systems',
-    triggers: [
-      'agent',
-      'assistant',
-      'assistants',
-      'code',
-      'codebase',
-      'coding',
-      'codex',
-      'developer',
-      'engineering',
-      'programming',
-      'repo',
-      'repository',
-      'software',
-      'workflow',
-      'workflows',
-      'agents',
-    ],
-    expansions: ['agentic', 'repository', 'workflow', 'software'],
-  },
-  {
-    key: 'context',
-    label: 'Context efficiency',
-    triggers: [
-      'compact',
-      'compress',
-      'compression',
-      'context',
-      'output',
-      'reduction',
-      'retrieval',
-      'shrink',
-      'token',
-    ],
-    expansions: ['compaction', 'filtering', 'optimization', 'output', 'search'],
-  },
-  {
-    key: 'evaluation',
-    label: 'Evaluation and observability',
-    triggers: [
-      'benchmark',
-      'check',
-      'checks',
-      'eval',
-      'evaluation',
-      'browser',
-      'console',
-      'measure',
-      'observability',
-      'observe',
-      'observation',
-      'quality',
-      'proof',
-      'runtime',
-      'test',
-      'testing',
-      'verification',
-    ],
-    expansions: [
-      'assessment',
-      'browser',
-      'console',
-      'evidence',
-      'network',
-      'runtime',
-      'testing',
-      'usage',
-      'validation',
-    ],
-  },
-  {
-    key: 'interoperability',
-    label: 'Interoperability and discovery',
-    triggers: [
-      'hook',
-      'hooks',
-      'configuration',
-      'connect',
-      'connected',
-      'connector',
-      'connectors',
-      'auth',
-      'authentication',
-      'instruction',
-      'instructions',
-      'mcp',
-      'oauth',
-      'plugin',
-      'protocol',
-      'registry',
-      'skill',
-      'skills',
-      'standard',
-      'slack',
-      'tool',
-      'tools',
-    ],
-    expansions: [
-      'capability',
-      'authentication',
-      'connection',
-      'integration',
-      'interoperability',
-      'protocol',
-      'server',
-      'standard',
-      'tool',
-      'workflow',
-    ],
-  },
-  {
-    key: 'agent-workflow',
-    label: 'Agent workflow and orchestration',
-    triggers: [
-      'delegation',
-      'delegate',
-      'llm',
-      'llms',
-      'model',
-      'models',
-      'multi-agent',
-      'multi-model',
-      'orchestration',
-      'routing',
-      'route',
-      'subagent',
-      'subagents',
-    ],
-    expansions: ['agent', 'gateway', 'handoff', 'model', 'parallel', 'workflow'],
-  },
-  {
-    key: 'writing-design',
-    label: 'Writing and design quality',
-    triggers: [
-      'copy',
-      'design',
-      'frontend',
-      'generic',
-      'interface',
-      'language',
-      'robot',
-      'slop',
-      'tone',
-      'ui',
-      'writing',
-    ],
-    expansions: ['brevity', 'editing', 'guidance', 'interface', 'prose', 'style', 'tone', 'visual'],
-  },
-  {
-    key: 'local-search',
-    label: 'Local and search infrastructure',
-    triggers: ['local', 'offline', 'search', 'self-hosted', 'searxng'],
-    expansions: ['inference', 'knowledge', 'metasearch', 'retrieval'],
-  },
-  {
-    key: 'software-foundations',
-    label: 'Software foundations',
-    triggers: ['infrastructure', 'python', 'runtime', 'scripting', 'terraform'],
-    expansions: ['language', 'software', 'state', 'tooling'],
-  },
-];
-
-const OUTSIDE_MAINTAINED_DOMAINS = new Set([
-  'accounting',
-  'diagnosis',
-  'healthcare',
-  'medical',
-  'payroll',
+const TEMPORAL_WORDS = new Set([
+  'current',
+  'emerging',
+  'hot',
+  'latest',
+  'new',
+  'recent',
+  'today',
+  'trending',
+  'updated',
 ]);
 
-const LANDSCAPES: Record<
-  string,
-  {
-    aliases: string[];
-    label: string;
-    expansions: string[];
-    facets: string[];
-  }
-> = {
-  ai: {
-    aliases: ['ai', 'artificial intelligence'],
-    label: 'Artificial intelligence',
-    expansions: [
-      'artificial intelligence',
-      'machine learning',
-      'model',
-      'inference',
-      'agent',
-      'neural network',
-    ],
-    facets: [
-      'Models and providers',
-      'Machine learning',
-      'Agents and tools',
-      'Knowledge and context',
-      'Evaluation',
-      'Infrastructure',
-      'Standards',
-      'Practices and techniques',
-      'Research and learning',
-      'Safety and governance',
-      'Data',
-      'Interfaces',
-    ],
-  },
-  devops: {
-    aliases: ['devops', 'development operations'],
-    label: 'DevOps',
-    expansions: [
-      'continuous integration',
-      'continuous delivery',
-      'containers',
-      'orchestration',
-      'infrastructure as code',
-      'observability',
-      'site reliability engineering',
-      'gitops',
-    ],
-    facets: [
-      'Containers',
-      'Orchestration',
-      'Infrastructure as code',
-      'CI/CD',
-      'Observability',
-      'Site reliability',
-      'GitOps',
-      'Release engineering',
-      'Cloud platforms',
-      'Configuration',
-      'Security',
-      'Practices and learning',
-    ],
-  },
-  ml: {
-    aliases: ['ml', 'machine learning'],
-    label: 'Machine learning',
-    expansions: [
-      'machine learning',
-      'model training',
-      'neural network',
-      'supervised learning',
-      'unsupervised learning',
-      'reinforcement learning',
-      'feature engineering',
-    ],
-    facets: [
-      'Frameworks',
-      'Learning methods',
-      'Training',
-      'Evaluation',
-      'Data and features',
-      'Experiment tracking',
-      'Serving and deployment',
-      'Interpretability',
-      'Responsible ML',
-      'Research',
-      'Learning resources',
-      'Standards',
-    ],
-  },
-  cs: {
-    aliases: ['cs', 'computer science'],
-    label: 'Computer science',
-    expansions: [
-      'computer science',
-      'programming language',
-      'algorithm',
-      'data structure',
-      'distributed systems',
-      'operating systems',
-      'database systems',
-      'computer networks',
-    ],
-    facets: [
-      'Programming languages',
-      'Algorithms',
-      'Data structures',
-      'Systems',
-      'Databases',
-      'Networks',
-      'Security',
-      'Compilers',
-      'Software engineering',
-      'Theory',
-      'Human-computer interaction',
-      'Learning resources',
-    ],
-  },
-};
+const COMMUNITY_WORDS = new Set(['community', 'discussion', 'forum', 'people', 'social']);
 
-const TYPED_TARGETS: Array<{ target: string; terms: string[] }> = [
-  { target: 'standard', terms: ['standard', 'standards', 'specification', 'protocol'] },
-  { target: 'article', terms: ['article', 'articles', 'paper', 'papers'] },
-  { target: 'practice', terms: ['practice', 'practices', 'technique', 'techniques'] },
-  { target: 'model', terms: ['model', 'models', 'model family', 'model release'] },
-  { target: 'provider', terms: ['provider', 'providers', 'vendor', 'vendors'] },
-  {
-    target: 'implementation',
-    terms: ['tool', 'tools', 'library', 'libraries', 'framework', 'frameworks'],
-  },
-];
+const PROBLEM_WORDS = new Set([
+  'avoid',
+  'fix',
+  'improve',
+  'prevent',
+  'reduce',
+  'replace',
+  'solve',
+  'struggle',
+]);
 
-const EXPLICIT_FACETS: Array<{
-  key: string;
-  label: string;
-  value: string;
-  terms: string[];
-}> = [
-  { key: 'distribution', label: 'GitHub distribution', value: 'github', terms: ['github'] },
-  { key: 'locality', label: 'Local operation', value: 'local', terms: ['local', 'offline'] },
-  {
-    key: 'credential',
-    label: 'No API key',
-    value: 'no_api_key',
-    terms: ['no api key', 'without api key'],
-  },
-  {
-    key: 'network_constraint',
-    label: 'Network constraint',
-    value: 'no_network',
-    terms: ['no network', 'without network', 'offline'],
-  },
-];
+const AUTHORITY_WORDS = new Set(['deploy', 'execute', 'install', 'invoke', 'run']);
+const EXCLUSION_WORDS = new Set(['except', 'exclude', 'excluding', 'not', 'without']);
 
-function normalizedWords(query: string): string[] {
-  return query
-    .normalize('NFKC')
-    .toLocaleLowerCase('en-US')
-    .replace(/[^a-z0-9+#.-]+/g, ' ')
-    .split(/\s+/)
-    .filter(Boolean);
+function unique<T>(values: T[]): T[] {
+  return [...new Set(values)];
+}
+
+function bounded(value: string, maximum: number): string {
+  return value.normalize('NFKC').trim().replace(/\s+/g, ' ').slice(0, maximum);
+}
+
+function normalizedWords(value: string): string[] {
+  return (
+    value
+      .normalize('NFKC')
+      .toLocaleLowerCase('en-US')
+      .match(/[\p{L}\p{N}+#.-]+/gu)
+      ?.map((word) => word.replace(/^[.-]+|[.-]+$/g, ''))
+      .filter(Boolean) ?? []
+  );
 }
 
 function normalizedPhrase(value: string): string {
   return normalizedWords(value.replaceAll('-', ' ')).join(' ');
 }
 
-function normalizedPhrasePresent(normalizedValue: string, normalizedPhrase: string): boolean {
-  if (!normalizedPhrase) return false;
-  if (` ${normalizedValue} `.includes(` ${normalizedPhrase} `)) return true;
-  const phraseWords = normalizedPhrase.split(' ');
-  if (phraseWords.length !== 1 || phraseWords[0]!.length <= 3) return false;
-  const term = phraseWords[0]!;
-  const variants = term.endsWith('ies')
-    ? [term.slice(0, -3) + 'y']
-    : term.endsWith('s')
-      ? [term.slice(0, -1)]
-      : [term + 's'];
-  return variants.some((variant) => ` ${normalizedValue} `.includes(` ${variant} `));
-}
-
-function phrasePresent(value: string, phrase: string): boolean {
-  return normalizedPhrasePresent(normalizedPhrase(value), normalizedPhrase(phrase));
-}
-
-function landscapeFor(normalizedText: string, words: string[]): string | null {
-  for (const [key, landscape] of Object.entries(LANDSCAPES)) {
-    if (
-      landscape.aliases.some(
-        (alias) =>
-          normalizedText === alias || (words.length <= 3 && phrasePresent(normalizedText, alias)),
-      )
-    ) {
-      return key;
+function wordVariants(word: string): Set<string> {
+  const variants = new Set([word]);
+  if (word.endsWith('ies') && word.length > 4) variants.add(`${word.slice(0, -3)}y`);
+  if (word.endsWith('es') && word.length > 4) variants.add(word.slice(0, -2));
+  if (word.endsWith('s') && word.length > 3) variants.add(word.slice(0, -1));
+  if (word.endsWith('y') && word.length > 3) variants.add(`${word.slice(0, -1)}ies`);
+  else {
+    variants.add(`${word}s`);
+    if (word.endsWith('s') || word.endsWith('x') || word.endsWith('ch')) {
+      variants.add(`${word}es`);
     }
   }
-  return null;
+  return variants;
 }
 
-function typedTargetFor(normalizedText: string): string | null {
-  const words = normalizedWords(normalizedText);
-  const phraseTarget = TYPED_TARGETS.find((entry) =>
-    entry.terms
-      .filter((term) => term.includes(' '))
-      .some((term) => phrasePresent(normalizedText, term)),
-  );
-  if (phraseTarget) return phraseTarget.target;
-  const matches = TYPED_TARGETS.filter((entry) =>
-    entry.terms.some((term) => !term.includes(' ') && words.includes(term)),
-  );
-  if (!matches.length) return null;
-  const knowledgeTarget = matches.find((entry) => ['standard', 'article'].includes(entry.target));
-  if (knowledgeTarget) return knowledgeTarget.target;
-  const pluralTypedNoun = matches.find((entry) =>
-    entry.terms.some((term) => term.endsWith('s') && words.includes(term)),
-  );
-  if (pluralTypedNoun && words.length <= 5) return pluralTypedNoun.target;
-  const leadingTypedNoun = matches.find((entry) => {
-    const nounIndex = Math.min(
-      ...entry.terms
-        .filter((term) => !term.includes(' ') && words.includes(term))
-        .map((term) => words.indexOf(term)),
+function normalizedPhrasePresent(value: string, phrase: string): boolean {
+  const valueWords = normalizedWords(value);
+  const phraseWords = normalizedWords(phrase);
+  if (!phraseWords.length || phraseWords.length > valueWords.length) return false;
+  for (let start = 0; start <= valueWords.length - phraseWords.length; start += 1) {
+    const matches = phraseWords.every((word, index) =>
+      wordVariants(word).has(valueWords[start + index]!),
     );
-    return nounIndex <= 1 && ['for', 'about', 'of'].some((word) => words.includes(word));
-  });
-  return leadingTypedNoun?.target ?? null;
+    if (matches) return true;
+  }
+  return false;
 }
 
-function intentModeFor(input: {
-  normalizedText: string;
-  searchable: string[];
-  landscapeKey: string | null;
+function acronym(value: string): string | null {
+  const words = normalizedWords(value).filter((word) => !STOP_WORDS.has(word));
+  if (words.length < 2 || words.length > 6) return null;
+  const result = words.map((word) => word[0]).join('');
+  return result.length >= 2 && result.length <= 6 ? result : null;
+}
+
+function conceptLabels(concept: QueryConceptKnowledge): string[] {
+  const stableLabel = concept.stableKey.split(':').at(-1)?.replaceAll('-', ' ') ?? '';
+  return unique(
+    [concept.preferredLabel, ...concept.labels, stableLabel].map((label) => bounded(label, 160)),
+  ).filter(Boolean);
+}
+
+function tokenOverlap(left: string[], right: string[]): number {
+  return left.filter((leftWord) =>
+    right.some(
+      (rightWord) => wordVariants(leftWord).has(rightWord) || wordVariants(rightWord).has(leftWord),
+    ),
+  ).length;
+}
+
+function resolveConcepts(
+  normalizedText: string,
+  meaningfulTerms: string[],
+  concepts: QueryConceptKnowledge[],
+): ResolvedQueryConcept[] {
+  const matches: Array<ResolvedQueryConcept & { specificity: number }> = [];
+  for (const concept of concepts) {
+    const labels = conceptLabels(concept);
+    const labelMatch = labels
+      .filter((label) => normalizedPhrasePresent(normalizedText, label))
+      .sort((left, right) => normalizedWords(right).length - normalizedWords(left).length)[0];
+    const preferredAcronym = acronym(concept.preferredLabel);
+    const acronymMatch =
+      !labelMatch &&
+      preferredAcronym &&
+      meaningfulTerms.length <= 4 &&
+      meaningfulTerms.includes(preferredAcronym)
+        ? preferredAcronym
+        : null;
+    const overlapMatch =
+      !labelMatch && !acronymMatch && !['entity_class', 'document_type'].includes(concept.facetKey)
+        ? labels
+            .map((label) => {
+              const labelWords = normalizedWords(label).filter((word) => !STOP_WORDS.has(word));
+              const overlap = tokenOverlap(labelWords, meaningfulTerms);
+              return {
+                label,
+                overlap,
+                coverage: labelWords.length ? overlap / labelWords.length : 0,
+              };
+            })
+            .filter((candidate) => candidate.overlap >= 2 && candidate.coverage >= 0.5)
+            .sort(
+              (left, right) =>
+                right.overlap - left.overlap ||
+                right.coverage - left.coverage ||
+                left.label.length - right.label.length,
+            )[0]
+        : null;
+    if (!labelMatch && !acronymMatch && !overlapMatch) continue;
+    const matchedLabel = labelMatch ?? acronymMatch ?? overlapMatch!.label;
+    matches.push({
+      conceptId: concept.conceptId,
+      schemeKey: concept.schemeKey,
+      schemeVersion: concept.schemeVersion,
+      stableKey: concept.stableKey,
+      facetKey: concept.facetKey,
+      preferredLabel: concept.preferredLabel,
+      matchedLabel,
+      matchMethod: acronymMatch
+        ? 'acronym'
+        : overlapMatch
+          ? 'token_overlap'
+          : normalizedPhrase(labelMatch!) === normalizedPhrase(concept.preferredLabel)
+            ? 'preferred_label'
+            : 'alternate_label',
+      relations: concept.relations.slice(0, 24),
+      specificity: normalizedWords(matchedLabel).length * 100 + matchedLabel.length,
+    });
+  }
+  return matches
+    .sort(
+      (left, right) =>
+        right.specificity - left.specificity ||
+        left.preferredLabel.localeCompare(right.preferredLabel) ||
+        left.conceptId.localeCompare(right.conceptId),
+    )
+    .slice(0, 16)
+    .map((match) => ({
+      conceptId: match.conceptId,
+      schemeKey: match.schemeKey,
+      schemeVersion: match.schemeVersion,
+      stableKey: match.stableKey,
+      facetKey: match.facetKey,
+      preferredLabel: match.preferredLabel,
+      matchedLabel: match.matchedLabel,
+      matchMethod: match.matchMethod,
+      relations: match.relations,
+    }));
+}
+
+function resolveEntities(
+  normalizedText: string,
+  entities: QueryEntityKnowledge[],
+): ResolvedQueryEntity[] {
+  const resolved: Array<ResolvedQueryEntity & { specificity: number }> = [];
+  for (const entity of entities) {
+    const labels = unique([entity.preferredLabel, ...entity.aliases]).filter(Boolean);
+    const exact = labels.find((label) => normalizedPhrase(label) === normalizedText);
+    const mentioned = exact
+      ? null
+      : labels
+          .filter(
+            (label) =>
+              normalizedWords(label).join('').length >= 4 &&
+              normalizedPhrasePresent(normalizedText, label),
+          )
+          .sort((left, right) => right.length - left.length)[0];
+    if (!exact && !mentioned) continue;
+    const matchedLabel = exact ?? mentioned!;
+    resolved.push({
+      entityId: entity.entityId,
+      entityClass: entity.entityClass,
+      preferredLabel: entity.preferredLabel,
+      matchedLabel,
+      matchMethod: exact ? 'exact' : 'mentioned',
+      specificity: normalizedWords(matchedLabel).length * 100 + matchedLabel.length,
+    });
+  }
+  return resolved
+    .sort(
+      (left, right) =>
+        Number(right.matchMethod === 'exact') - Number(left.matchMethod === 'exact') ||
+        right.specificity - left.specificity ||
+        left.preferredLabel.localeCompare(right.preferredLabel),
+    )
+    .slice(0, 8)
+    .map((match) => ({
+      entityId: match.entityId,
+      entityClass: match.entityClass,
+      preferredLabel: match.preferredLabel,
+      matchedLabel: match.matchedLabel,
+      matchMethod: match.matchMethod,
+    }));
+}
+
+function suppliedFacets(values: Record<string, string>): QueryFacet[] {
+  return Object.entries(values)
+    .map(([key, value]) => ({
+      key: bounded(key, 80),
+      label: bounded(
+        key.replaceAll('_', ' ').replace(/\b\p{L}/gu, (character) => character.toUpperCase()),
+        120,
+      ),
+      value: bounded(value, 240),
+      origin: 'explicit' as const,
+    }))
+    .filter((facet) => facet.key && facet.value);
+}
+
+function extractExclusions(words: string[]): string[] {
+  const exclusions: string[] = [];
+  for (let index = 0; index < words.length; index += 1) {
+    if (!EXCLUSION_WORDS.has(words[index]!)) continue;
+    const captured: string[] = [];
+    for (const candidate of words.slice(index + 1, index + 4)) {
+      if (STOP_WORDS.has(candidate) || EXCLUSION_WORDS.has(candidate)) break;
+      captured.push(candidate);
+    }
+    if (captured.length) exclusions.push(captured.join(' '));
+  }
+  return unique(exclusions);
+}
+
+function extractMechanisms(words: string[], resolvedConcepts: ResolvedQueryConcept[]): string[] {
+  const conceptWords = new Set(
+    resolvedConcepts.flatMap((concept) => normalizedWords(concept.matchedLabel)),
+  );
+  const candidates = words.filter(
+    (word) =>
+      !STOP_WORDS.has(word) &&
+      !TEMPORAL_WORDS.has(word) &&
+      !COMMUNITY_WORDS.has(word) &&
+      !EXCLUSION_WORDS.has(word) &&
+      !conceptWords.has(word),
+  );
+  const phrases: string[] = [];
+  for (const size of [3, 2]) {
+    for (let index = 0; index <= candidates.length - size; index += 1) {
+      phrases.push(candidates.slice(index, index + size).join(' '));
+    }
+  }
+  phrases.push(...candidates.filter((word) => word.length >= 4));
+  return unique(phrases).slice(0, 12);
+}
+
+function typedTargetFor(
+  resolvedConcepts: ResolvedQueryConcept[],
+  explicitFacets: QueryFacet[],
+  meaningfulTerms: string[],
+): { typedTarget: string | null; requestedEntityClasses: string[] } {
+  const suppliedEntityClass = explicitFacets
+    .filter((facet) => facet.key === 'entity_class' || facet.key === 'entityClass')
+    .map((facet) => normalizedPhrase(facet.value).replaceAll(' ', '-'));
+  const entityClasses = resolvedConcepts
+    .filter((concept) => concept.facetKey === 'entity_class')
+    .filter((concept) => {
+      const key = concept.stableKey.replace(/^entity-class:/, '');
+      const pluralMention = meaningfulTerms.some(
+        (term) => term.endsWith('s') && normalizedPhrasePresent(term, concept.matchedLabel),
+      );
+      const leadingMention = meaningfulTerms
+        .slice(0, 2)
+        .some((term) => normalizedPhrasePresent(term, concept.matchedLabel));
+      return (
+        meaningfulTerms.length <= 5 &&
+        (pluralMention || leadingMention || ['document', 'standard'].includes(key))
+      );
+    })
+    .sort((left, right) => {
+      const priority = (concept: ResolvedQueryConcept) =>
+        ['document', 'standard'].includes(concept.stableKey.replace(/^entity-class:/, '')) ? 0 : 1;
+      return priority(left) - priority(right);
+    })
+    .map((concept) => concept.stableKey.replace(/^entity-class:/, ''));
+  const requestedEntityClasses = unique([...suppliedEntityClass, ...entityClasses]);
+  if (requestedEntityClasses.length) {
+    const first = requestedEntityClasses[0]!;
+    return { typedTarget: first === 'document' ? 'article' : first, requestedEntityClasses };
+  }
+  const documentType = resolvedConcepts.find((concept) => concept.facetKey === 'document_type');
+  if (!documentType) return { typedTarget: null, requestedEntityClasses };
+  const key = documentType.stableKey.replace(/^document-type:/, '');
+  return {
+    typedTarget: ['standard', 'specification'].includes(key) ? 'standard' : 'article',
+    requestedEntityClasses: ['document'],
+  };
+}
+
+function inferIntent(input: {
+  meaningfulTerms: string[];
+  resolvedConcepts: ResolvedQueryConcept[];
+  exactEntities: ResolvedQueryEntity[];
   typedTarget: string | null;
   explicitFacets: QueryFacet[];
-}): QueryInterpretation['intentMode'] {
-  if (
-    input.searchable.some((term) =>
-      ['latest', 'new', 'recent', 'updated', 'current'].includes(term),
-    )
-  ) {
-    return 'temporal_discovery';
-  }
-  if (
-    input.searchable.some((term) => ['community', 'discussion', 'people', 'social'].includes(term))
-  ) {
-    return 'social_discovery';
-  }
-  if (input.explicitFacets.length > 0) return 'constrained_discovery';
+  exclusions: string[];
+  temporalTerms: string[];
+}): QueryIntentMode {
+  if (input.exactEntities.some((entity) => entity.matchMethod === 'exact')) return 'exact_entity';
+  if (input.temporalTerms.length) return 'temporal_discovery';
+  if (input.meaningfulTerms.some((term) => COMMUNITY_WORDS.has(term))) return 'social_discovery';
+  if (input.explicitFacets.length || input.exclusions.length) return 'constrained_discovery';
   if (input.typedTarget === 'article' || input.typedTarget === 'standard') {
     return 'knowledge_discovery';
   }
   if (input.typedTarget) return 'typed_discovery';
-  if (input.landscapeKey && input.searchable.length <= 2) return 'broad_landscape';
-  return input.searchable.length ? 'task_discovery' : 'ambiguous';
+  if (
+    input.resolvedConcepts.some((concept) => concept.facetKey === 'domain') &&
+    input.meaningfulTerms.length <= 3
+  ) {
+    return 'broad_landscape';
+  }
+  if (input.meaningfulTerms.some((term) => PROBLEM_WORDS.has(term))) {
+    return 'problem_discovery';
+  }
+  if (
+    input.meaningfulTerms.length === 1 &&
+    input.meaningfulTerms[0]!.length <= 4 &&
+    !input.resolvedConcepts.length
+  ) {
+    return 'ambiguous';
+  }
+  return 'task_discovery';
 }
 
 export function interpretQuery(
   query: string,
-  suppliedFacets: Record<string, string> = {},
+  suppliedFacetValues: Record<string, string> = {},
+  knowledge: QueryKnowledge = { concepts: [], entities: [] },
 ): QueryInterpretation {
-  const normalizedText = normalizedWords(query).join(' ').slice(0, 1000);
+  const normalizedText = normalizedPhrase(query).slice(0, 1000);
   if (!normalizedText) throw new TypeError('A query must contain searchable text.');
   const words = normalizedWords(normalizedText);
-  const searchable = words.filter((word) => !STOP_WORDS.has(word));
-  const landscapeKey = landscapeFor(normalizedText, searchable);
-  const landscape = landscapeKey ? LANDSCAPES[landscapeKey]! : null;
-  const typedTarget = typedTargetFor(normalizedText);
-  const matchedConcepts = CONCEPTS.filter((concept) =>
-    concept.triggers.some((trigger) => searchable.includes(trigger)),
-  );
-  const outsideMaintainedDomain = searchable.some((term) => OUTSIDE_MAINTAINED_DOMAINS.has(term));
-  const circularEndorsement =
-    searchable.includes('maestro') &&
-    searchable.some((term) => ['best', 'selected', 'top'].includes(term));
-  const broadAiOnly = searchable.length === 1 && searchable[0] === 'ai';
-  const capabilityGroups = outsideMaintainedDomain
-    ? []
-    : landscape
-      ? [landscape.label, ...matchedConcepts.map((concept) => concept.label)]
-      : matchedConcepts.map((concept) => concept.label);
-  const expandedTerms = [
-    ...new Set([
-      ...searchable.filter((word) => word !== 'ai'),
-      ...(landscape?.expansions ?? []),
-      ...matchedConcepts.flatMap((concept) => concept.expansions),
-    ]),
-  ].sort();
-  const detectedFacets = EXPLICIT_FACETS.filter((facet) =>
-    facet.terms.some((term) => normalizedText.includes(term)),
-  ).map((facet) => ({ ...facet, origin: 'explicit' as const }));
-  if (
-    searchable.includes('install') &&
-    searchable.some((term) => ['plugin', 'plugins'].includes(term))
-  ) {
+  const meaningfulTerms = words.filter((word) => !STOP_WORDS.has(word));
+  const supplied = suppliedFacets(suppliedFacetValues);
+  const suppliedTerms = supplied.flatMap((facet) => normalizedWords(facet.value));
+  const terms = unique([...meaningfulTerms, ...suppliedTerms]);
+  const resolvedConcepts = resolveConcepts(normalizedText, meaningfulTerms, knowledge.concepts);
+  const exactEntities = resolveEntities(normalizedText, knowledge.entities);
+  const exclusions = extractExclusions(words);
+  const temporalTerms = unique(words.filter((word) => TEMPORAL_WORDS.has(word)));
+
+  const detectedFacets: QueryFacet[] = [];
+  if (words.includes('github')) {
     detectedFacets.push({
-      key: 'candidate_kind',
-      label: 'Requested kind',
-      value: 'plugin',
-      terms: ['plugin'],
+      key: 'distribution',
+      label: 'Distribution',
+      value: 'github',
       origin: 'explicit',
     });
   }
-  const supplied = Object.entries(suppliedFacets)
-    .map(([key, value]) => ({
-      key: key.normalize('NFKC').trim().slice(0, 80),
-      label: key
-        .replaceAll('_', ' ')
-        .replace(/\b\w/g, (character) => character.toUpperCase())
-        .slice(0, 120),
-      value: value.normalize('NFKC').trim().replace(/\s+/g, ' ').slice(0, 240),
-      origin: 'explicit' as const,
-    }))
-    .filter((facet) => facet.key && facet.value);
-  const suppliedKeys = new Set(supplied.map((facet) => facet.key));
+  if (words.some((word) => word === 'local' || word === 'offline')) {
+    detectedFacets.push({
+      key: 'locality',
+      label: 'Locality',
+      value: words.includes('offline') ? 'offline' : 'local',
+      origin: 'explicit',
+    });
+  }
+  if (normalizedPhrasePresent(normalizedText, 'no api key')) {
+    detectedFacets.push({
+      key: 'credential',
+      label: 'Credential',
+      value: 'no_api_key',
+      origin: 'explicit',
+    });
+  }
+  if (normalizedPhrasePresent(normalizedText, 'no network') || words.includes('offline')) {
+    detectedFacets.push({
+      key: 'network_constraint',
+      label: 'Network constraint',
+      value: 'no_network',
+      origin: 'explicit',
+    });
+  }
+  for (const exclusion of exclusions) {
+    detectedFacets.push({
+      key: 'exclusion',
+      label: 'Exclusion',
+      value: exclusion,
+      origin: 'explicit',
+    });
+  }
+  for (const temporal of temporalTerms) {
+    detectedFacets.push({
+      key: 'temporal',
+      label: 'Temporal qualifier',
+      value: temporal,
+      origin: 'explicit',
+    });
+  }
+  const suppliedKeys = new Set(supplied.map((facet) => `${facet.key}:${facet.value}`));
   const explicitFacets = [
-    ...detectedFacets.filter((facet) => !suppliedKeys.has(facet.key)),
+    ...detectedFacets.filter((facet) => !suppliedKeys.has(`${facet.key}:${facet.value}`)),
     ...supplied,
   ];
-  const suppliedTerms = supplied.flatMap((facet) => normalizedWords(facet.value));
-  const inferredFacets = matchedConcepts.map((concept) => ({
-    key: 'capability_group',
-    label: 'Suggested interpretation',
-    value: concept.key,
+  const { typedTarget, requestedEntityClasses } = typedTargetFor(
+    resolvedConcepts,
+    explicitFacets,
+    meaningfulTerms,
+  );
+  const intentMode = inferIntent({
+    meaningfulTerms,
+    resolvedConcepts,
+    exactEntities,
+    typedTarget,
+    explicitFacets,
+    exclusions,
+    temporalTerms,
+  });
+  const mechanismTerms = extractMechanisms(words, resolvedConcepts);
+  const related = unique(
+    resolvedConcepts.flatMap((concept) =>
+      concept.relations
+        .filter((relation) =>
+          ['narrower', 'related', 'close_match', 'exact_match'].includes(relation.relationType),
+        )
+        .map((relation) => relation.label),
+    ),
+  ).slice(0, 16);
+  const expandedTerms = unique([
+    ...resolvedConcepts.flatMap((concept) => [
+      concept.preferredLabel,
+      ...concept.relations.slice(0, 12).map((relation) => relation.label),
+    ]),
+    ...mechanismTerms,
+  ])
+    .filter((term) => !terms.includes(normalizedPhrase(term)))
+    .slice(0, 32);
+  const inferredFacets: QueryFacet[] = resolvedConcepts.map((concept) => ({
+    key: concept.facetKey,
+    label: 'Resolved concept',
+    value: concept.stableKey,
     origin: 'inferred' as const,
   }));
-  if (searchable.includes('github')) {
+  if (
+    words.includes('github') &&
+    !explicitFacets.some((facet) => facet.key === 'integration_target')
+  ) {
     inferredFacets.push({
       key: 'integration_target',
       label: 'Suggested interpretation',
@@ -579,82 +609,106 @@ export function interpretQuery(
       origin: 'inferred',
     });
   }
-  const unresolvedInferredFacets = inferredFacets.filter((facet) => !suppliedKeys.has(facet.key));
   const missingContext: QueryFacet[] = [];
-  if (searchable.some((term) => ['local', 'offline'].includes(term))) {
+  if (words.some((word) => word === 'local' || word === 'offline')) {
     missingContext.push({
       key: 'hardware',
       label: 'Missing context',
-      value: 'Hardware capacity is unknown; local does not imply offline search.',
+      value: 'Hardware capacity is unknown; local and offline are distinct constraints.',
       origin: 'missing',
     });
   }
-  if (circularEndorsement) {
-    missingContext.push({
-      key: 'independent_evidence',
-      label: 'Missing context',
-      value: 'Selection by Maestro is circular and does not establish independent quality.',
-      origin: 'missing',
-    });
-  }
-  if (searchable.some((term) => ['deploy', 'execute', 'install', 'invoke'].includes(term))) {
+  if (words.some((word) => AUTHORITY_WORDS.has(word))) {
     missingContext.push({
       key: 'action_authority',
       label: 'Authority boundary',
-      value: 'Exploration does not grant installation, execution, deployment, or invocation.',
+      value:
+        'Research does not grant installation, execution, deployment, or invocation authority.',
       origin: 'missing',
     });
   }
-  const aiRelated = broadAiOnly || matchedConcepts.length > 0 || searchable.includes('ai');
-  const canonicalConcepts = [
-    ...(landscape ? [landscape.label] : []),
-    ...matchedConcepts.map((concept) => concept.label),
-  ];
-  const intentMode = intentModeFor({
-    normalizedText,
-    searchable,
-    landscapeKey,
-    typedTarget,
-    explicitFacets,
-  });
-  const sourceRoutingHints = [
+  if (
+    words.some((word) => word === 'best' || word === 'top') &&
+    normalizedPhrasePresent(normalizedText, 'selected by')
+  ) {
+    missingContext.push({
+      key: 'independent_evidence',
+      label: 'Evidence caveat',
+      value:
+        'Selection by the subject itself is circular and does not establish independent quality.',
+      origin: 'missing',
+    });
+  }
+  if (intentMode === 'ambiguous') {
+    missingContext.push({
+      key: 'ambiguity',
+      label: 'Ambiguous term',
+      value:
+        'The short term did not resolve to a known concept or entity; alternate interpretations remain open.',
+      origin: 'missing',
+    });
+  }
+
+  const sourceRoutingHints = unique([
     'local_index',
-    ...(typedTarget === 'article' || intentMode === 'knowledge_discovery' ? ['general_web'] : []),
-    ...(searchable.some((term) =>
-      ['mcp', 'tool', 'tools', 'assistant', 'assistants'].includes(term),
+    ...(resolvedConcepts.length ? ['concept_neighborhood'] : []),
+    ...(exactEntities.length ? ['exact_identity'] : []),
+    'general_web',
+    ...(['article', 'standard'].includes(typedTarget ?? '') ||
+    words.some((word) => ['paper', 'research', 'study'].includes(word))
+      ? ['research_index']
+      : []),
+    ...(typedTarget === 'standard' ? ['standards_registry'] : []),
+    ...(!['article', 'standard', 'document'].includes(typedTarget ?? '')
+      ? ['implementation_forge', 'package_registry']
+      : []),
+    ...(resolvedConcepts.some(
+      (concept) => concept.facetKey === 'interface' && concept.stableKey.endsWith('mcp-server'),
     )
       ? ['technology_registry']
       : []),
-    ...(intentMode === 'social_discovery' || intentMode === 'temporal_discovery'
+    ...(['broad_landscape', 'social_discovery', 'temporal_discovery'].includes(intentMode)
       ? ['community']
       : []),
-    ...(typedTarget !== 'article' && typedTarget !== 'standard' ? ['implementation_forge'] : []),
-  ];
+  ]);
+  const canonicalConcepts = resolvedConcepts.map((concept) => concept.preferredLabel);
+  const capabilityGroups = unique(
+    resolvedConcepts
+      .filter((concept) => concept.facetKey === 'domain' || concept.facetKey === 'capability')
+      .map((concept) => concept.preferredLabel),
+  );
   return {
     normalizedText,
-    terms: [...new Set([...searchable, ...suppliedTerms])].sort(),
+    terms,
     expandedTerms,
     canonicalConcepts,
+    resolvedConcepts,
+    exactEntities,
     explicitFacets,
-    inferredFacets: unresolvedInferredFacets,
+    inferredFacets,
     missingContext,
     capabilityGroups,
-    landscapeFacets: landscape?.facets ?? [],
+    landscapeFacets: related,
+    mechanismTerms,
+    exclusions,
+    temporalTerms,
     intentMode,
     typedTarget,
-    sourceRoutingHints: [...new Set(sourceRoutingHints)],
-    coverageState: outsideMaintainedDomain
-      ? 'outside_maintained_coverage'
-      : circularEndorsement
-        ? 'partial'
-        : aiRelated
-          ? matchedConcepts.length || broadAiOnly
-            ? 'maintained'
-            : 'partial'
-          : landscape || typedTarget
-            ? 'maintained'
-            : 'outside_maintained_coverage',
-    interpretationMethod: 'deterministic-v2',
+    requestedEntityClasses,
+    sourceRoutingHints,
+    coverageState:
+      resolvedConcepts.length || exactEntities.length
+        ? 'maintained'
+        : intentMode === 'ambiguous'
+          ? 'partial'
+          : 'outside_maintained_coverage',
+    interpretationMethod: 'deterministic-v3',
+    knowledgeStats: {
+      availableConcepts: knowledge.concepts.length,
+      availableEntities: knowledge.entities.length,
+      resolvedConcepts: resolvedConcepts.length,
+      resolvedEntities: exactEntities.length,
+    },
   };
 }
 
@@ -675,79 +729,64 @@ export interface LexicalRelevanceResult {
 export function compileLexicalRelevance(
   interpretation: QueryInterpretation,
 ): (document: LexicalDocument) => LexicalRelevanceResult {
-  const broadAiQuery = interpretation.terms.length === 1 && interpretation.terms[0] === 'ai';
-  const candidateTerms = [...new Set([...interpretation.terms, ...interpretation.expandedTerms])]
-    .filter((term) => term !== 'ai' || broadAiQuery)
-    .map((term) => ({
-      term,
-      normalized: normalizedPhrase(term),
-    }));
-  const explicitOutsideDomainTerms = interpretation.terms.filter((term) =>
-    OUTSIDE_MAINTAINED_DOMAINS.has(term),
+  const explicitTerms = unique(interpretation.terms.map(normalizedPhrase)).filter(Boolean);
+  const expandedTerms = unique(
+    [...interpretation.expandedTerms, ...interpretation.canonicalConcepts]
+      .map(normalizedPhrase)
+      .filter(Boolean),
   );
-  const explicitTerms = broadAiQuery
-    ? interpretation.terms
-    : interpretation.terms.filter((term) => term !== 'ai');
-  const normalizedCanonicalConcepts = (interpretation.canonicalConcepts ?? []).map((concept) =>
-    normalizedPhrase(concept),
-  );
+  const candidateTerms = unique([...explicitTerms, ...expandedTerms]);
 
   return (document) => {
-    const normalizedFields = [
+    const fields = [
       { key: 'name', value: normalizedPhrase(document.name) },
       { key: 'alias', value: normalizedPhrase(document.aliases.join(' ')) },
       { key: 'capability', value: normalizedPhrase(document.capabilities.join(' ')) },
       { key: 'knowledge', value: normalizedPhrase(document.searchText) },
     ];
     const termMatches = candidateTerms
-      .map(({ term, normalized }) => ({
+      .map((term) => ({
         term,
-        fields: normalizedFields
-          .filter((field) => normalizedPhrasePresent(field.value, normalized))
+        fields: fields
+          .filter((field) => normalizedPhrasePresent(field.value, term))
           .map((field) => field.key),
       }))
-      .filter((match) => match.fields.length > 0);
+      .filter((match) => match.fields.length);
     const matchedTerms = termMatches.map((match) => match.term);
-    if (
-      explicitOutsideDomainTerms.length > 0 &&
-      !explicitOutsideDomainTerms.some((term) => matchedTerms.includes(term))
-    ) {
-      return { ordinal: 'no_match', value: 0, matchedFields: [], matchedTerms: [] };
-    }
-    const matchedFields = normalizedFields
+    const matchedFields = fields
       .filter((field) => termMatches.some((match) => match.fields.includes(field.key)))
       .map((field) => field.key);
-    if (!matchedTerms.length) {
-      return { ordinal: 'no_match', value: 0, matchedFields: [], matchedTerms: [] };
-    }
-    // `ai` is an umbrella landscape selector rather than a discriminating
-    // lexical requirement when qualifiers exist. As the entire broad query it
-    // remains a real, boundary-matched term so newly authored AI records are not
-    // excluded solely because they do not repeat a longer taxonomy phrase.
     const explicitMatched = explicitTerms.filter((term) => matchedTerms.includes(term));
-    const canonicalDirect =
-      interpretation.intentMode === 'broad_landscape' &&
-      normalizedCanonicalConcepts.some((concept) =>
-        normalizedFields.some((field) => normalizedPhrasePresent(field.value, concept)),
-      );
-    const expandedOnly = matchedTerms.filter((term) => !explicitTerms.includes(term));
-    if (
-      explicitMatched.length === 0 &&
-      !canonicalDirect &&
-      (expandedOnly.length < 2 ||
-        !matchedFields.some((field) => field === 'capability' || field === 'knowledge'))
-    ) {
+    const conceptDirect = interpretation.canonicalConcepts.some((label) =>
+      fields.some((field) => normalizedPhrasePresent(field.value, label)),
+    );
+    const exactEntity = interpretation.exactEntities.some((entity) =>
+      [document.name, ...document.aliases].some(
+        (label) => normalizedPhrase(label) === normalizedPhrase(entity.preferredLabel),
+      ),
+    );
+
+    if (!termMatches.length || (!explicitMatched.length && !conceptDirect && !exactEntity)) {
       return { ordinal: 'no_match', value: 0, matchedFields: [], matchedTerms: [] };
     }
-    const ratio = explicitTerms.length ? explicitMatched.length / explicitTerms.length : 0;
-    if (
-      (ratio === 1 || canonicalDirect) &&
-      matchedFields.some((field) => field === 'name' || field === 'alias' || field === 'capability')
-    ) {
+    const explicitRatio = explicitTerms.length
+      ? explicitMatched.length / explicitTerms.length
+      : conceptDirect || exactEntity
+        ? 1
+        : 0;
+    if (!interpretation.resolvedConcepts.length && !exactEntity && explicitRatio < 0.5) {
+      return { ordinal: 'no_match', value: 0, matchedFields: [], matchedTerms: [] };
+    }
+    const strongField = matchedFields.some((field) =>
+      ['name', 'alias', 'capability'].includes(field),
+    );
+    if (exactEntity || (explicitRatio === 1 && strongField) || (conceptDirect && strongField)) {
       return { ordinal: 'direct', value: 100, matchedFields, matchedTerms };
     }
-    if (ratio >= 0.6) return { ordinal: 'partial', value: 75, matchedFields, matchedTerms };
-    if (matchedFields.includes('capability')) {
+    if (explicitRatio >= 0.6 || (conceptDirect && explicitMatched.length > 0)) {
+      return { ordinal: 'partial', value: 75, matchedFields, matchedTerms };
+    }
+    if (matchedFields.some((field) => field === 'capability' || field === 'knowledge')) {
       return { ordinal: 'complementary', value: 50, matchedFields, matchedTerms };
     }
     return { ordinal: 'incidental', value: 25, matchedFields, matchedTerms };

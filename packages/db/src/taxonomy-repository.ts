@@ -1,4 +1,10 @@
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
+import type {
+  ConceptRelationType,
+  QueryConceptKnowledge,
+  QueryEntityKnowledge,
+  QueryKnowledge,
+} from '../../domain/src/index.js';
 
 export interface TaxonomyFacetValue {
   conceptId: string;
@@ -32,6 +38,17 @@ interface FacetRow {
   entityCount: number;
   schemeKey: string | null;
   schemeVersion: number | null;
+}
+
+type QueryConceptRow = Omit<QueryConceptKnowledge, 'relations'>;
+
+interface QueryConceptRelationRow {
+  ownerConceptId: string;
+  conceptId: string;
+  relationType: ConceptRelationType;
+  stableKey: string;
+  facetKey: string;
+  label: string;
 }
 
 export async function listTaxonomyFacets(pool: Pool): Promise<{
@@ -107,5 +124,101 @@ export async function listTaxonomyFacets(pool: Pool): Promise<{
     semantics:
       'Entity class, interface, service model, domain, capability, and document type are independent facets. Counts describe the current local corpus, not market completeness.',
     facets: [...facets.values()],
+  };
+}
+
+export async function loadQueryKnowledge(pool: Pool | PoolClient): Promise<QueryKnowledge> {
+  // A PoolClient may be inside a transaction and cannot execute concurrent
+  // queries. Keep this loader sequential so it is safe for both Pool and client.
+  const conceptResult = await pool.query<QueryConceptRow>(`
+      SELECT concept.id::text AS "conceptId", scheme.scheme_key AS "schemeKey",
+             scheme.version::int AS "schemeVersion", concept.stable_key AS "stableKey",
+             concept.facet_key AS "facetKey", concept.preferred_label AS "preferredLabel",
+             COALESCE(array_agg(DISTINCT label.label ORDER BY label.label)
+               FILTER (WHERE label.id IS NOT NULL), '{}') AS labels
+      FROM catalog.concepts concept
+      JOIN catalog.concept_schemes scheme ON scheme.id = concept.concept_scheme_id
+      LEFT JOIN catalog.concept_labels label ON label.concept_id = concept.id
+      WHERE concept.status = 'active' AND scheme.status = 'active'
+      GROUP BY concept.id, scheme.scheme_key, scheme.version
+      ORDER BY concept.facet_key, concept.preferred_label, concept.id
+    `);
+  const relationResult = await pool.query<QueryConceptRelationRow>(`
+      SELECT relation.subject_concept_id::text AS "ownerConceptId",
+             object_concept.id::text AS "conceptId",
+             relation.relation_type AS "relationType",
+             object_concept.stable_key AS "stableKey",
+             object_concept.facet_key AS "facetKey",
+             object_concept.preferred_label AS label
+      FROM catalog.concept_relations relation
+      JOIN catalog.concepts object_concept ON object_concept.id = relation.object_concept_id
+      WHERE relation.valid_to IS NULL AND object_concept.status = 'active'
+      UNION ALL
+      SELECT relation.object_concept_id::text AS "ownerConceptId",
+             subject_concept.id::text AS "conceptId",
+             CASE relation.relation_type
+               WHEN 'broader' THEN 'narrower'
+               WHEN 'narrower' THEN 'broader'
+               ELSE relation.relation_type
+             END AS "relationType",
+             subject_concept.stable_key AS "stableKey",
+             subject_concept.facet_key AS "facetKey",
+             subject_concept.preferred_label AS label
+      FROM catalog.concept_relations relation
+      JOIN catalog.concepts subject_concept ON subject_concept.id = relation.subject_concept_id
+      WHERE relation.valid_to IS NULL AND subject_concept.status = 'active'
+      ORDER BY "ownerConceptId", "relationType", label, "conceptId"
+    `);
+  const entityResult = await pool.query<QueryEntityKnowledge>(`
+      WITH latest_revisions AS (
+        SELECT DISTINCT ON (revision.entity_id)
+               revision.entity_id, revision.preferred_label,
+               revision.entity_class_concept_id
+        FROM catalog.knowledge_entity_revisions revision
+        ORDER BY revision.entity_id, revision.revision DESC, revision.created_at DESC,
+                 revision.id DESC
+      )
+      SELECT entity.id::text AS "entityId",
+             replace(class_concept.stable_key, 'entity-class:', '') AS "entityClass",
+             latest.preferred_label AS "preferredLabel",
+             CASE entity.source_kind
+               WHEN 'provider' THEN COALESCE((
+                 SELECT array_agg(DISTINCT alias ORDER BY alias)
+                 FROM (
+                   SELECT provider_alias.alias
+                   FROM catalog.provider_aliases provider_alias
+                   WHERE provider_alias.provider_id = entity.provider_id
+                   UNION
+                   SELECT identity.display_value
+                   FROM catalog.provider_identities identity
+                   WHERE identity.provider_id = entity.provider_id AND identity.valid_to IS NULL
+                 ) provider_labels(alias)
+               ), '{}')
+               WHEN 'document' THEN COALESCE(document.aliases, '{}')
+             END AS aliases
+      FROM catalog.knowledge_entities entity
+      JOIN latest_revisions latest ON latest.entity_id = entity.id
+      JOIN catalog.concepts class_concept ON class_concept.id = latest.entity_class_concept_id
+      LEFT JOIN catalog.knowledge_documents document ON document.id = entity.document_id
+      ORDER BY latest.preferred_label, entity.id
+    `);
+  const relations = new Map<string, QueryConceptRelationRow[]>();
+  for (const relation of relationResult.rows) {
+    const values = relations.get(relation.ownerConceptId) ?? [];
+    values.push(relation);
+    relations.set(relation.ownerConceptId, values);
+  }
+  return {
+    concepts: conceptResult.rows.map((concept) => ({
+      ...concept,
+      relations: (relations.get(concept.conceptId) ?? []).map((relation) => ({
+        conceptId: relation.conceptId,
+        relationType: relation.relationType,
+        stableKey: relation.stableKey,
+        facetKey: relation.facetKey,
+        label: relation.label,
+      })),
+    })),
+    entities: entityResult.rows,
   };
 }

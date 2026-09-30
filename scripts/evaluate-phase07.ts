@@ -395,7 +395,7 @@ async function main(): Promise<void> {
       candidatePoolControl:
         'All three policies are replayed over each query result set identified by one candidate-pool hash.',
       configuration: {
-        retrieval: 'deterministic-v2 interpretation + typed lexical expansion',
+        retrieval: 'deterministic-v3 knowledge-backed interpretation + lexical-concept-v4',
         currentSignalPolicy: 'query-signal-v2',
         historicalReplayPolicy: 'query-signal-v1',
         resultCutoff: 20,
@@ -430,7 +430,7 @@ async function main(): Promise<void> {
       semanticMechanism: {
         state: 'not_configured',
         implementedCandidate:
-          'Typed deterministic interpretation, synonym expansion, heterogeneous documents, and diversity-aware ranking.',
+          'Versioned concept and alias resolution, bounded taxonomy-relation expansion, heterogeneous documents, and diversity-aware ranking.',
         limitation:
           'No approved local embedding or reranking endpoint was configured, so semantic-model benefit remains unmeasured.',
       },

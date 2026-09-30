@@ -15,6 +15,7 @@ import {
 } from '../../scoring/src/index.js';
 import { scoreDiscoveryCandidate } from './discovery-repository.js';
 import { DomainValidationError } from './errors.js';
+import { loadQueryKnowledge } from './taxonomy-repository.js';
 
 type CorpusLayer = 'indexed_knowledge' | 'knowledge_document' | 'source_lead';
 
@@ -357,7 +358,10 @@ export async function listResearchCorpus(
   const offset = decodeCursor(query.cursor, viewHash);
   const limit = Math.min(Math.max(query.limit ?? 20, 1), 50);
   const corpus = await loadCorpus(pool, workspaceId);
-  const interpretation = normalizedQuery ? interpretQuery(normalizedQuery) : null;
+  const knowledge = normalizedQuery ? await loadQueryKnowledge(pool) : null;
+  const interpretation = normalizedQuery
+    ? interpretQuery(normalizedQuery, {}, knowledge ?? undefined)
+    : null;
   const assessRelevance = interpretation ? compileLexicalRelevance(interpretation) : null;
   const matched = corpus
     .map((row) => assessRow(row, interpretation, assessRelevance))

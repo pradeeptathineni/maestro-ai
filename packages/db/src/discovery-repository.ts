@@ -451,12 +451,12 @@ export async function requestEnabledDiscovery(
         {
           adapterKey: route.adapterKey,
           approvedPublicQuery,
-          idempotencyKey: `search:${querySessionId}:${route.id}:1`,
+          idempotencyKey: `search:${querySessionId}:${route.id}:${route.variantIndex}`,
           intent: 'explore',
         },
         {
           planRouteId: route.id,
-          variantIndex: 1,
+          variantIndex: route.variantIndex,
           routingReason: route.reason,
           sourcePlanState: route.state,
           outboundQuery: route.variant,

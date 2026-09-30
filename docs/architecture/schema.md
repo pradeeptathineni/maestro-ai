@@ -46,6 +46,12 @@ Phase 08 migration `0016` adds a compatibility layer rather than replacing those
 
 Compatibility triggers project future writes through the historical provider/document APIs into
 the new layer. They do not reverse-sync or change old score, query, receipt, or provenance meaning.
+
+Migration `0017` adds general entity/document/interface alternate labels and service-operation
+concepts, then makes research-plan budgets, stop policy, coverage assessment, planned pass count,
+and stop reason independently queryable. Historical Phase 07 plans retain `NULL` for fields that
+were not captured by their policy; their original JSON and plan hash remain unchanged.
+
 The readiness gate checks the ordered repository migrations; catalog cardinality remains diagnostic
 data rather than readiness.
 

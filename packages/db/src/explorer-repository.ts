@@ -6,6 +6,7 @@ import type {
   ShortlistBody,
 } from '../../contracts/src/index.js';
 import {
+  assessResearchCoverage,
   buildDiscoveryPlan,
   compileLexicalRelevance,
   createVerificationBundle,
@@ -23,11 +24,12 @@ import {
   type QueryValueInput,
 } from '../../scoring/src/index.js';
 import { DomainValidationError, NotFoundError } from './errors.js';
+import { loadQueryKnowledge } from './taxonomy-repository.js';
 import { inTransaction } from './transaction.js';
 
 type JsonRow = Record<string, unknown>;
 
-const retrievalPolicyVersion = 'lexical-structured-v3';
+const retrievalPolicyVersion = 'lexical-concept-v4';
 
 interface ProjectionRow {
   projectionId: string;
@@ -35,6 +37,7 @@ interface ProjectionRow {
   providerRevision: number;
   displayRevisionId: string;
   publicationState: 'lead' | 'proposed' | 'reviewed' | 'stale' | 'withdrawn';
+  entityClass: string;
   kind: string;
   name: string;
   summary: string;
@@ -59,6 +62,7 @@ interface DocumentRow {
   documentId: string;
   publicationState: 'proposed' | 'reviewed' | 'stale';
   kind: 'article' | 'research' | 'resource' | 'specification' | 'standard';
+  entityClass: 'document';
   name: string;
   summary: string;
   searchText: string;
@@ -100,7 +104,7 @@ function json(value: unknown): string {
 }
 
 function capabilityGroup(projection: ProjectionRow, interpretation: QueryInterpretation): string {
-  return projection.domainLabels[0] ?? interpretation.capabilityGroups[0] ?? 'Other AI capability';
+  return projection.domainLabels[0] ?? interpretation.capabilityGroups[0] ?? 'Other';
 }
 
 function explanationFor(
@@ -210,6 +214,18 @@ async function loadProjectionCandidates(
         `SELECT kp.id AS "projectionId", kp.provider_id AS "providerId",
                 kp.provider_revision AS "providerRevision", pdr.id AS "displayRevisionId",
                 kp.publication_state AS "publicationState", kp.kind_profile AS kind,
+                COALESCE((
+                  SELECT replace(class_concept.stable_key, 'entity-class:', '')
+                  FROM catalog.knowledge_entities entity
+                  JOIN catalog.knowledge_entity_revisions entity_revision
+                    ON entity_revision.entity_id = entity.id
+                  JOIN catalog.concepts class_concept
+                    ON class_concept.id = entity_revision.entity_class_concept_id
+                  WHERE entity.provider_id = kp.provider_id
+                  ORDER BY entity_revision.revision DESC, entity_revision.created_at DESC,
+                           entity_revision.id DESC
+                  LIMIT 1
+                ), 'implementation') AS "entityClass",
                 kp.preferred_label AS name, kp.summary,
                 concat_ws(' ', kp.search_text, identity_data.identities) AS "searchText",
                 kp.aliases, kp.capability_keys AS capabilities, kp.value_profile AS "valueProfile",
@@ -297,7 +313,8 @@ async function loadDocumentCandidates(
   }
   const result = await client.query<DocumentRow>(
     `SELECT kd.id AS "documentId", kd.publication_state AS "publicationState",
-            kd.document_kind AS kind, kd.title AS name, kd.summary,
+            kd.document_kind AS kind, 'document'::text AS "entityClass",
+            kd.title AS name, kd.summary,
             kd.search_text AS "searchText", kd.aliases, kd.mechanism_keys AS mechanisms,
             kd.publisher, kd.canonical_uri AS "canonicalUri", kd.value_profile AS "valueProfile"
      FROM catalog.knowledge_documents kd
@@ -421,9 +438,8 @@ function rankMaterial(
           ? candidate.item.projection.kind
           : candidate.item.document.kind;
       const group = candidate.item.capabilityGroup;
-      const modelFamilyFacet = kind === 'model' && group === 'AI model families';
-      const kindLimit = modelFamilyFacet ? 4 : 3;
-      const groupLimit = modelFamilyFacet ? 4 : 2;
+      const kindLimit = 3;
+      const groupLimit = 2;
       const fits =
         (kindCounts.get(kind) ?? 0) < kindLimit && (groupCounts.get(group) ?? 0) < groupLimit;
       if (!fits) {
@@ -796,9 +812,44 @@ export async function createExplorerSession(
     }
     // Project fit is a separate assessment layer. Binding private context to a
     // snapshot must not silently change query relevance or query-signal-v2.
-    const interpretation = interpretQuery(input.query, input.explicitFacets ?? {});
-    const plan = buildDiscoveryPlan(input.query, interpretation);
-    const prepared = await prepareSnapshot(client, interpretation);
+    const knowledge = await loadQueryKnowledge(client);
+    const initialInterpretation = interpretQuery(
+      input.query,
+      input.explicitFacets ?? {},
+      knowledge,
+    );
+    const prepared = await prepareSnapshot(client, initialInterpretation);
+    const interpretation: QueryInterpretation = {
+      ...initialInterpretation,
+      coverageState:
+        initialInterpretation.missingContext.some(
+          (facet) => facet.key === 'independent_evidence',
+        ) ||
+        (initialInterpretation.terms.length <= 2 &&
+          initialInterpretation.inferredFacets.some((facet) => facet.key === 'integration_target'))
+          ? 'partial'
+          : prepared.ranked.length
+            ? 'maintained'
+            : initialInterpretation.coverageState,
+    };
+    const coverageAssessment = assessResearchCoverage(
+      interpretation,
+      prepared.ranked.map((candidate) =>
+        candidate.subjectType === 'implementation'
+          ? {
+              entityClass: candidate.item.projection.entityClass,
+              group: candidate.item.capabilityGroup,
+            }
+          : {
+              entityClass: candidate.item.document.entityClass,
+              group: candidate.item.capabilityGroup,
+            },
+      ),
+    );
+    const plan = buildDiscoveryPlan(input.query, interpretation, {
+      coverageAssessment,
+      externalSourcesEnabled: input.searchConnectedSources ?? false,
+    });
     const sessionId = newOpaqueId();
     const createdAt = new Date();
     const retentionUntil = new Date(createdAt.getTime() + 30 * 24 * 60 * 60 * 1000);
@@ -807,7 +858,7 @@ export async function createExplorerSession(
          (id, workspace_id, project_context_id, query_text, query_hash, normalized_intent,
           explicit_facets, inferred_facets, interpretation_method, interpretation_state,
           retrieval_policy_version, index_revision, state, retention_until, created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'deterministic-v2', 'deterministic',
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'deterministic-v3', 'deterministic',
                $9, $10, 'active', $11, $12)`,
       [
         sessionId,
@@ -827,8 +878,8 @@ export async function createExplorerSession(
     await client.query(
       `INSERT INTO workspace.query_plans
          (id, workspace_id, query_session_id, policy_version, intent_mode, plan, plan_hash,
-          created_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          budgets, stop_policy, stop_reason, coverage_assessment, planned_passes, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
       [
         newOpaqueId(),
         workspaceId,
@@ -837,6 +888,11 @@ export async function createExplorerSession(
         plan.intentMode,
         json(plan),
         plan.planHash,
+        json(plan.budgets),
+        json(plan.stopPolicy),
+        plan.stopReason,
+        json(plan.coverageAssessment ?? {}),
+        plan.secondPass.state === 'planned' ? 2 : 1,
         createdAt,
       ],
     );

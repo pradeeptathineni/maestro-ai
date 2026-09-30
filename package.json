@@ -42,6 +42,7 @@
     "start:test-stack": "concurrently --kill-others --names api,worker --prefix-colors cyan,magenta \"npm:start\" \"npm:start:worker\"",
     "start:worker": "node --env-file-if-exists=.env dist/apps/worker/src/server.js",
     "test": "vitest run --config vitest.config.ts",
+    "test:anti-overfit": "node scripts/check-query-special-cases.mjs",
     "test:integration": "vitest run --config vitest.integration.config.ts",
     "test:e2e": "node --import tsx packages/test-fixtures/src/prepare-e2e.ts && playwright test",
     "test:provenance": "node --import tsx packages/seed/src/audit.ts",

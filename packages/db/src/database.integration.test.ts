@@ -59,6 +59,7 @@ describe('reviewed PostgreSQL contract', () => {
       '0014_semantic_adapter_configuration.sql',
       '0015_discovery_intelligence.sql',
       '0016_faceted_knowledge.sql',
+      '0017_research_planner.sql',
     ]);
     expect(migrations.rows.every((row) => /^[a-f0-9]{64}$/.test(row.sha256))).toBe(true);
   });
@@ -213,6 +214,59 @@ describe('reviewed PostgreSQL contract', () => {
         expect.objectContaining({ facetKey: 'document_type', total: 5 }),
       ]),
     );
+  });
+
+  it('persists a bounded open-world plan for an unseen domain without a query-specific rule', async () => {
+    const session = (await createExplorerSession(pool, localWorkspaceId, {
+      query: 'lichen spectroscopy field notebook',
+    })) as {
+      id: string;
+      interpretation: {
+        interpretationMethod: string;
+        coverageState: string;
+        resolvedConcepts: unknown[];
+      };
+      plan: {
+        policyVersion: string;
+        stopReason: string;
+        budgets: { maximumPasses: number; maximumExternalCalls: number };
+        routes: Array<{ adapterKey: string; state: string; reason: string }>;
+        secondPass: { state: string; routes: unknown[] };
+      };
+    };
+    expect(session.interpretation).toMatchObject({
+      interpretationMethod: 'deterministic-v3',
+      coverageState: 'outside_maintained_coverage',
+      resolvedConcepts: [],
+    });
+    expect(session.plan).toMatchObject({
+      policyVersion: 'research-plan-v2',
+      stopReason: 'external_sources_disabled_after_local_pass',
+      budgets: { maximumPasses: 2, maximumExternalCalls: 6 },
+    });
+    expect(session.plan.routes.find((route) => route.adapterKey === 'searxng')).toMatchObject({
+      state: 'planned',
+      reason: expect.any(String),
+    });
+    expect(session.plan.secondPass).toMatchObject({ state: 'planned' });
+
+    const persisted = await pool.query<{
+      stopReason: string;
+      plannedPasses: number;
+      budgets: { maximumPasses: number };
+      coverage: { needsSecondPass: boolean };
+    }>(
+      `SELECT stop_reason AS "stopReason", planned_passes AS "plannedPasses", budgets,
+              coverage_assessment AS coverage
+       FROM workspace.query_plans WHERE query_session_id = $1`,
+      [session.id],
+    );
+    expect(persisted.rows[0]).toEqual({
+      stopReason: 'external_sources_disabled_after_local_pass',
+      plannedPasses: 2,
+      budgets: expect.objectContaining({ maximumPasses: 2 }),
+      coverage: expect.objectContaining({ needsSecondPass: true }),
+    });
   });
 
   it('keeps first-class knowledge documents and their query results immutable', async () => {
