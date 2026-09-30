@@ -2773,6 +2773,15 @@ tbody td small {
   margin-top: 0.55rem;
 }
 
+.corpus-record-main {
+  min-width: 0;
+}
+
+.corpus-record-main .card-topline {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+
 .corpus-record-main > p {
   margin: 0.35rem 0;
   color: #465159;
