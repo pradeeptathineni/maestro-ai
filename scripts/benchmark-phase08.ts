@@ -1,22 +1,22 @@
-import os from 'node:os';
 import assert from 'node:assert/strict';
 import { performance } from 'node:perf_hooks';
 import { interpretQuery } from '../packages/domain/src/index.js';
-import { initializeWorker } from '../apps/worker/src/initialize.js';
 import {
   createExplorerSession,
   createPool,
   getExplorerResultPage,
   listResearchCorpus,
   loadQueryKnowledge,
-  migrate,
 } from '../packages/db/src/index.js';
-import { importSeed, localWorkspaceId } from '../packages/seed/src/import.js';
+import { localWorkspaceId } from '../packages/seed/src/import.js';
+import { testDatabaseUrl } from '../packages/test-fixtures/src/database.js';
 import {
-  ensureTestDatabase,
-  resetTestSchemas,
-  testDatabaseUrl,
-} from '../packages/test-fixtures/src/database.js';
+  benchmarkEnvironment,
+  ensureDedicatedBenchmarkDatabase,
+  latencySummary,
+  rebuildBenchmarkDatabase,
+  syntheticBenchmarkValueProfile,
+} from './benchmark-utils.js';
 import { emitJsonReport } from './write-json-report.js';
 
 const syntheticCount = 25_000;
@@ -25,72 +25,7 @@ const query = 'distributed tracing telemetry sampling storage';
 const snapshotWarmP95TargetMs = 1_500;
 const corpusWarmP95TargetMs = 750;
 
-function percentile(values: number[], fraction: number): number {
-  const ordered = [...values].sort((left, right) => left - right);
-  return Number(ordered[Math.ceil(ordered.length * fraction) - 1]!.toFixed(2));
-}
-
-function latencySummary(values: number[]): {
-  p50: number;
-  p95: number;
-  min: number;
-  max: number;
-} {
-  return {
-    p50: percentile(values, 0.5),
-    p95: percentile(values, 0.95),
-    min: Number(Math.min(...values).toFixed(2)),
-    max: Number(Math.max(...values).toFixed(2)),
-  };
-}
-
 async function insertSyntheticCorpus(pool: ReturnType<typeof createPool>): Promise<void> {
-  const valueProfile = JSON.stringify([
-    {
-      key: 'reuse_leverage',
-      raw: 50,
-      confidence: 0.35,
-      coverage: 1,
-      applicability: 'applicable',
-      state: 'present',
-      reasons: ['Synthetic performance fixture; not knowledge evidence.'],
-      missing: [],
-      evidenceIds: [],
-    },
-    {
-      key: 'adoption_ease',
-      raw: null,
-      confidence: 0,
-      coverage: 0,
-      applicability: 'applicable',
-      state: 'missing',
-      reasons: [],
-      missing: ['Synthetic fixture.'],
-      evidenceIds: [],
-    },
-    {
-      key: 'maturity',
-      raw: null,
-      confidence: 0,
-      coverage: 0,
-      applicability: 'applicable',
-      state: 'missing',
-      reasons: [],
-      missing: ['Synthetic fixture.'],
-      evidenceIds: [],
-    },
-    {
-      key: 'provenance_clarity',
-      raw: 50,
-      confidence: 0.35,
-      coverage: 1,
-      applicability: 'applicable',
-      state: 'present',
-      reasons: ['Synthetic performance fixture; not knowledge evidence.'],
-      missing: [],
-      evidenceIds: [],
-    },
-  ]);
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -136,7 +71,7 @@ async function insertSyntheticCorpus(pool: ReturnType<typeof createPool>): Promi
               md5('phase08-perf-projection:' || n::text) || md5('phase08-perf-projection-2:' || n::text),
               now()
        FROM generate_series(1, $1) AS fixture(n)`,
-      [syntheticCount, valueProfile],
+      [syntheticCount, syntheticBenchmarkValueProfile],
     );
     await client.query('COMMIT');
   } catch (error) {
@@ -149,17 +84,10 @@ async function insertSyntheticCorpus(pool: ReturnType<typeof createPool>): Promi
 
 async function main(): Promise<void> {
   const databaseUrl = testDatabaseUrl();
-  const databaseName = decodeURIComponent(new URL(databaseUrl).pathname.slice(1));
   const reuseFixture = process.env.MAESTRO_BENCHMARK_REUSE_FIXTURE === 'true';
-  if (!databaseName.endsWith('_test')) {
-    throw new Error('Discovery benchmark only resets a dedicated database ending in _test.');
-  }
-  await ensureTestDatabase();
+  await ensureDedicatedBenchmarkDatabase(databaseUrl);
   if (!reuseFixture) {
-    await resetTestSchemas();
-    await migrate(databaseUrl);
-    await initializeWorker(databaseUrl);
-    await importSeed(databaseUrl);
+    await rebuildBenchmarkDatabase(databaseUrl);
   }
   const pool = createPool(databaseUrl);
   try {
@@ -312,14 +240,7 @@ async function main(): Promise<void> {
         statement:
           'Synthetic rows measure local query mechanics only and are not evidence or knowledge-quality data.',
       },
-      environment: {
-        platform: `${os.platform()} ${os.release()} ${os.arch()}`,
-        cpu: os.cpus()[0]?.model ?? 'unavailable',
-        logicalCpus: os.cpus().length,
-        memoryBytes: os.totalmem(),
-        node: process.version,
-        postgresql: postgresql.rows[0]!.version,
-      },
+      environment: benchmarkEnvironment(postgresql.rows[0]!.version),
       snapshotSearch: {
         path: 'plan, retrieve, fuse, rerank, persist immutable lineage, and serialize 50 matches',
         samples: snapshotLatencies.length,
