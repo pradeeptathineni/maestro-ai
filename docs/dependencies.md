@@ -31,7 +31,7 @@ code/dependencies, and `jscpd@5.3.3` (MIT) for clone detection. None grants runt
 authority or makes a catalog candidate trusted.
 
 The verification gate checks that all direct packages remain at their exact reviewed versions and
-use the reviewed MIT, Apache-2.0, ISC, or MPL-2.0 licenses. The 2026-09-29 installed-tree audit reported
+use the reviewed MIT, Apache-2.0, ISC, or MPL-2.0 licenses. The 2026-09-30 installed-tree audit reported
 zero known vulnerabilities. These are time-scoped dependency checks, not a claim that the
 application or dependencies are universally safe. CI and the local verification gate repeat them.
 
