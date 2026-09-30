@@ -76,12 +76,9 @@
       "apps/web/src/vite-env.d.ts",
       "apps/web/vite.config.ts",
       "apps/web/src/types.ts",
-      "apps/web/src/pages/ConsiderPage.tsx",
-      "apps/web/src/pages/DecidePage.tsx",
-      "apps/web/src/pages/DecisionPage.tsx",
-      "apps/web/src/pages/EvidencePage.tsx",
-      "apps/web/src/pages/NeedPage.tsx",
-      "apps/web/src/pages/ProviderPage.tsx",
+      "apps/web/src/pages/**",
+      "apps/web/src/ExplorerMap.tsx",
+      "packages/db/src/*-repository.ts",
       "**/dist/**",
       "**/node_modules/**"
     ]
