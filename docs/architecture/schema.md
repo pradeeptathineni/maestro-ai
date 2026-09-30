@@ -99,3 +99,9 @@ concept-scheme view selects the newest active version per stable scheme key. Cur
 relationship views honor validity windows and exclude rows with an effective append-only
 successor. Historical base rows remain directly queryable and unchanged; current search and filter
 paths use the projections so a correction does not leave both predecessor and successor active.
+
+Migration `0023` additively introduces the current-scheme `AI development tools` domain and projects
+the retained Phase 07 AI-engineering entity assignments into it. It does not retire, relabel, or
+rewrite the version-1 taxonomy or any historical result. The bridge lets the current interpreter
+and filters reach those subjects through an ordinary concept relationship instead of a query-string
+special case.

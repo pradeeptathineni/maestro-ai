@@ -4,12 +4,17 @@
 > the working title **Signals AI**. The repository and packages intentionally retain their Maestro
 > names until the recorded naming-collision gate receives a human decision.
 
-The current product is a local-first technology search and evidence-to-decision workspace. Search starts
-with a useful offline index, fans out to every source the operator has enabled, and gives every
-returned item a query-specific signal estimate with confidence, missing information, and source
-state shown separately. List, map, detail, compare, and export share one immutable local snapshot;
-live source results remain visibly preliminary and are saved into a separate research corpus. A
-reviewed admission—not collection alone—moves a lead into the indexed knowledge layer.
+The current product is a local-first technology search and evidence-to-decision workspace. **Search**
+starts with the indexed corpus and, when the operator asks, fans out through a bounded plan to every
+relevant source they have enabled. **Corpus** searches the durable local knowledge and attributed
+research leads already collected. Both use the same query interpretation and Match policy, while
+remaining different workflows: Search creates an immutable research snapshot; Corpus filters and
+scores retained records without silently turning leads into reviewed knowledge.
+
+Every result keeps query-specific **Match**, query-independent **Signal**, evidence confidence,
+trend, missing information, and source state separate. List, map, detail, compare, and export share
+one immutable local snapshot. Live results remain visibly preliminary. A reviewed admission—not
+collection alone—moves a lead into the indexed knowledge layer.
 
 It does **not** install, authorize, invoke, or orchestrate cataloged software. No model key is
 required. The narrow system establishes policy, evidence, project-context, adapter, and receipt
@@ -35,9 +40,10 @@ npm run dev
 ```
 
 Open [http://127.0.0.1:5173](http://127.0.0.1:5173). `db:init` applies checked SQL migrations,
-initializes Graphile Worker's schema, and imports the deterministic 61-item search seed. Twelve
-items have reviewed baseline evidence; the other 49 retain their proposed source-review state but
-still receive conservative numeric signal estimates. Initialization is safe to run again:
+initializes Graphile Worker's schema, and imports the deterministic source-backed seed. The current
+seed projects 87 provider records and 8 knowledge documents into 95 canonical subjects. Review
+state, provenance, and missing evidence remain visible rather than being inferred from presence in
+the index. Initialization is safe to run again:
 migrations are hash-checked and the seed is idempotent.
 
 The default configuration is safe and local: every Phase 06 source/model adapter starts disabled,
@@ -51,12 +57,15 @@ as safe failure receipts. Both the API bind and browser origin remain loopback-o
 
 ## Primary demonstration
 
-1. Open **Search**, ask for `ai context reduction github`, and inspect the result count, signal,
-   confidence, caveat, and `query-signal-v1` explanation.
+1. Open **Search**, ask `Reduce repository context before an AI coding agent starts work`, and
+   inspect the interpretation, bounded source plan, Match explanation, intrinsic Signal,
+   confidence, and caveat. The original wording remains visible even when the planner removes a
+   generic problem verb from an outbound source query.
 2. Switch between list and the bounded capability map, open a detail, compare two items, and save a
    shortlist to the seeded local project. The query stays out of the URL.
-3. Open **Corpus** to browse saved indexed records and source leads, or enter a need to score every
-   matching record under the same query policy used by Search.
+3. Open **Corpus** to browse reviewed/proposed indexed records and attributed source leads, or enter
+   a need to apply the same interpretation and Match semantics to the retained data. Corpus does
+   not make a network request.
 4. Open **Workspace** to create or revise a project context and configure source adapters. Enabled
    source adapters run when the operator presses Search; local semantic assistance remains separate.
 5. Open **Decide**, compare provider/composition/status-quo/build/defer options, and inspect hard
@@ -90,6 +99,11 @@ Useful individual commands:
 | `npm run test:e2e`          | Start the built local stack and run Chromium plus axe checks                 |
 | `npm run eval:phase06`      | Run the frozen 50-query proxy retrieval/signal evaluation                    |
 | `npm run benchmark:phase06` | Run the disposable 10k-row cached-query benchmark                            |
+| `npm run eval:phase07`      | Replay the retained Phase 07 evaluation contract                             |
+| `npm run eval:phase08`      | Run the stratified Phase 08 local evaluation                                 |
+| `npm run benchmark:phase08` | Run the disposable 25k-row Search and Corpus benchmark                       |
+| `npm run dogfood:discovery` | Exercise Search, configured live sources, and Corpus through the actual API  |
+| `npm run test:anti-overfit` | Reject production query-string special cases for the evaluation examples     |
 | `npm run context:pack`      | Create a secret-scanned, bounded disposable repository map                   |
 
 ## Production-like local run
