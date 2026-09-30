@@ -26,13 +26,17 @@ export async function recordSourceReliability(
   },
 ): Promise<string> {
   return inTransaction(pool, async (client) => {
+    await client.query(
+      `SELECT pg_advisory_xact_lock(hashtext('source-reliability:' || $1::text))`,
+      [input.sourceId],
+    );
     const source = await client.query('SELECT id FROM catalog.sources WHERE id = $1', [
       input.sourceId,
     ]);
     if (!source.rowCount) throw new NotFoundError('Source not found.');
     const predecessor = await client.query<{ id: string }>(
       `SELECT id FROM catalog.source_reliability_assessments
-       WHERE source_id = $1 ORDER BY observed_at DESC, id DESC LIMIT 1 FOR SHARE`,
+       WHERE source_id = $1 ORDER BY created_at DESC, id DESC LIMIT 1 FOR SHARE`,
       [input.sourceId],
     );
     const id = newOpaqueId();
@@ -40,8 +44,9 @@ export async function recordSourceReliability(
       `INSERT INTO catalog.source_reliability_assessments
          (id, source_id, policy_version, authority_class, availability_state,
           rights_state, reliability_score, evidence_basis, source_observation_ids,
-          observed_at, predecessor_id)
-       VALUES ($1, $2, 'source-reliability-v1', $3, $4, $5, $6, $7, $8, $9, $10)`,
+          observed_at, predecessor_id, created_at)
+       VALUES ($1, $2, 'source-reliability-v1', $3, $4, $5, $6, $7, $8, $9, $10,
+               clock_timestamp())`,
       [
         id,
         input.sourceId,
@@ -134,6 +139,12 @@ export async function recordCorroboration(
 ): Promise<{ id: string; state: ReturnType<typeof assessCorroboration>['state'] }> {
   const assessment = assessCorroboration(input.evidence);
   return inTransaction(pool, async (client) => {
+    await client.query(
+      `SELECT pg_advisory_xact_lock(
+         hashtext('corroboration:' || $1::text || ':' || $2 || ':' || $3)
+       )`,
+      [input.knowledgeEntityId, input.predicate, input.applicabilityScope],
+    );
     const entity = await client.query('SELECT id FROM catalog.knowledge_entities WHERE id = $1', [
       input.knowledgeEntityId,
     ]);
@@ -141,7 +152,7 @@ export async function recordCorroboration(
     const predecessor = await client.query<{ id: string }>(
       `SELECT id FROM catalog.corroboration_assessments
        WHERE knowledge_entity_id = $1 AND predicate = $2 AND applicability_scope = $3
-       ORDER BY observed_at DESC, id DESC LIMIT 1 FOR SHARE`,
+       ORDER BY created_at DESC, id DESC LIMIT 1 FOR SHARE`,
       [input.knowledgeEntityId, input.predicate, input.applicabilityScope],
     );
     const id = newOpaqueId();
@@ -149,8 +160,10 @@ export async function recordCorroboration(
       `INSERT INTO catalog.corroboration_assessments
          (id, knowledge_entity_id, policy_version, predicate, applicability_scope,
           state, primary_source_count, independent_source_count, community_source_count,
-          source_observation_ids, evidence_item_ids, rationale, observed_at, predecessor_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)`,
+          source_observation_ids, evidence_item_ids, rationale, observed_at, predecessor_id,
+          created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+               clock_timestamp())`,
       [
         id,
         input.knowledgeEntityId,

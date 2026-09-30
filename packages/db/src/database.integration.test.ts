@@ -69,6 +69,7 @@ describe('reviewed PostgreSQL contract', () => {
       '0018_retrieval_fabric.sql',
       '0019_intrinsic_signal.sql',
       '0020_corpus_intelligence.sql',
+      '0021_history_chain_integrity.sql',
     ]);
     expect(migrations.rows.every((row) => /^[a-f0-9]{64}$/.test(row.sha256))).toBe(true);
   });
@@ -323,6 +324,129 @@ describe('reviewed PostgreSQL contract', () => {
         [reliabilityId],
       ),
     ).rejects.toThrow(/immutable/i);
+  });
+
+  it('binds history links to one logical owner at the database boundary', async () => {
+    const revisions = await pool.query<{
+      id: string;
+      entityId: string;
+      revision: number;
+      entityClassConceptId: string;
+      label: string;
+      summary: string;
+      lifecycleState: string;
+    }>(`
+      SELECT DISTINCT ON (entity_id)
+             id, entity_id AS "entityId", revision,
+             entity_class_concept_id AS "entityClassConceptId",
+             preferred_label AS label, summary, lifecycle_state AS "lifecycleState"
+      FROM catalog.knowledge_entity_revisions
+      ORDER BY entity_id, revision DESC, id
+      LIMIT 2
+    `);
+    const [first, second] = revisions.rows;
+    expect(first!.entityId).not.toBe(second!.entityId);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await expect(
+        client.query(
+          `INSERT INTO catalog.knowledge_entity_revisions
+             (id, entity_id, revision, entity_class_concept_id, preferred_label,
+              summary, lifecycle_state, predecessor_id, content_hash)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [
+            randomUUID(),
+            second!.entityId,
+            second!.revision + 10_000,
+            second!.entityClassConceptId,
+            second!.label,
+            second!.summary,
+            second!.lifecycleState,
+            first!.id,
+            'a'.repeat(64),
+          ],
+        ),
+      ).rejects.toMatchObject({
+        code: '23503',
+        constraint: 'knowledge_entity_revisions_predecessor_same_entity_fkey',
+      });
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release();
+    }
+
+    await createExplorerSession(pool, localWorkspaceId, {
+      query: 'history owner constraint fixture',
+    });
+    const signal = await pool.query<{ id: string; entityId: string }>(
+      `SELECT id, knowledge_entity_id AS "entityId"
+       FROM catalog.intrinsic_signal_runs ORDER BY id LIMIT 1`,
+    );
+    const otherRevision = await pool.query<{ id: string }>(
+      `SELECT id FROM catalog.knowledge_entity_revisions
+       WHERE entity_id <> $1 ORDER BY id LIMIT 1`,
+      [signal.rows[0]!.entityId],
+    );
+    const signalClient = await pool.connect();
+    try {
+      await signalClient.query('BEGIN');
+      await expect(
+        signalClient.query(
+          `INSERT INTO catalog.intrinsic_signal_runs
+             (id, knowledge_entity_id, entity_revision_id, policy_id, policy_version,
+              profile, input_hash, dimension_inputs, central, uncertainty, conservative,
+              signal_display, display_state, band, evidence_confidence,
+              evidence_confidence_detail, trend_policy_version, trend_state,
+              trend_window_start, trend_window_end, trend_detail, evidence_ids, generated_at)
+           SELECT $1, knowledge_entity_id, $2, policy_id, policy_version, profile, $3,
+                  dimension_inputs, central, uncertainty, conservative, signal_display,
+                  display_state, band, evidence_confidence, evidence_confidence_detail,
+                  trend_policy_version, trend_state, trend_window_start, trend_window_end,
+                  trend_detail, evidence_ids, generated_at
+           FROM catalog.intrinsic_signal_runs WHERE id = $4`,
+          [randomUUID(), otherRevision.rows[0]!.id, 'b'.repeat(64), signal.rows[0]!.id],
+        ),
+      ).rejects.toMatchObject({
+        code: '23503',
+        constraint: 'intrinsic_signal_runs_revision_same_entity_fkey',
+      });
+    } finally {
+      await signalClient.query('ROLLBACK').catch(() => undefined);
+      signalClient.release();
+    }
+  });
+
+  it('serializes concurrent source-assessment appends into one lineage', async () => {
+    const fixture = await pool.query<{ sourceId: string; observationId: string }>(`
+      SELECT source_id AS "sourceId", id AS "observationId"
+      FROM catalog.source_observations ORDER BY id LIMIT 1
+    `);
+    const item = fixture.rows[0]!;
+    const ids = await Promise.all(
+      Array.from({ length: 6 }, (_, index) =>
+        recordSourceReliability(pool, {
+          sourceId: item.sourceId,
+          authorityClass: 'unknown',
+          availabilityState: 'unknown',
+          rightsState: 'unknown',
+          reliabilityScore: null,
+          evidenceBasis: { fixture: 'concurrent-lineage', index },
+          sourceObservationIds: [item.observationId],
+          observedAt: new Date(Date.UTC(2030, 0, 1, 0, 0, index)),
+        }),
+      ),
+    );
+    const lineage = await pool.query<{ id: string; predecessorId: string | null }>(
+      `SELECT id, predecessor_id AS "predecessorId"
+       FROM catalog.source_reliability_assessments WHERE id = ANY($1::uuid[])`,
+      [ids],
+    );
+    const idSet = new Set(ids);
+    expect(
+      lineage.rows.filter((row) => row.predecessorId && idSet.has(row.predecessorId)),
+    ).toHaveLength(ids.length - 1);
+    expect(new Set(lineage.rows.map((row) => row.predecessorId)).size).toBe(ids.length);
   });
 
   it('persists a bounded open-world plan for an unseen domain without a query-specific rule', async () => {

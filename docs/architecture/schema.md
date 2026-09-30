@@ -81,3 +81,9 @@ data rather than readiness.
 Drizzle declarations mirror queryable concepts but do not replace reviewed SQL. Startup never uses
 schema push. Corrections to immutable evidence, score, context, and decision records require a new
 revision or explicit supersession.
+
+Migration `0021` binds predecessor and supersession foreign keys to their logical owner. A revision
+cannot cite a row from another entity, document, source, query session, provider, facet, or
+relationship subject merely because the referenced UUID exists. Source-reliability and
+corroboration writers also serialize appends on the logical history key so concurrent writes form
+one lineage.
