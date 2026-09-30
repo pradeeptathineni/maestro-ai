@@ -7,7 +7,7 @@ import {
   getExplorerResultPage,
   migrate,
 } from '../packages/db/src/index.js';
-import { hashCanonical } from '../packages/domain/src/index.js';
+import { hashCanonical, type RetrievalFusionPolicy } from '../packages/domain/src/index.js';
 import { calculateQuerySignalV1, type QueryValueInput } from '../packages/scoring/src/index.js';
 import {
   phase06QueryEvaluationV1,
@@ -85,6 +85,12 @@ interface QueryMeasurement {
   elapsedMs: number;
   rankings: Record<BaselineKey, Ranking & RankingJudgment>;
 }
+
+const requestedFusionPolicy = process.env.MAESTRO_EVALUATION_FUSION_POLICY;
+const fusionPolicy: RetrievalFusionPolicy =
+  requestedFusionPolicy === 'normalized-weighted-fusion-v1'
+    ? requestedFusionPolicy
+    : 'reciprocal-rank-fusion-v1';
 
 const broadAnchors = [
   {
@@ -255,9 +261,12 @@ function fromPage(page: ResultPage): Ranking {
 
 async function getRankings(pool: Pool, query: string) {
   const started = performance.now();
-  const session = (await createExplorerSession(pool, localWorkspaceId, {
-    query,
-  })) as SessionResult;
+  const session = (await createExplorerSession(
+    pool,
+    localWorkspaceId,
+    { query },
+    { fusionPolicy },
+  )) as SessionResult;
   const [relevancePage, recommendedPage, rows] = await Promise.all([
     getExplorerResultPage(pool, localWorkspaceId, session.resultSetId, {
       limit: 50,
@@ -395,7 +404,8 @@ async function main(): Promise<void> {
       candidatePoolControl:
         'All three policies are replayed over each query result set identified by one candidate-pool hash.',
       configuration: {
-        retrieval: 'deterministic-v3 knowledge-backed interpretation + lexical-concept-v4',
+        retrieval: `deterministic-v3 + retrieval-fabric-v5 + ${fusionPolicy} + structured-rerank-v1`,
+        fusionPolicy,
         currentSignalPolicy: 'query-signal-v2',
         historicalReplayPolicy: 'query-signal-v1',
         resultCutoff: 20,

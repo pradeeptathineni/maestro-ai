@@ -60,6 +60,7 @@ describe('reviewed PostgreSQL contract', () => {
       '0015_discovery_intelligence.sql',
       '0016_faceted_knowledge.sql',
       '0017_research_planner.sql',
+      '0018_retrieval_fabric.sql',
     ]);
     expect(migrations.rows.every((row) => /^[a-f0-9]{64}$/.test(row.sha256))).toBe(true);
   });
@@ -170,7 +171,7 @@ describe('reviewed PostgreSQL contract', () => {
   });
 
   it('keeps reviewed SQL and Drizzle table/column declarations aligned', async () => {
-    expect(await checkSchemaDefinitions(pool)).toEqual({ checkedTables: 87, errors: [] });
+    expect(await checkSchemaDefinitions(pool)).toEqual({ checkedTables: 90, errors: [] });
   });
 
   it('projects every historical provider and document into the faceted knowledge model', async () => {
@@ -241,14 +242,14 @@ describe('reviewed PostgreSQL contract', () => {
     });
     expect(session.plan).toMatchObject({
       policyVersion: 'research-plan-v2',
-      stopReason: 'external_sources_disabled_after_local_pass',
+      stopReason: 'second_pass_exhausted',
       budgets: { maximumPasses: 2, maximumExternalCalls: 6 },
     });
     expect(session.plan.routes.find((route) => route.adapterKey === 'searxng')).toMatchObject({
       state: 'planned',
       reason: expect.any(String),
     });
-    expect(session.plan.secondPass).toMatchObject({ state: 'planned' });
+    expect(session.plan.secondPass).toMatchObject({ state: 'completed' });
 
     const persisted = await pool.query<{
       stopReason: string;
@@ -262,11 +263,66 @@ describe('reviewed PostgreSQL contract', () => {
       [session.id],
     );
     expect(persisted.rows[0]).toEqual({
-      stopReason: 'external_sources_disabled_after_local_pass',
+      stopReason: 'second_pass_exhausted',
       plannedPasses: 2,
       budgets: expect.objectContaining({ maximumPasses: 2 }),
       coverage: expect.objectContaining({ needsSecondPass: true }),
     });
+  });
+
+  it('freezes one candidate pool while persisting retriever, fusion, and rerank lineage', async () => {
+    const session = (await createExplorerSession(pool, localWorkspaceId, {
+      query: 'code context compression approaches',
+    })) as {
+      resultSetId: string;
+      retrieval: {
+        candidatePoolHash: string;
+        fusionPolicy: string;
+        rerankPolicy: string;
+        passes: number;
+        retrievers: Array<{ key: string; passIndex: number; returned: number }>;
+      };
+    };
+    expect(session.retrieval).toMatchObject({
+      candidatePoolHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      fusionPolicy: 'normalized-weighted-fusion-v1',
+      rerankPolicy: 'structured-rerank-v1',
+    });
+    expect(session.retrieval.retrievers.length).toBeGreaterThanOrEqual(2);
+
+    const lineage = await pool.query<{
+      runs: number;
+      hits: number;
+      fusions: number;
+      compared: number;
+      poolHash: string;
+    }>(
+      `SELECT
+         (SELECT count(*)::int FROM workspace.query_retrieval_runs
+           WHERE result_set_id = $1) AS runs,
+         (SELECT count(*)::int FROM workspace.query_retrieval_hits hit
+           JOIN workspace.query_retrieval_runs run ON run.id = hit.retrieval_run_id
+           WHERE run.result_set_id = $1) AS hits,
+         (SELECT count(*)::int FROM workspace.query_candidate_fusions
+           WHERE result_set_id = $1) AS fusions,
+         (SELECT count(*)::int FROM workspace.query_candidate_fusions
+           WHERE result_set_id = $1
+             AND reciprocal_rank > 0 AND normalized_weighted_rank > 0
+             AND reciprocal_rerank_position > 0
+             AND normalized_weighted_rerank_position > 0) AS compared,
+         (SELECT candidate_pool_hash FROM workspace.query_result_sets WHERE id = $1) AS "poolHash"`,
+      [session.resultSetId],
+    );
+    expect(lineage.rows[0]).toMatchObject({
+      runs: session.retrieval.retrievers.length,
+      hits: expect.any(Number),
+      fusions: expect.any(Number),
+      compared: expect.any(Number),
+      poolHash: session.retrieval.candidatePoolHash,
+    });
+    expect(lineage.rows[0]!.hits).toBeGreaterThan(0);
+    expect(lineage.rows[0]!.fusions).toBeGreaterThan(0);
+    expect(lineage.rows[0]!.compared).toBe(lineage.rows[0]!.fusions);
   });
 
   it('keeps first-class knowledge documents and their query results immutable', async () => {

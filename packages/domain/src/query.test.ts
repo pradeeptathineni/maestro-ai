@@ -80,6 +80,12 @@ const knowledge: QueryKnowledge = {
         },
       ],
     }),
+    concept('capability:repeatable-workflows', 'capability', 'Repeatable agent workflows', {
+      labels: ['Repeatable agent workflows'],
+    }),
+    concept('entity-class:practice', 'entity_class', 'Practice', {
+      labels: ['Practice', 'Workflow', 'Workflows'],
+    }),
   ],
   entities: [
     {
@@ -153,6 +159,16 @@ describe('knowledge-driven query interpretation', () => {
     expect(interpretQuery('latest marine robotics models', {}, knowledge).intentMode).toBe(
       'temporal_discovery',
     );
+    expect(interpretQuery('multi-model routing gateway', {}, knowledge)).toMatchObject({
+      intentMode: 'task_discovery',
+      typedTarget: null,
+      requestedEntityClasses: [],
+    });
+    expect(interpretQuery('repeatable workflows', {}, knowledge)).toMatchObject({
+      intentMode: 'task_discovery',
+      typedTarget: null,
+      requestedEntityClasses: [],
+    });
     expect(interpretQuery('marine robotics without cloud', {}, knowledge)).toMatchObject({
       intentMode: 'constrained_discovery',
       exclusions: ['cloud'],

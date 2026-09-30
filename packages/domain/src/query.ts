@@ -421,14 +421,33 @@ function typedTargetFor(
     .filter((concept) => concept.facetKey === 'entity_class')
     .filter((concept) => {
       const key = concept.stableKey.replace(/^entity-class:/, '');
+      const matchedClassWords = new Set(normalizedWords(concept.matchedLabel));
+      const classMentionIsPartOfAnotherConcept = resolvedConcepts
+        .filter((candidate) => candidate.facetKey !== 'entity_class')
+        .some((candidate) => {
+          const candidateWords = new Set([
+            ...normalizedWords(candidate.matchedLabel),
+            ...normalizedWords(candidate.preferredLabel),
+          ]);
+          return (
+            matchedClassWords.size > 0 &&
+            [...matchedClassWords].every((word) =>
+              [...candidateWords].some(
+                (candidateWord) =>
+                  wordVariants(word).has(candidateWord) || wordVariants(candidateWord).has(word),
+              ),
+            )
+          );
+        });
       const pluralMention = meaningfulTerms.some(
         (term) => term.endsWith('s') && normalizedPhrasePresent(term, concept.matchedLabel),
       );
       const leadingMention = meaningfulTerms
-        .slice(0, 2)
+        .slice(0, 1)
         .some((term) => normalizedPhrasePresent(term, concept.matchedLabel));
       return (
         meaningfulTerms.length <= 5 &&
+        !classMentionIsPartOfAnotherConcept &&
         (pluralMention || leadingMention || ['document', 'standard'].includes(key))
       );
     })
@@ -471,6 +490,9 @@ function inferIntent(input: {
   if (input.typedTarget) return 'typed_discovery';
   if (
     input.resolvedConcepts.some((concept) => concept.facetKey === 'domain') &&
+    !input.resolvedConcepts.some((concept) =>
+      ['capability', 'interface', 'service_model', 'document_type'].includes(concept.facetKey),
+    ) &&
     input.meaningfulTerms.length <= 3
   ) {
     return 'broad_landscape';

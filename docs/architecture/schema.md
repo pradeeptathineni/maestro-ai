@@ -52,6 +52,20 @@ concepts, then makes research-plan budgets, stop policy, coverage assessment, pl
 and stop reason independently queryable. Historical Phase 07 plans retain `NULL` for fields that
 were not captured by their policy; their original JSON and plan hash remain unchanged.
 
+Migration `0018` adds immutable retrieval lineage without changing a historical result set:
+
+- `query_retrieval_runs` records bounded local retriever/pass execution and disclosure limits;
+- `query_retrieval_hits` records native rank, score, matched terms, concepts, and candidate source;
+- `query_candidate_fusions` preserves both compared fusion rankings, structured rerank outputs,
+  entity-resolution evidence, and the selected policy for every frozen candidate; and
+- nullable result-set metadata records the candidate-pool hash, selected fusion/rerank policy,
+  pass count, stop reason, and coverage assessment. Pre-Phase-08 result sets retain `NULL` for facts
+  their original policy did not capture.
+
+The default Phase 08 policy is normalized weighted fusion; reciprocal-rank fusion remains persisted
+as the comparison baseline over the identical frozen pool. Neither policy changes intrinsic Signal
+or grants discovery, installation, or execution authority.
+
 The readiness gate checks the ordered repository migrations; catalog cardinality remains diagnostic
 data rather than readiness.
 

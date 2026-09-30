@@ -8,13 +8,25 @@ import type {
 import {
   assessResearchCoverage,
   buildDiscoveryPlan,
-  compileLexicalRelevance,
   createVerificationBundle,
+  diversifyBroadRetrieval,
+  fuseRetrievalRankings,
   hashCanonical,
   interpretQuery,
   lexicalRelevance,
   newOpaqueId,
+  resolveRetrievalDuplicates,
+  retrieveFirstPass,
+  retrieveSecondPass,
+  structuredRerank,
+  type DuplicateResolution,
+  type FusedRetrievalCandidate,
   type QueryInterpretation,
+  type ResearchCoverageAssessment,
+  type RerankedRetrievalCandidate,
+  type RetrievalDocument,
+  type RetrievalFusionPolicy,
+  type RetrievalRanking,
 } from '../../domain/src/index.js';
 import {
   calculateQuerySignalV2,
@@ -29,7 +41,8 @@ import { inTransaction } from './transaction.js';
 
 type JsonRow = Record<string, unknown>;
 
-const retrievalPolicyVersion = 'lexical-concept-v4';
+const retrievalPolicyVersion = 'retrieval-fabric-v5';
+const defaultFusionPolicy: RetrievalFusionPolicy = 'normalized-weighted-fusion-v1';
 
 interface ProjectionRow {
   projectionId: string;
@@ -56,6 +69,7 @@ interface MaterializedResult {
   explanation: string;
   caveats: string[];
   capabilityGroup: string;
+  retrieval: RerankedRetrievalCandidate;
 }
 
 interface DocumentRow {
@@ -80,6 +94,14 @@ interface MaterializedDocument {
   explanation: string;
   caveats: string[];
   capabilityGroup: string;
+  retrieval: RerankedRetrievalCandidate;
+}
+
+interface RetrievalIndex {
+  documents: RetrievalDocument[];
+  projectionCount: number;
+  documentCount: number;
+  indexRevision: string;
 }
 
 interface ResultItemRow extends JsonRow {
@@ -141,77 +163,186 @@ function validateValueProfile(value: unknown): QueryValueInput[] {
   return value as QueryValueInput[];
 }
 
-async function loadProjectionCandidates(
-  client: PoolClient,
-  interpretation: QueryInterpretation,
-): Promise<{
-  rows: ProjectionRow[];
-  availableCount: number;
-  projectionCount: number;
-  indexRevision: string;
-}> {
-  const metadata = await client.query<{ projectionCount: number; indexRevision: string }>(`
-    SELECT count(*)::int AS "projectionCount",
-           encode(digest(convert_to(COALESCE(string_agg(
-             kp.id::text || ':' || kp.provider_revision::text, ','
-             ORDER BY kp.preferred_label, kp.id
-           ), ''), 'UTF8'), 'sha256'), 'hex') AS "indexRevision"
-    FROM catalog.knowledge_projections kp
-    WHERE kp.publication_state <> 'withdrawn'
-      AND (kp.expires_at IS NULL OR kp.expires_at > now())
-  `);
-  const projectionCount = metadata.rows[0]!.projectionCount;
-  const indexRevision = metadata.rows[0]!.indexRevision;
-  const requestedKind = interpretation.explicitFacets.find(
-    (facet) => facet.key === 'candidate_kind',
-  )?.value;
-  const assessRelevance = compileLexicalRelevance(interpretation);
-  const index = await client.query<{
-    projectionId: string;
+function retrievalRelevance(
+  lexical: ReturnType<typeof lexicalRelevance>,
+  retrieval: RerankedRetrievalCandidate,
+): ReturnType<typeof lexicalRelevance> {
+  if (lexical.value > 0) {
+    return {
+      ...lexical,
+      matchedFields: [...new Set([...lexical.matchedFields, 'retrieval'])],
+      matchedTerms: [...new Set([...lexical.matchedTerms, ...retrieval.matchedTerms])],
+    };
+  }
+  const ordinal =
+    retrieval.matchScore >= 70
+      ? 'direct'
+      : retrieval.matchScore >= 45
+        ? 'partial'
+        : retrieval.matchScore >= 25
+          ? 'complementary'
+          : 'incidental';
+  const values = { direct: 100, partial: 75, complementary: 50, incidental: 25 } as const;
+  return {
+    ordinal,
+    value: values[ordinal],
+    matchedFields: retrieval.matchedConceptIds.length ? ['concept', 'retrieval'] : ['retrieval'],
+    matchedTerms: retrieval.matchedTerms,
+  };
+}
+
+async function loadRetrievalIndex(client: PoolClient): Promise<RetrievalIndex> {
+  const providers = await client.query<{
     providerId: string;
+    entityId: string;
+    entityClass: string;
     kind: string;
     name: string;
-    searchText: string;
     aliases: string[];
-    capabilities: string[];
-    valueConservative: number;
-  }>(
+    searchText: string;
+    identityKeys: string[];
+    concepts: RetrievalDocument['concepts'];
+    projectionId: string;
+    providerRevision: number;
+  }>(`
+    SELECT kp.provider_id AS "providerId", entity.id AS "entityId",
+           COALESCE(replace(class_concept.stable_key, 'entity-class:', ''), 'implementation')
+             AS "entityClass",
+           kp.kind_profile AS kind, kp.preferred_label AS name, kp.aliases,
+           concat_ws(' ', kp.search_text, kp.summary, identity_data.identities) AS "searchText",
+           COALESCE(identity_data.identity_keys, '{}') AS "identityKeys",
+           COALESCE(facets.concepts, '[]'::jsonb) AS concepts,
+           kp.id AS "projectionId", kp.provider_revision AS "providerRevision"
+    FROM catalog.knowledge_projections kp
+    JOIN catalog.knowledge_entities entity ON entity.provider_id = kp.provider_id
+    LEFT JOIN LATERAL (
+      SELECT revision.entity_class_concept_id
+      FROM catalog.knowledge_entity_revisions revision
+      WHERE revision.entity_id = entity.id
+      ORDER BY revision.revision DESC, revision.id DESC
+      LIMIT 1
+    ) latest_revision ON true
+    LEFT JOIN catalog.concepts class_concept
+      ON class_concept.id = latest_revision.entity_class_concept_id
+    LEFT JOIN LATERAL (
+      SELECT string_agg(identity.normalized_value, ' ' ORDER BY identity.normalized_value)
+               AS identities,
+             array_agg(identity.scheme || ':' || identity.normalized_value
+                       ORDER BY identity.scheme, identity.normalized_value) AS identity_keys
+      FROM catalog.provider_identities identity
+      WHERE identity.provider_id = kp.provider_id AND identity.valid_to IS NULL
+    ) identity_data ON true
+    LEFT JOIN LATERAL (
+      SELECT jsonb_agg(jsonb_build_object(
+               'conceptId', concept.id,
+               'stableKey', concept.stable_key,
+               'facetKey', concept.facet_key,
+               'label', concept.preferred_label
+             ) ORDER BY concept.facet_key, concept.stable_key, concept.id) AS concepts
+      FROM catalog.entity_facet_assignments assignment
+      JOIN catalog.concepts concept ON concept.id = assignment.concept_id
+      WHERE assignment.entity_id = entity.id AND assignment.valid_to IS NULL
+    ) facets ON true
+    WHERE kp.publication_state <> 'withdrawn'
+      AND (kp.expires_at IS NULL OR kp.expires_at > now())
+    ORDER BY kp.preferred_label, kp.provider_id
+  `);
+  const documents = await client.query<{
+    documentId: string;
+    entityId: string;
+    entityClass: string;
+    kind: string;
+    name: string;
+    aliases: string[];
+    searchText: string;
+    canonicalUri: string;
+    contentDigest: string;
+    concepts: RetrievalDocument['concepts'];
+  }>(`
+    SELECT document.id AS "documentId", entity.id AS "entityId",
+           COALESCE(replace(class_concept.stable_key, 'entity-class:', ''), 'document')
+             AS "entityClass",
+           document.document_kind AS kind, document.title AS name, document.aliases,
+           document.search_text AS "searchText", document.canonical_uri AS "canonicalUri",
+           document.content_digest AS "contentDigest",
+           COALESCE(facets.concepts, '[]'::jsonb) AS concepts
+    FROM catalog.knowledge_documents document
+    JOIN catalog.knowledge_entities entity ON entity.document_id = document.id
+    LEFT JOIN LATERAL (
+      SELECT revision.entity_class_concept_id
+      FROM catalog.knowledge_entity_revisions revision
+      WHERE revision.entity_id = entity.id
+      ORDER BY revision.revision DESC, revision.id DESC
+      LIMIT 1
+    ) latest_revision ON true
+    LEFT JOIN catalog.concepts class_concept
+      ON class_concept.id = latest_revision.entity_class_concept_id
+    LEFT JOIN LATERAL (
+      SELECT jsonb_agg(jsonb_build_object(
+               'conceptId', concept.id,
+               'stableKey', concept.stable_key,
+               'facetKey', concept.facet_key,
+               'label', concept.preferred_label
+             ) ORDER BY concept.facet_key, concept.stable_key, concept.id) AS concepts
+      FROM catalog.entity_facet_assignments assignment
+      JOIN catalog.concepts concept ON concept.id = assignment.concept_id
+      WHERE assignment.entity_id = entity.id AND assignment.valid_to IS NULL
+    ) facets ON true
+    WHERE document.publication_state <> 'withdrawn'
+    ORDER BY document.title, document.id
+  `);
+  const retrievalDocuments: RetrievalDocument[] = [
+    ...providers.rows.map((row) => ({
+      candidateKey: `implementation:${row.providerId}`,
+      subjectType: 'implementation' as const,
+      entityId: row.entityId,
+      entityClass: row.entityClass,
+      kind: row.kind,
+      name: row.name,
+      aliases: row.aliases,
+      searchText: row.searchText,
+      strongIdentityKeys: row.identityKeys,
+      concepts: row.concepts,
+    })),
+    ...documents.rows.map((row) => ({
+      candidateKey: `document:${row.documentId}`,
+      subjectType: 'document' as const,
+      entityId: row.entityId,
+      entityClass: row.entityClass,
+      kind: row.kind,
+      name: row.name,
+      aliases: row.aliases,
+      searchText: row.searchText,
+      strongIdentityKeys: [`uri:${row.canonicalUri}`, `digest:${row.contentDigest}`],
+      concepts: row.concepts,
+    })),
+  ];
+  return {
+    documents: retrievalDocuments,
+    projectionCount: providers.rowCount ?? providers.rows.length,
+    documentCount: documents.rowCount ?? documents.rows.length,
+    indexRevision: hashCanonical({
+      providers: providers.rows.map((row) => ({
+        id: row.projectionId,
+        revision: row.providerRevision,
+        concepts: row.concepts.map((concept) => concept.conceptId),
+      })),
+      documents: documents.rows.map((row) => ({
+        id: row.documentId,
+        digest: row.contentDigest,
+        concepts: row.concepts.map((concept) => concept.conceptId),
+      })),
+    }),
+  };
+}
+
+async function loadProjectionCandidates(
+  client: PoolClient,
+  selectedProviderIds: string[],
+): Promise<ProjectionRow[]> {
+  if (!selectedProviderIds.length) return [];
+  const result = await client.query<ProjectionRow>(
     `SELECT kp.id AS "projectionId", kp.provider_id AS "providerId",
-            kp.kind_profile AS kind, kp.preferred_label AS name,
-            concat_ws(' ', kp.search_text, identity_data.identities) AS "searchText",
-            kp.aliases, kp.capability_keys AS capabilities,
-            kp.query_value_conservative::float8 AS "valueConservative"
-     FROM catalog.knowledge_projections kp
-     LEFT JOIN (
-       SELECT pi.provider_id,
-              string_agg(pi.normalized_value, ' ' ORDER BY pi.normalized_value) AS identities
-       FROM catalog.provider_identities pi
-       WHERE pi.valid_to IS NULL
-       GROUP BY pi.provider_id
-     ) identity_data ON identity_data.provider_id = kp.provider_id
-     WHERE kp.publication_state <> 'withdrawn'
-       AND (kp.expires_at IS NULL OR kp.expires_at > now())
-       AND ($1::text IS NULL OR kp.kind_profile = $1)`,
-    [requestedKind ?? null],
-  );
-  const ranked = index.rows
-    .map((projection) => ({
-      ...projection,
-      relevance: assessRelevance(projection),
-    }))
-    .filter((projection) => projection.relevance.value > 0)
-    .filter((projection) => kindMatchesTarget(projection.kind, interpretation.typedTarget))
-    .sort(
-      (left, right) =>
-        right.relevance.value - left.relevance.value ||
-        right.valueConservative - left.valueConservative ||
-        left.name.localeCompare(right.name) ||
-        left.providerId.localeCompare(right.providerId),
-    );
-  const selectedIds = ranked.slice(0, 100).map((projection) => projection.projectionId);
-  const result = selectedIds.length
-    ? await client.query<ProjectionRow>(
-        `SELECT kp.id AS "projectionId", kp.provider_id AS "providerId",
                 kp.provider_revision AS "providerRevision", pdr.id AS "displayRevisionId",
                 kp.publication_state AS "publicationState", kp.kind_profile AS kind,
                 COALESCE((
@@ -227,7 +358,7 @@ async function loadProjectionCandidates(
                   LIMIT 1
                 ), 'implementation') AS "entityClass",
                 kp.preferred_label AS name, kp.summary,
-                concat_ws(' ', kp.search_text, identity_data.identities) AS "searchText",
+                concat_ws(' ', kp.search_text, kp.summary, identity_data.identities) AS "searchText",
                 kp.aliases, kp.capability_keys AS capabilities, kp.value_profile AS "valueProfile",
                 COALESCE((SELECT array_agg(dn.label ORDER BY dn.label)
                           FROM catalog.domain_memberships dm
@@ -246,37 +377,34 @@ async function loadProjectionCandidates(
            WHERE pi.valid_to IS NULL
            GROUP BY pi.provider_id
          ) identity_data ON identity_data.provider_id = kp.provider_id
-         WHERE kp.id = ANY($1::uuid[])
-         ORDER BY array_position($1::uuid[], kp.id)`,
-        [selectedIds],
-      )
-    : { rows: [] as ProjectionRow[] };
-  return {
-    rows: result.rows.map((row) => ({
-      ...row,
-      valueProfile: validateValueProfile(row.valueProfile),
-    })),
-    availableCount: ranked.length,
-    projectionCount,
-    indexRevision,
-  };
+         WHERE kp.provider_id = ANY($1::uuid[])
+         ORDER BY array_position($1::uuid[], kp.provider_id)`,
+    [selectedProviderIds],
+  );
+  return result.rows.map((row) => ({
+    ...row,
+    valueProfile: validateValueProfile(row.valueProfile),
+  }));
 }
 
 function materialize(
   projection: ProjectionRow,
   interpretation: QueryInterpretation,
+  retrieval: RerankedRetrievalCandidate,
 ): MaterializedResult | null {
   const requestedKind = interpretation.explicitFacets.find(
     (facet) => facet.key === 'candidate_kind',
   )?.value;
   if (requestedKind && projection.kind !== requestedKind) return null;
-  const relevance = lexicalRelevance(interpretation, {
-    name: projection.name,
-    aliases: projection.aliases,
-    capabilities: projection.capabilities,
-    searchText: projection.searchText,
-  });
-  if (relevance.value === 0) return null;
+  const relevance = retrievalRelevance(
+    lexicalRelevance(interpretation, {
+      name: projection.name,
+      aliases: projection.aliases,
+      capabilities: projection.capabilities,
+      searchText: projection.searchText,
+    }),
+    retrieval,
+  );
   const signal = calculateQuerySignalV2({
     relevanceOrdinal: relevance.ordinal,
     relevanceMethod: 'rule',
@@ -298,19 +426,18 @@ function materialize(
     projection,
     relevance,
     signal,
-    explanation: explanationFor(relevance, projection),
+    explanation: `${retrieval.reasons.join(' ')} ${explanationFor(relevance, projection)}`.trim(),
     caveats,
     capabilityGroup: capabilityGroup(projection, interpretation),
+    retrieval,
   };
 }
 
 async function loadDocumentCandidates(
   client: PoolClient,
-  interpretation: QueryInterpretation,
+  selectedDocumentIds: string[],
 ): Promise<DocumentRow[]> {
-  if (interpretation.typedTarget && !['article', 'standard'].includes(interpretation.typedTarget)) {
-    return [];
-  }
+  if (!selectedDocumentIds.length) return [];
   const result = await client.query<DocumentRow>(
     `SELECT kd.id AS "documentId", kd.publication_state AS "publicationState",
             kd.document_kind AS kind, 'document'::text AS "entityClass",
@@ -319,32 +446,30 @@ async function loadDocumentCandidates(
             kd.publisher, kd.canonical_uri AS "canonicalUri", kd.value_profile AS "valueProfile"
      FROM catalog.knowledge_documents kd
      WHERE kd.publication_state <> 'withdrawn'
-     ORDER BY kd.title, kd.id`,
+       AND kd.id = ANY($1::uuid[])
+     ORDER BY array_position($1::uuid[], kd.id)`,
+    [selectedDocumentIds],
   );
-  return result.rows
-    .map((row) => ({ ...row, valueProfile: validateValueProfile(row.valueProfile) }))
-    .filter((row) => {
-      if (interpretation.typedTarget === 'article') {
-        return ['article', 'research', 'resource'].includes(row.kind);
-      }
-      if (interpretation.typedTarget === 'standard') {
-        return ['standard', 'specification'].includes(row.kind);
-      }
-      return true;
-    });
+  return result.rows.map((row) => ({
+    ...row,
+    valueProfile: validateValueProfile(row.valueProfile),
+  }));
 }
 
 function materializeDocument(
   document: DocumentRow,
   interpretation: QueryInterpretation,
+  retrieval: RerankedRetrievalCandidate,
 ): MaterializedDocument | null {
-  const relevance = lexicalRelevance(interpretation, {
-    name: document.name,
-    aliases: document.aliases,
-    capabilities: document.mechanisms,
-    searchText: document.searchText,
-  });
-  if (relevance.value === 0) return null;
+  const relevance = retrievalRelevance(
+    lexicalRelevance(interpretation, {
+      name: document.name,
+      aliases: document.aliases,
+      capabilities: document.mechanisms,
+      searchText: document.searchText,
+    }),
+    retrieval,
+  );
   const signal = calculateQuerySignalV2({
     relevanceOrdinal: relevance.ordinal,
     relevanceMethod: 'rule',
@@ -356,10 +481,11 @@ function materializeDocument(
     document,
     relevance,
     signal,
-    explanation:
+    explanation: `${retrieval.reasons.join(' ')} ${
       relevance.ordinal === 'direct'
         ? `Direct document match through ${relevance.matchedFields.join(' and ')}.`
-        : `This ${document.kind} explains or evaluates a related mechanism.`,
+        : `This ${document.kind} explains or evaluates a related mechanism.`
+    }`.trim(),
     caveats: [
       ...(document.publicationState !== 'reviewed'
         ? ['Document subject mapping is proposed and does not establish independent usefulness.']
@@ -367,6 +493,7 @@ function materializeDocument(
       ...signal.dimensions.flatMap((dimension) => dimension.missing),
     ].slice(0, 3),
     capabilityGroup: document.mechanisms[0]?.replaceAll('-', ' ') ?? 'Research and learning',
+    retrieval,
   };
 }
 
@@ -374,116 +501,168 @@ type RankedMaterial =
   | { subjectType: 'implementation'; item: MaterializedResult }
   | { subjectType: 'document'; item: MaterializedDocument };
 
-function explicitSpecificity(
-  candidates: RankedMaterial[],
-  interpretation: QueryInterpretation,
-): Map<RankedMaterial, number> {
-  const explicitTerms = interpretation.terms.filter(
-    (term) => term !== 'ai' || interpretation.terms.length === 1,
-  );
-  const documentFrequency = new Map(
-    explicitTerms.map((term) => [
-      term,
-      candidates.filter((candidate) => candidate.item.relevance.matchedTerms.includes(term)).length,
-    ]),
-  );
-  return new Map(
-    candidates.map((candidate) => [
-      candidate,
-      explicitTerms
-        .filter((term) => candidate.item.relevance.matchedTerms.includes(term))
-        .reduce(
-          (sum, term) =>
-            sum + Math.log((candidates.length + 1) / ((documentFrequency.get(term) ?? 0) + 1)),
-          0,
-        ),
-    ]),
-  );
-}
-
-function rankMaterial(
-  providers: MaterializedResult[],
-  documents: MaterializedDocument[],
-  interpretation: QueryInterpretation,
-): RankedMaterial[] {
-  const candidates: RankedMaterial[] = [
-    ...providers.map((item): RankedMaterial => ({ subjectType: 'implementation', item })),
-    ...documents.map((item): RankedMaterial => ({ subjectType: 'document', item })),
-  ];
-  const specificity = explicitSpecificity(candidates, interpretation);
-  const ranked = candidates.sort((left, right) => {
-    const leftName =
-      left.subjectType === 'implementation' ? left.item.projection.name : left.item.document.name;
-    const rightName =
-      right.subjectType === 'implementation'
-        ? right.item.projection.name
-        : right.item.document.name;
-    return (
-      right.item.relevance.value - left.item.relevance.value ||
-      (specificity.get(right) ?? 0) - (specificity.get(left) ?? 0) ||
-      right.item.signal.signalUnrounded - left.item.signal.signalUnrounded ||
-      leftName.localeCompare(rightName)
-    );
-  });
-  if (interpretation.intentMode !== 'broad_landscape') return ranked;
-  const result: RankedMaterial[] = [];
-  for (const relevanceValue of [100, 75, 50, 25]) {
-    const tier = ranked.filter((candidate) => candidate.item.relevance.value === relevanceValue);
-    const deferred: RankedMaterial[] = [];
-    const kindCounts = new Map<string, number>();
-    const groupCounts = new Map<string, number>();
-    for (const candidate of tier) {
-      const kind =
-        candidate.subjectType === 'implementation'
-          ? candidate.item.projection.kind
-          : candidate.item.document.kind;
-      const group = candidate.item.capabilityGroup;
-      const kindLimit = 3;
-      const groupLimit = 2;
-      const fits =
-        (kindCounts.get(kind) ?? 0) < kindLimit && (groupCounts.get(group) ?? 0) < groupLimit;
-      if (!fits) {
-        deferred.push(candidate);
-        continue;
-      }
-      result.push(candidate);
-      kindCounts.set(kind, (kindCounts.get(kind) ?? 0) + 1);
-      groupCounts.set(group, (groupCounts.get(group) ?? 0) + 1);
-    }
-    result.push(...deferred);
-  }
-  return result;
-}
-
 interface PreparedSnapshot {
   bounded: MaterializedResult[];
   documents: MaterializedDocument[];
   ranked: RankedMaterial[];
   availableCount: number;
   projectionCount: number;
+  indexedDocumentCount: number;
   indexRevision: string;
+  candidatePoolHash: string;
   resultHash: string;
+  fusionPolicy: RetrievalFusionPolicy;
+  rankings: RetrievalRanking[];
+  rrf: FusedRetrievalCandidate[];
+  weighted: FusedRetrievalCandidate[];
+  rrfReranked: RerankedRetrievalCandidate[];
+  weightedReranked: RerankedRetrievalCandidate[];
+  selected: RerankedRetrievalCandidate[];
+  duplicateResolutions: DuplicateResolution[];
+  retrievalDocuments: RetrievalDocument[];
+  firstPassCoverage: ResearchCoverageAssessment;
+  finalCoverage: ResearchCoverageAssessment;
+  retrievalPasses: 1 | 2;
+}
+
+function retrievalStopReason(prepared: PreparedSnapshot): string {
+  if (prepared.retrievalPasses === 2) {
+    return prepared.finalCoverage.needsSecondPass
+      ? 'second_pass_exhausted'
+      : 'second_pass_complete';
+  }
+  return prepared.finalCoverage.needsSecondPass
+    ? 'external_sources_disabled_after_local_pass'
+    : 'sufficient_local_coverage';
+}
+
+function compatibleRetrievalDocument(
+  document: RetrievalDocument,
+  interpretation: QueryInterpretation,
+): boolean {
+  const requestedKind = interpretation.explicitFacets.find(
+    (facet) => facet.key === 'candidate_kind',
+  )?.value;
+  if (requestedKind && document.kind !== requestedKind) return false;
+  if (document.subjectType === 'document') {
+    if (!interpretation.typedTarget) return true;
+    if (interpretation.typedTarget === 'article') {
+      return ['article', 'research', 'resource'].includes(document.kind);
+    }
+    if (interpretation.typedTarget === 'standard') {
+      return ['standard', 'specification'].includes(document.kind);
+    }
+    return false;
+  }
+  return kindMatchesTarget(document.kind, interpretation.typedTarget);
+}
+
+function summaryForCoverage(document: RetrievalDocument): {
+  entityClass: string;
+  group: string | null;
+} {
+  const group =
+    document.concepts.find((concept) => concept.facetKey === 'domain')?.label ??
+    document.concepts.find((concept) => concept.facetKey === 'capability')?.label ??
+    null;
+  return { entityClass: document.entityClass, group };
+}
+
+function keepSupportedOpenWorldMatch(
+  candidate: RerankedRetrievalCandidate,
+  interpretation: QueryInterpretation,
+): boolean {
+  return (
+    interpretation.coverageState !== 'outside_maintained_coverage' || candidate.matchScore >= 8
+  );
 }
 
 async function prepareSnapshot(
   client: PoolClient,
   interpretation: QueryInterpretation,
+  fusionPolicy: RetrievalFusionPolicy = defaultFusionPolicy,
 ): Promise<PreparedSnapshot> {
-  const loaded = await loadProjectionCandidates(client, interpretation);
-  const providers = loaded.rows
-    .map((projection) => materialize(projection, interpretation))
-    .filter((item): item is MaterializedResult => item !== null)
-    .sort(
-      (left, right) =>
-        right.relevance.value - left.relevance.value ||
-        right.signal.signalUnrounded - left.signal.signalUnrounded ||
-        left.projection.name.localeCompare(right.projection.name) ||
-        left.projection.providerId.localeCompare(right.projection.providerId),
-    );
-  const documents = (await loadDocumentCandidates(client, interpretation))
-    .map((document) => materializeDocument(document, interpretation))
-    .filter((item): item is MaterializedDocument => item !== null);
-  const ranked = rankMaterial(providers, documents, interpretation).slice(0, 100);
+  const index = await loadRetrievalIndex(client);
+  const compatible = index.documents.filter((document) =>
+    compatibleRetrievalDocument(document, interpretation),
+  );
+  const resolved = resolveRetrievalDuplicates(compatible);
+  const firstPass = retrieveFirstPass(resolved.documents, interpretation);
+  const firstFused = fuseRetrievalRankings(firstPass.rankings, fusionPolicy);
+  const firstReranked = diversifyBroadRetrieval(
+    structuredRerank(firstFused, resolved.documents, interpretation),
+    resolved.documents,
+    interpretation,
+  ).filter((candidate) => keepSupportedOpenWorldMatch(candidate, interpretation));
+  const byCandidate = new Map(
+    resolved.documents.map((document) => [document.candidateKey, document]),
+  );
+  const firstPassCoverage = assessResearchCoverage(
+    interpretation,
+    firstReranked
+      .slice(0, 100)
+      .map((candidate) => byCandidate.get(candidate.candidateKey))
+      .filter((document): document is RetrievalDocument => Boolean(document))
+      .map(summaryForCoverage),
+  );
+  const secondPass = firstPassCoverage.needsSecondPass
+    ? retrieveSecondPass(resolved.documents, interpretation, firstPass)
+    : { rankings: [], hits: [] };
+  const rankings = [...firstPass.rankings, ...secondPass.rankings];
+  const rrf = fuseRetrievalRankings(rankings, 'reciprocal-rank-fusion-v1');
+  const weighted = fuseRetrievalRankings(rankings, 'normalized-weighted-fusion-v1');
+  const rrfReranked = diversifyBroadRetrieval(
+    structuredRerank(rrf, resolved.documents, interpretation),
+    resolved.documents,
+    interpretation,
+  );
+  const weightedReranked = diversifyBroadRetrieval(
+    structuredRerank(weighted, resolved.documents, interpretation),
+    resolved.documents,
+    interpretation,
+  );
+  const selected = (fusionPolicy === 'reciprocal-rank-fusion-v1' ? rrfReranked : weightedReranked)
+    .filter((candidate) => keepSupportedOpenWorldMatch(candidate, interpretation))
+    .slice(0, 200);
+  const finalCoverage = assessResearchCoverage(
+    interpretation,
+    selected
+      .slice(0, 100)
+      .map((candidate) => byCandidate.get(candidate.candidateKey))
+      .filter((document): document is RetrievalDocument => Boolean(document))
+      .map(summaryForCoverage),
+  );
+  const selectedTop = selected.slice(0, 100);
+  const providerIds = selectedTop.flatMap((candidate) => {
+    const document = byCandidate.get(candidate.candidateKey);
+    return document?.subjectType === 'implementation'
+      ? [candidate.candidateKey.replace(/^implementation:/, '')]
+      : [];
+  });
+  const documentIds = selectedTop.flatMap((candidate) => {
+    const document = byCandidate.get(candidate.candidateKey);
+    return document?.subjectType === 'document'
+      ? [candidate.candidateKey.replace(/^document:/, '')]
+      : [];
+  });
+  const providerRows = await loadProjectionCandidates(client, providerIds);
+  const documentRows = await loadDocumentCandidates(client, documentIds);
+  const providerById = new Map(providerRows.map((row) => [row.providerId, row]));
+  const documentById = new Map(documentRows.map((row) => [row.documentId, row]));
+  const ranked = selectedTop.flatMap((retrieval): RankedMaterial[] => {
+    const document = byCandidate.get(retrieval.candidateKey);
+    if (!document) return [];
+    if (document.subjectType === 'implementation') {
+      const providerId = retrieval.candidateKey.replace(/^implementation:/, '');
+      const projection = providerById.get(providerId);
+      const item = projection ? materialize(projection, interpretation, retrieval) : null;
+      return item ? [{ subjectType: 'implementation', item }] : [];
+    }
+    const documentId = retrieval.candidateKey.replace(/^document:/, '');
+    const row = documentById.get(documentId);
+    const item = row ? materializeDocument(row, interpretation, retrieval) : null;
+    return item ? [{ subjectType: 'document', item }] : [];
+  });
   const bounded = ranked
     .filter(
       (candidate): candidate is { subjectType: 'implementation'; item: MaterializedResult } =>
@@ -496,8 +675,14 @@ async function prepareSnapshot(
         candidate.subjectType === 'document',
     )
     .map((candidate) => candidate.item);
-  const resultHash = hashCanonical(
-    ranked.map((candidate) =>
+  const candidatePoolKeys = [
+    ...new Set(rankings.flatMap((ranking) => ranking.hits.map((hit) => hit.candidateKey))),
+  ].sort();
+  const candidatePoolHash = hashCanonical(candidatePoolKeys);
+  const resultHash = hashCanonical({
+    fusionPolicy,
+    candidatePoolHash,
+    results: ranked.map((candidate) =>
       candidate.subjectType === 'implementation'
         ? {
             subjectType: candidate.subjectType,
@@ -513,23 +698,236 @@ async function prepareSnapshot(
             relevance: candidate.item.relevance.ordinal,
           },
     ),
-  );
+  });
   return {
     bounded,
     documents: boundedDocuments,
     ranked,
-    availableCount: loaded.availableCount + documents.length,
-    projectionCount: loaded.projectionCount,
-    indexRevision: hashCanonical({
-      providers: loaded.indexRevision,
-      documents: boundedDocuments.map((item) => ({
-        id: item.document.documentId,
-        state: item.document.publicationState,
-        searchText: item.document.searchText,
-      })),
-    }),
+    availableCount: selected.length,
+    projectionCount: index.projectionCount,
+    indexedDocumentCount: index.documentCount,
+    indexRevision: index.indexRevision,
+    candidatePoolHash,
     resultHash,
+    fusionPolicy,
+    rankings,
+    rrf,
+    weighted,
+    rrfReranked,
+    weightedReranked,
+    selected,
+    duplicateResolutions: resolved.resolutions,
+    retrievalDocuments: resolved.documents,
+    firstPassCoverage,
+    finalCoverage,
+    retrievalPasses: firstPassCoverage.needsSecondPass ? 2 : 1,
   };
+}
+
+function candidateSubjectIds(candidateKey: string): {
+  providerId: string | null;
+  documentId: string | null;
+} {
+  if (candidateKey.startsWith('implementation:')) {
+    return { providerId: candidateKey.replace(/^implementation:/, ''), documentId: null };
+  }
+  if (candidateKey.startsWith('document:')) {
+    return { providerId: null, documentId: candidateKey.replace(/^document:/, '') };
+  }
+  throw new Error(`Unsupported retrieval candidate key: ${candidateKey}`);
+}
+
+async function insertRetrievalLineage(
+  client: PoolClient,
+  resultSetId: string,
+  input: {
+    workspaceId: string;
+    query: string;
+    createdAt: Date;
+    prepared: PreparedSnapshot;
+  },
+): Promise<void> {
+  const runRows = input.prepared.rankings.map((ranking) => ({
+    id: newOpaqueId(),
+    workspace_id: input.workspaceId,
+    result_set_id: resultSetId,
+    pass_index: ranking.passIndex,
+    retriever_key: ranking.retrieverKey,
+    retriever_version: 1,
+    source_class: ranking.retrieverKey.startsWith('concept') ? 'concept_graph' : 'local_corpus',
+    source_identity: 'postgresql_catalog',
+    plan_route_id: null,
+    outbound_query: input.query.trim(),
+    native_result_count: ranking.hits.length,
+    returned_count: ranking.hits.length,
+    response_limitations:
+      'Local indexed metadata only; absence is not evidence that no relevant external candidate exists.',
+    rights_retention_notes:
+      'Workspace query lineage is private; referenced catalog identities remain public catalog data.',
+    started_at: input.createdAt.toISOString(),
+    completed_at: input.createdAt.toISOString(),
+  }));
+  if (runRows.length) {
+    await client.query(
+      `INSERT INTO workspace.query_retrieval_runs
+         (id, workspace_id, result_set_id, pass_index, retriever_key, retriever_version,
+          source_class, source_identity, plan_route_id, outbound_query, native_result_count,
+          returned_count, response_limitations, rights_retention_notes, started_at, completed_at)
+       SELECT record.id, record.workspace_id, record.result_set_id, record.pass_index,
+              record.retriever_key, record.retriever_version, record.source_class,
+              record.source_identity, record.plan_route_id, record.outbound_query,
+              record.native_result_count, record.returned_count, record.response_limitations,
+              record.rights_retention_notes, record.started_at, record.completed_at
+       FROM jsonb_to_recordset($1::jsonb) AS record(
+         id uuid, workspace_id uuid, result_set_id uuid, pass_index integer,
+         retriever_key text, retriever_version integer, source_class text,
+         source_identity text, plan_route_id text, outbound_query text,
+         native_result_count integer, returned_count integer, response_limitations text,
+         rights_retention_notes text, started_at timestamptz, completed_at timestamptz
+       )`,
+      [json(runRows)],
+    );
+    const runIdByKey = new Map(
+      runRows.map((row) => [`${row.pass_index}:${row.retriever_key}`, row.id]),
+    );
+    const hitRows = input.prepared.rankings.flatMap((ranking) =>
+      ranking.hits.map((hit) => ({
+        id: newOpaqueId(),
+        workspace_id: input.workspaceId,
+        retrieval_run_id: runIdByKey.get(`${ranking.passIndex}:${ranking.retrieverKey}`)!,
+        candidate_key: hit.candidateKey,
+        ...candidateSubjectIds(hit.candidateKey),
+        native_rank: hit.nativeRank,
+        native_score: hit.nativeScore,
+        matched_terms: hit.matchedTerms,
+        matched_concept_ids: hit.matchedConceptIds,
+        explanation: hit.reason,
+      })),
+    );
+    if (hitRows.length) {
+      await client.query(
+        `INSERT INTO workspace.query_retrieval_hits
+           (id, workspace_id, retrieval_run_id, candidate_key, provider_id, document_id,
+            native_rank, native_score, matched_terms, matched_concept_ids, explanation)
+         SELECT record.id, record.workspace_id, record.retrieval_run_id, record.candidate_key,
+                record."providerId", record."documentId", record.native_rank,
+                record.native_score,
+                ARRAY(SELECT jsonb_array_elements_text(record.matched_terms)),
+                ARRAY(SELECT jsonb_array_elements_text(record.matched_concept_ids))::uuid[],
+                record.explanation
+         FROM jsonb_to_recordset($1::jsonb) AS record(
+           id uuid, workspace_id uuid, retrieval_run_id uuid, candidate_key text,
+           "providerId" uuid, "documentId" uuid, native_rank integer, native_score numeric,
+           matched_terms jsonb, matched_concept_ids jsonb, explanation text
+         )`,
+        [json(hitRows)],
+      );
+    }
+  }
+
+  const rrfByKey = new Map(
+    input.prepared.rrf.map((candidate) => [candidate.candidateKey, candidate]),
+  );
+  const weightedByKey = new Map(
+    input.prepared.weighted.map((candidate) => [candidate.candidateKey, candidate]),
+  );
+  const rrfRerankedByKey = new Map(
+    input.prepared.rrfReranked.map((candidate) => [candidate.candidateKey, candidate]),
+  );
+  const weightedRerankedByKey = new Map(
+    input.prepared.weightedReranked.map((candidate) => [candidate.candidateKey, candidate]),
+  );
+  const resolutionByKey = new Map(
+    input.prepared.duplicateResolutions.map((resolution) => [resolution.candidateKey, resolution]),
+  );
+  const poolPosition = new Map(
+    [
+      ...new Set(
+        input.prepared.rankings.flatMap((ranking) => ranking.hits.map((hit) => hit.candidateKey)),
+      ),
+    ]
+      .sort()
+      .map((candidateKey, index) => [candidateKey, index + 1]),
+  );
+  const fusionRows = input.prepared.selected.map((candidate) => {
+    const rrf = rrfByKey.get(candidate.candidateKey)!;
+    const weighted = weightedByKey.get(candidate.candidateKey)!;
+    const rrfReranked = rrfRerankedByKey.get(candidate.candidateKey)!;
+    const weightedReranked = weightedRerankedByKey.get(candidate.candidateKey)!;
+    const selectedFusion =
+      input.prepared.fusionPolicy === 'reciprocal-rank-fusion-v1' ? rrf : weighted;
+    return {
+      id: newOpaqueId(),
+      workspace_id: input.workspaceId,
+      result_set_id: resultSetId,
+      candidate_key: candidate.candidateKey,
+      ...candidateSubjectIds(candidate.candidateKey),
+      candidate_pool_position: poolPosition.get(candidate.candidateKey)!,
+      reciprocal_rank: rrf.fusedRank,
+      reciprocal_score: rrf.fusedScore,
+      reciprocal_contributions: rrf.contributions,
+      reciprocal_rerank_position: rrfReranked.rerankPosition,
+      reciprocal_rerank_score: rrfReranked.rerankScore,
+      normalized_weighted_rank: weighted.fusedRank,
+      normalized_weighted_score: weighted.fusedScore,
+      normalized_weighted_contributions: weighted.contributions,
+      normalized_weighted_rerank_position: weightedReranked.rerankPosition,
+      normalized_weighted_rerank_score: weightedReranked.rerankScore,
+      selected_fusion_policy: input.prepared.fusionPolicy,
+      selected_fusion_rank: selectedFusion.fusedRank,
+      rerank_policy: candidate.rerankPolicy,
+      rerank_position: candidate.rerankPosition,
+      rerank_score: candidate.rerankScore,
+      match_score: candidate.matchScore,
+      matched_terms: candidate.matchedTerms,
+      matched_concept_ids: candidate.matchedConceptIds,
+      entity_resolution: resolutionByKey.get(candidate.candidateKey) ?? {
+        candidateKey: candidate.candidateKey,
+        canonicalCandidateKey: candidate.candidateKey,
+        method: 'distinct',
+        matchedIdentityKeys: [],
+      },
+      explanation: candidate.reasons.join(' ') || 'Retrieved by one bounded local ranking.',
+    };
+  });
+  if (!fusionRows.length) return;
+  await client.query(
+    `INSERT INTO workspace.query_candidate_fusions
+       (id, workspace_id, result_set_id, candidate_key, provider_id, document_id,
+        candidate_pool_position, reciprocal_rank, reciprocal_score, reciprocal_contributions,
+        reciprocal_rerank_position, reciprocal_rerank_score, normalized_weighted_rank,
+        normalized_weighted_score, normalized_weighted_contributions,
+        normalized_weighted_rerank_position, normalized_weighted_rerank_score,
+        selected_fusion_policy, selected_fusion_rank, rerank_policy, rerank_position,
+        rerank_score, match_score, matched_terms, matched_concept_ids, entity_resolution,
+        explanation)
+     SELECT record.id, record.workspace_id, record.result_set_id, record.candidate_key,
+            record."providerId", record."documentId", record.candidate_pool_position,
+            record.reciprocal_rank, record.reciprocal_score, record.reciprocal_contributions,
+            record.reciprocal_rerank_position, record.reciprocal_rerank_score,
+            record.normalized_weighted_rank, record.normalized_weighted_score,
+            record.normalized_weighted_contributions,
+            record.normalized_weighted_rerank_position,
+            record.normalized_weighted_rerank_score, record.selected_fusion_policy,
+            record.selected_fusion_rank, record.rerank_policy, record.rerank_position,
+            record.rerank_score, record.match_score,
+            ARRAY(SELECT jsonb_array_elements_text(record.matched_terms)),
+            ARRAY(SELECT jsonb_array_elements_text(record.matched_concept_ids))::uuid[],
+            record.entity_resolution, record.explanation
+     FROM jsonb_to_recordset($1::jsonb) AS record(
+       id uuid, workspace_id uuid, result_set_id uuid, candidate_key text,
+       "providerId" uuid, "documentId" uuid, candidate_pool_position integer,
+       reciprocal_rank integer, reciprocal_score numeric, reciprocal_contributions jsonb,
+       reciprocal_rerank_position integer, reciprocal_rerank_score numeric,
+       normalized_weighted_rank integer, normalized_weighted_score numeric,
+       normalized_weighted_contributions jsonb, normalized_weighted_rerank_position integer,
+       normalized_weighted_rerank_score numeric, selected_fusion_policy text,
+       selected_fusion_rank integer, rerank_policy text, rerank_position integer,
+       rerank_score numeric, match_score integer, matched_terms jsonb,
+       matched_concept_ids jsonb, entity_resolution jsonb, explanation text
+     )`,
+    [json(fusionRows)],
+  );
 }
 
 async function insertResultSetRevision(
@@ -548,15 +946,26 @@ async function insertResultSetRevision(
   },
 ): Promise<string> {
   const resultSetId = newOpaqueId();
-  const { bounded, documents, ranked, availableCount, indexRevision, projectionCount, resultHash } =
-    input.prepared;
+  const {
+    bounded,
+    documents,
+    ranked,
+    availableCount,
+    indexRevision,
+    projectionCount,
+    indexedDocumentCount,
+    resultHash,
+  } = input.prepared;
   await client.query(
     `INSERT INTO workspace.query_result_sets
        (id, workspace_id, query_session_id, revision, predecessor_id, status,
         retrieval_policy_version, signal_policy_version, index_revision, assessed_count,
-        available_count, truncated_count, diagnostics, result_hash, created_at, expires_at)
+        available_count, truncated_count, diagnostics, fusion_policy_version,
+        rerank_policy_version, candidate_pool_hash, retrieval_passes, stop_reason,
+        coverage_assessment, result_hash, created_at, expires_at)
      VALUES ($1, $2, $3, $4, $5, 'complete', $6, $7, $8, $9, $10, $11,
-             $12, $13, $14, $15)`,
+             $12, $13, 'structured-rerank-v1', $14, $15, $16, $17, $18,
+             $19, $20)`,
     [
       resultSetId,
       input.workspaceId,
@@ -572,18 +981,25 @@ async function insertResultSetRevision(
       json({
         coverageState: input.interpretation.coverageState,
         indexedProjectionCount: projectionCount,
-        indexedDocumentCount: documents.length,
+        indexedDocumentCount,
         intentMode: input.interpretation.intentMode,
         landscapeFacets: input.interpretation.landscapeFacets,
+        firstPassCoverage: input.prepared.firstPassCoverage,
         externalDiscoveryAttempted: false,
         projectFitState: input.projectContextId ? 'unknown_blocked' : 'not_applicable',
         projectContextAffectsSignal: false,
       }),
+      input.prepared.fusionPolicy,
+      input.prepared.candidatePoolHash,
+      input.prepared.retrievalPasses,
+      retrievalStopReason(input.prepared),
+      json(input.prepared.finalCoverage),
       resultHash,
       input.createdAt,
       input.retentionUntil,
     ],
   );
+  await insertRetrievalLineage(client, resultSetId, input);
   const policy = await client.query<{ id: string }>(
     `SELECT id FROM catalog.score_policies WHERE version = $1 AND policy_key = 'query-signal'`,
     [querySignalPolicyV2.version],
@@ -621,6 +1037,14 @@ async function insertResultSetRevision(
         relevance_anchors: {
           projectionId: item.projection.projectionId,
           matchedFields: item.relevance.matchedFields,
+          retrieval: {
+            fusionPolicy: item.retrieval.fusionPolicy,
+            fusedRank: item.retrieval.fusedRank,
+            rerankPolicy: item.retrieval.rerankPolicy,
+            rerankPosition: item.retrieval.rerankPosition,
+            matchScore: item.retrieval.matchScore,
+            matchedConceptIds: item.retrieval.matchedConceptIds,
+          },
         },
         value_inputs: item.signal.dimensions,
         value_central: item.signal.valueCentral,
@@ -743,6 +1167,14 @@ async function insertResultSetRevision(
         matchedTerms: item.relevance.matchedTerms,
         publisher: item.document.publisher,
         canonicalUri: item.document.canonicalUri,
+        retrieval: {
+          fusionPolicy: item.retrieval.fusionPolicy,
+          fusedRank: item.retrieval.fusedRank,
+          rerankPolicy: item.retrieval.rerankPolicy,
+          rerankPosition: item.retrieval.rerankPosition,
+          matchScore: item.retrieval.matchScore,
+          matchedConceptIds: item.retrieval.matchedConceptIds,
+        },
       },
       matched_fields: item.relevance.matchedFields,
       signal_policy_version: item.signal.policyVersion,
@@ -801,6 +1233,7 @@ export async function createExplorerSession(
   pool: Pool,
   workspaceId: string,
   input: ExplorerQueryBody,
+  options: { fusionPolicy?: RetrievalFusionPolicy } = {},
 ): Promise<unknown> {
   return inTransaction(pool, async (client) => {
     if (input.projectContextId) {
@@ -818,37 +1251,32 @@ export async function createExplorerSession(
       input.explicitFacets ?? {},
       knowledge,
     );
-    const prepared = await prepareSnapshot(client, initialInterpretation);
+    const prepared = await prepareSnapshot(
+      client,
+      initialInterpretation,
+      options.fusionPolicy ?? defaultFusionPolicy,
+    );
+    const forcedPartial =
+      initialInterpretation.missingContext.some((facet) => facet.key === 'independent_evidence') ||
+      (initialInterpretation.terms.length <= 2 &&
+        initialInterpretation.inferredFacets.some((facet) => facet.key === 'integration_target'));
+    const supportedOpenWorldTerms = new Set(
+      prepared.selected.slice(0, 20).flatMap((candidate) => candidate.matchedTerms),
+    );
+    const openWorldEvidenceSupported = supportedOpenWorldTerms.size >= 2;
     const interpretation: QueryInterpretation = {
       ...initialInterpretation,
-      coverageState:
-        initialInterpretation.missingContext.some(
-          (facet) => facet.key === 'independent_evidence',
-        ) ||
-        (initialInterpretation.terms.length <= 2 &&
-          initialInterpretation.inferredFacets.some((facet) => facet.key === 'integration_target'))
-          ? 'partial'
-          : prepared.ranked.length
-            ? 'maintained'
-            : initialInterpretation.coverageState,
+      coverageState: forcedPartial
+        ? 'partial'
+        : initialInterpretation.coverageState === 'maintained' || openWorldEvidenceSupported
+          ? 'maintained'
+          : initialInterpretation.coverageState,
     };
-    const coverageAssessment = assessResearchCoverage(
-      interpretation,
-      prepared.ranked.map((candidate) =>
-        candidate.subjectType === 'implementation'
-          ? {
-              entityClass: candidate.item.projection.entityClass,
-              group: candidate.item.capabilityGroup,
-            }
-          : {
-              entityClass: candidate.item.document.entityClass,
-              group: candidate.item.capabilityGroup,
-            },
-      ),
-    );
+    const coverageAssessment = prepared.finalCoverage;
     const plan = buildDiscoveryPlan(input.query, interpretation, {
       coverageAssessment,
       externalSourcesEnabled: input.searchConnectedSources ?? false,
+      secondPassExecuted: prepared.retrievalPasses === 2,
     });
     const sessionId = newOpaqueId();
     const createdAt = new Date();
@@ -892,7 +1320,7 @@ export async function createExplorerSession(
         json(plan.stopPolicy),
         plan.stopReason,
         json(plan.coverageAssessment ?? {}),
-        plan.secondPass.state === 'planned' ? 2 : 1,
+        prepared.retrievalPasses,
         createdAt,
       ],
     );
@@ -919,6 +1347,21 @@ export async function createExplorerSession(
         assessed: prepared.ranked.length,
         available: prepared.availableCount,
         truncated: Math.max(0, prepared.availableCount - prepared.ranked.length),
+      },
+      retrieval: {
+        policyVersion: retrievalPolicyVersion,
+        candidatePoolHash: prepared.candidatePoolHash,
+        fusionPolicy: prepared.fusionPolicy,
+        rerankPolicy: 'structured-rerank-v1',
+        passes: prepared.retrievalPasses,
+        stopReason: retrievalStopReason(prepared),
+        firstPassCoverage: prepared.firstPassCoverage,
+        finalCoverage: prepared.finalCoverage,
+        retrievers: prepared.rankings.map((ranking) => ({
+          key: ranking.retrieverKey,
+          passIndex: ranking.passIndex,
+          returned: ranking.hits.length,
+        })),
       },
       retentionUntil: retentionUntil.toISOString(),
       externalDiscovery: { attempted: false, state: 'disabled_by_default' },
@@ -959,8 +1402,10 @@ export async function refreshExplorerSession(
       revision: number;
       indexRevision: string;
       resultHash: string;
+      fusionPolicy: RetrievalFusionPolicy | null;
     }>(
-      `SELECT id, revision, index_revision AS "indexRevision", result_hash AS "resultHash"
+      `SELECT id, revision, index_revision AS "indexRevision", result_hash AS "resultHash",
+              fusion_policy_version AS "fusionPolicy"
        FROM workspace.query_result_sets
        WHERE query_session_id = $1 AND workspace_id = $2
        ORDER BY revision DESC LIMIT 1`,
@@ -969,7 +1414,11 @@ export async function refreshExplorerSession(
     if (!current.rowCount) throw new NotFoundError('Query result set not found.');
     const row = session.rows[0]!;
     const previous = current.rows[0]!;
-    const prepared = await prepareSnapshot(client, row.interpretation);
+    const prepared = await prepareSnapshot(
+      client,
+      row.interpretation,
+      previous.fusionPolicy ?? defaultFusionPolicy,
+    );
     if (
       previous.indexRevision === prepared.indexRevision &&
       previous.resultHash === prepared.resultHash
@@ -1086,6 +1535,11 @@ async function resultRows(
             qrs.available_count AS "availableCount", qrs.truncated_count AS "truncatedCount",
             qrs.retrieval_policy_version AS "retrievalPolicyVersion",
             qrs.signal_policy_version AS "signalPolicyVersion", qrs.index_revision AS "indexRevision",
+            qrs.fusion_policy_version AS "fusionPolicyVersion",
+            qrs.rerank_policy_version AS "rerankPolicyVersion",
+            qrs.candidate_pool_hash AS "candidatePoolHash",
+            qrs.retrieval_passes AS "retrievalPasses", qrs.stop_reason AS "stopReason",
+            qrs.coverage_assessment AS "coverageAssessment",
             qrs.created_at AS "createdAt", qrs.expires_at AS "expiresAt", qrs.diagnostics,
             qs.id AS "querySessionId", qs.query_text AS query,
             qs.normalized_intent AS interpretation, qs.project_context_id AS "projectContextId",
@@ -1121,12 +1575,20 @@ async function resultRows(
             qsr.value_conservative::float8 AS "valueConservative",
             qsr.evidence_coverage::float8 AS "evidenceCoverage",
             qsr.signal_unrounded::float8 AS "signalUnrounded", qsr.signal_display AS "signalDisplay",
-            qsr.display_state AS "displayState", qsr.missing, qsr.policy_version AS "policyVersion"
+            qsr.display_state AS "displayState", qsr.missing, qsr.policy_version AS "policyVersion",
+            qcf.match_score AS "matchScore", qcf.matched_concept_ids AS "matchedConceptIds",
+            qcf.selected_fusion_policy AS "fusionPolicy",
+            qcf.selected_fusion_rank AS "fusionRank", qcf.rerank_policy AS "rerankPolicy",
+            qcf.rerank_position AS "rerankPosition", qcf.rerank_score::float8 AS "rerankScore",
+            qcf.reciprocal_rank AS "reciprocalRank",
+            qcf.normalized_weighted_rank AS "normalizedWeightedRank"
      FROM workspace.query_result_items qri
      JOIN workspace.query_signal_runs qsr ON qsr.id = qri.query_signal_run_id
      JOIN catalog.providers p ON p.id = qri.provider_id
      JOIN catalog.knowledge_projections kp
        ON kp.provider_id = qri.provider_id AND kp.provider_revision = qri.provider_revision
+     LEFT JOIN workspace.query_candidate_fusions qcf
+       ON qcf.result_set_id = qri.result_set_id AND qcf.provider_id = qri.provider_id
      WHERE ${providerFilters.join(' AND ')}`,
     providerValues,
   );
@@ -1154,9 +1616,17 @@ async function resultRows(
             qdr.signal_unrounded::float8 AS "signalUnrounded",
             qdr.signal_display AS "signalDisplay", qdr.display_state AS "displayState",
             qdr.missing, qdr.signal_policy_version AS "policyVersion",
-            kd.publisher, kd.canonical_uri AS "canonicalUri"
+            kd.publisher, kd.canonical_uri AS "canonicalUri",
+            qcf.match_score AS "matchScore", qcf.matched_concept_ids AS "matchedConceptIds",
+            qcf.selected_fusion_policy AS "fusionPolicy",
+            qcf.selected_fusion_rank AS "fusionRank", qcf.rerank_policy AS "rerankPolicy",
+            qcf.rerank_position AS "rerankPosition", qcf.rerank_score::float8 AS "rerankScore",
+            qcf.reciprocal_rank AS "reciprocalRank",
+            qcf.normalized_weighted_rank AS "normalizedWeightedRank"
      FROM workspace.query_document_results qdr
      JOIN catalog.knowledge_documents kd ON kd.id = qdr.document_id
+     LEFT JOIN workspace.query_candidate_fusions qcf
+       ON qcf.result_set_id = qdr.result_set_id AND qcf.document_id = qdr.document_id
      WHERE ${documentFilters.join(' AND ')}`,
     documentValues,
   );
@@ -1228,12 +1698,21 @@ export async function getExplorerItem(
             qsr.evidence_coverage::float8 AS "evidenceCoverage",
             qsr.signal_unrounded::float8 AS "signalUnrounded", qsr.signal_display AS "signalDisplay",
             qsr.display_state AS "displayState", qsr.missing, qsr.policy_version AS "policyVersion",
-            qsr.input_hash AS "inputHash", qsr.generated_at AS "generatedAt"
+            qsr.input_hash AS "inputHash", qsr.generated_at AS "generatedAt",
+            qcf.match_score AS "matchScore", qcf.matched_concept_ids AS "matchedConceptIds",
+            qcf.selected_fusion_policy AS "fusionPolicy", qcf.selected_fusion_rank AS "fusionRank",
+            qcf.rerank_policy AS "rerankPolicy", qcf.rerank_position AS "rerankPosition",
+            qcf.rerank_score::float8 AS "rerankScore",
+            qcf.reciprocal_contributions AS "reciprocalContributions",
+            qcf.normalized_weighted_contributions AS "normalizedWeightedContributions",
+            qcf.entity_resolution AS "entityResolution"
      FROM workspace.query_result_items qri
      JOIN workspace.query_signal_runs qsr ON qsr.id = qri.query_signal_run_id
      JOIN catalog.provider_display_revisions pdr ON pdr.id = qsr.provider_display_revision_id
      JOIN catalog.knowledge_projections kp
        ON kp.provider_id = qri.provider_id AND kp.provider_revision = qri.provider_revision
+     LEFT JOIN workspace.query_candidate_fusions qcf
+       ON qcf.result_set_id = qri.result_set_id AND qcf.provider_id = qri.provider_id
      WHERE qri.id = $1 AND qri.result_set_id = $2 AND qri.workspace_id = $3`,
     [itemId, resultSetId, workspaceId],
   );
@@ -1255,6 +1734,13 @@ export async function getExplorerItem(
               qdr.signal_display AS "signalDisplay", qdr.display_state AS "displayState",
               qdr.missing, qdr.signal_policy_version AS "policyVersion",
               qdr.input_hash AS "inputHash", qdr.created_at AS "generatedAt",
+              qcf.match_score AS "matchScore", qcf.matched_concept_ids AS "matchedConceptIds",
+              qcf.selected_fusion_policy AS "fusionPolicy",
+              qcf.selected_fusion_rank AS "fusionRank", qcf.rerank_policy AS "rerankPolicy",
+              qcf.rerank_position AS "rerankPosition", qcf.rerank_score::float8 AS "rerankScore",
+              qcf.reciprocal_contributions AS "reciprocalContributions",
+              qcf.normalized_weighted_contributions AS "normalizedWeightedContributions",
+              qcf.entity_resolution AS "entityResolution",
               so.id AS "sourceObservationId", so.observed_at AS "observedAt",
               so.retrieval_method AS "retrievalMethod", so.adapter_version AS "adapterVersion",
               so.handling_status AS "handlingStatus", s.title AS "sourceTitle",
@@ -1263,6 +1749,8 @@ export async function getExplorerItem(
        JOIN catalog.knowledge_documents kd ON kd.id = qdr.document_id
        JOIN catalog.source_observations so ON so.id = kd.source_observation_id
        JOIN catalog.sources s ON s.id = so.source_id
+       LEFT JOIN workspace.query_candidate_fusions qcf
+         ON qcf.result_set_id = qdr.result_set_id AND qcf.document_id = qdr.document_id
        WHERE qdr.id = $1 AND qdr.result_set_id = $2 AND qdr.workspace_id = $3`,
       [itemId, resultSetId, workspaceId],
     );

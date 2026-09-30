@@ -7,6 +7,8 @@ export type ResearchStopReason =
   | 'planning_complete'
   | 'sufficient_local_coverage'
   | 'second_pass_planned'
+  | 'second_pass_complete'
+  | 'second_pass_exhausted'
   | 'external_sources_disabled_after_local_pass'
   | 'clarification_required';
 
@@ -70,7 +72,7 @@ export interface DiscoveryPlan {
   };
   routes: DiscoveryPlanRoute[];
   secondPass: {
-    state: 'contingent' | 'planned' | 'not_needed';
+    state: 'contingent' | 'planned' | 'completed' | 'not_needed';
     trigger: string;
     routes: DiscoveryPlanRoute[];
   };
@@ -162,6 +164,9 @@ export function assessResearchCoverage(
     : null;
   const reasons: string[] = [];
   if (!candidates.length) reasons.push('No local candidate survived first-pass matching.');
+  if (candidates.length > 0 && candidates.length < 5) {
+    reasons.push('First-pass candidate breadth is below the frozen minimum of five.');
+  }
   if (
     interpretation.intentMode === 'broad_landscape' &&
     observedGroups.length < Math.min(3, Math.max(expectedBranches.length, 1))
@@ -309,6 +314,7 @@ export function buildDiscoveryPlan(
   options: {
     coverageAssessment?: ResearchCoverageAssessment;
     externalSourcesEnabled?: boolean;
+    secondPassExecuted?: boolean;
   } = {},
 ): DiscoveryPlan {
   const normalized = boundedVariant(publicQuery);
@@ -317,20 +323,26 @@ export function buildDiscoveryPlan(
   const routes = firstPassRoutes(normalized, interpretation);
   const secondRoutes = secondPassRoutes(normalized, interpretation, coverageAssessment);
   const secondPassState: DiscoveryPlan['secondPass']['state'] = coverageAssessment
-    ? coverageAssessment.needsSecondPass && secondRoutes.length
-      ? 'planned'
-      : 'not_needed'
+    ? options.secondPassExecuted
+      ? 'completed'
+      : coverageAssessment.needsSecondPass && secondRoutes.length
+        ? 'planned'
+        : 'not_needed'
     : 'contingent';
   const stopReason: ResearchStopReason =
     interpretation.intentMode === 'ambiguous' && !interpretation.resolvedConcepts.length
       ? 'clarification_required'
-      : options.externalSourcesEnabled === false
-        ? 'external_sources_disabled_after_local_pass'
-        : coverageAssessment?.needsSecondPass && secondRoutes.length
-          ? 'second_pass_planned'
-          : coverageAssessment
-            ? 'sufficient_local_coverage'
-            : 'planning_complete';
+      : options.secondPassExecuted
+        ? coverageAssessment?.needsSecondPass
+          ? 'second_pass_exhausted'
+          : 'second_pass_complete'
+        : options.externalSourcesEnabled === false
+          ? 'external_sources_disabled_after_local_pass'
+          : coverageAssessment?.needsSecondPass && secondRoutes.length
+            ? 'second_pass_planned'
+            : coverageAssessment
+              ? 'sufficient_local_coverage'
+              : 'planning_complete';
   const withoutHash = {
     policyVersion: 'research-plan-v2' as const,
     interpretationVersion: interpretation.interpretationMethod,
@@ -358,11 +370,15 @@ export function buildDiscoveryPlan(
     secondPass: {
       state: secondPassState,
       trigger:
-        secondPassState === 'planned'
-          ? coverageAssessment!.reasons.join(' ')
-          : secondPassState === 'not_needed'
-            ? 'The first-pass coverage policy found no targeted follow-up requirement.'
-            : 'Run only after the first pass records a coverage gap.',
+        secondPassState === 'completed'
+          ? coverageAssessment?.needsSecondPass
+            ? 'The bounded second pass completed with remaining recorded coverage gaps.'
+            : 'The bounded second pass completed and satisfied the local coverage policy.'
+          : secondPassState === 'planned'
+            ? coverageAssessment!.reasons.join(' ')
+            : secondPassState === 'not_needed'
+              ? 'The first-pass coverage policy found no targeted follow-up requirement.'
+              : 'Run only after the first pass records a coverage gap.',
       routes: secondRoutes,
     },
     coverageAssessment,
