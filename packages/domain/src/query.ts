@@ -366,19 +366,20 @@ function extractSubjectTerms(input: {
       constrainedTerms.add('no');
     }
   }
+  const subjectFrameTerms = input.meaningfulTerms.filter(
+    (word) =>
+      !TEMPORAL_WORDS.has(word) &&
+      !COMMUNITY_WORDS.has(word) &&
+      !EXCLUSION_WORDS.has(word) &&
+      !AUTHORITY_WORDS.has(word) &&
+      !PROBLEM_WORDS.has(word) &&
+      (!QUERY_FORM_WORDS.has(word) || protectedCompoundTerms.has(word)) &&
+      (!REQUEST_SCAFFOLD_WORDS.has(word) || protectedCompoundTerms.has(word)) &&
+      !excludedTerms.has(word),
+  );
   const subjectTerms = unique(
-    input.meaningfulTerms.filter(
-      (word) =>
-        !TEMPORAL_WORDS.has(word) &&
-        !COMMUNITY_WORDS.has(word) &&
-        !EXCLUSION_WORDS.has(word) &&
-        !AUTHORITY_WORDS.has(word) &&
-        !PROBLEM_WORDS.has(word) &&
-        (!QUERY_FORM_WORDS.has(word) || protectedCompoundTerms.has(word)) &&
-        (!REQUEST_SCAFFOLD_WORDS.has(word) || protectedCompoundTerms.has(word)) &&
-        !GENERIC_RESULT_TYPE_WORDS.has(word) &&
-        !excludedTerms.has(word) &&
-        !constrainedTerms.has(word),
+    subjectFrameTerms.filter(
+      (word) => !GENERIC_RESULT_TYPE_WORDS.has(word) && !constrainedTerms.has(word),
     ),
   );
   if (subjectTerms.length) return subjectTerms;
@@ -388,19 +389,7 @@ function extractSubjectTerms(input: {
     input.meaningfulTerms.filter((word) => GENERIC_RESULT_TYPE_WORDS.has(word)),
   );
   if (typeTerms.length) return typeTerms;
-  return unique(
-    input.meaningfulTerms.filter(
-      (word) =>
-        !TEMPORAL_WORDS.has(word) &&
-        !COMMUNITY_WORDS.has(word) &&
-        !EXCLUSION_WORDS.has(word) &&
-        !AUTHORITY_WORDS.has(word) &&
-        !PROBLEM_WORDS.has(word) &&
-        (!QUERY_FORM_WORDS.has(word) || protectedCompoundTerms.has(word)) &&
-        (!REQUEST_SCAFFOLD_WORDS.has(word) || protectedCompoundTerms.has(word)) &&
-        !excludedTerms.has(word),
-    ),
-  );
+  return unique(subjectFrameTerms);
 }
 
 function wordVariants(word: string): Set<string> {
