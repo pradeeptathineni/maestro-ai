@@ -903,7 +903,7 @@ describe('Phase 06 explorer and authoring contracts', () => {
       url: '/api/v1/explorer/sessions',
       headers: mutationHeaders,
       payload: {
-        query: 'xylophagous beetle stridulation framework',
+        query: 'xylophagous beetle stridulation acoustic analysis framework',
         searchConnectedSources: true,
       },
     });

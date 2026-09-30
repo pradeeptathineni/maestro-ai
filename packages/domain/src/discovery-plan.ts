@@ -320,22 +320,33 @@ function secondPassRoutes(
     : interpretation.mechanismTerms.slice(0, 3);
   if (!gapTerms.length) return [];
   const targetedVariant = targetedSourceVariant(interpretation, gapTerms, 5);
-  const routes = [
-    route({
-      adapterKey: 'searxng',
-      sourceClass: 'general_web',
-      retrieverKey: 'web_metasearch',
-      passIndex: 2,
-      variantIndex: 2,
-      state: 'planned',
-      variant: targetedVariant,
-      reason:
-        'Target the concept branches or mechanisms missing after first-pass coverage analysis.',
-      expectedEvidenceValue: 'Incremental candidates in recorded coverage gaps.',
-      callLimit: 1,
-    }),
-  ];
-  if (interpretation.sourceRoutingHints.includes('implementation_forge')) {
+  const exactLabel = interpretation.exactEntities[0]?.preferredLabel;
+  const firstWebVariant = exactLabel
+    ? boundedVariant(`"${exactLabel}"`)
+    : compactSourceVariant(interpretation, 5);
+  const routes: DiscoveryPlanRoute[] = [];
+  if (normalizeForComparison(targetedVariant) !== normalizeForComparison(firstWebVariant)) {
+    routes.push(
+      route({
+        adapterKey: 'searxng',
+        sourceClass: 'general_web',
+        retrieverKey: 'web_metasearch',
+        passIndex: 2,
+        variantIndex: 2,
+        state: 'planned',
+        variant: targetedVariant,
+        reason:
+          'Target the concept branches or mechanisms missing after first-pass coverage analysis.',
+        expectedEvidenceValue: 'Incremental candidates in recorded coverage gaps.',
+        callLimit: 1,
+      }),
+    );
+  }
+  const firstImplementationVariant = compactSourceVariant(interpretation, 3);
+  if (
+    interpretation.sourceRoutingHints.includes('implementation_forge') &&
+    normalizeForComparison(targetedVariant) !== normalizeForComparison(firstImplementationVariant)
+  ) {
     routes.push(
       route({
         adapterKey: 'github',
@@ -368,8 +379,11 @@ export function buildDiscoveryPlan(
   const coverageAssessment = options.coverageAssessment ?? null;
   const routes = firstPassRoutes(interpretation);
   const secondRoutes = secondPassRoutes(interpretation, coverageAssessment);
+  const secondPassExhaustedWithoutDistinctRoute = Boolean(
+    coverageAssessment?.needsSecondPass && secondRoutes.length === 0,
+  );
   const secondPassState: DiscoveryPlan['secondPass']['state'] = coverageAssessment
-    ? options.secondPassExecuted
+    ? options.secondPassExecuted || secondPassExhaustedWithoutDistinctRoute
       ? 'completed'
       : coverageAssessment.needsSecondPass && secondRoutes.length
         ? 'planned'
@@ -378,7 +392,7 @@ export function buildDiscoveryPlan(
   const stopReason: ResearchStopReason =
     interpretation.intentMode === 'ambiguous' && !interpretation.resolvedConcepts.length
       ? 'clarification_required'
-      : options.secondPassExecuted
+      : options.secondPassExecuted || secondPassExhaustedWithoutDistinctRoute
         ? coverageAssessment?.needsSecondPass
           ? 'second_pass_exhausted'
           : 'second_pass_complete'
@@ -417,9 +431,11 @@ export function buildDiscoveryPlan(
       state: secondPassState,
       trigger:
         secondPassState === 'completed'
-          ? coverageAssessment?.needsSecondPass
-            ? 'The bounded second pass completed with remaining recorded coverage gaps.'
-            : 'The bounded second pass completed and satisfied the local coverage policy.'
+          ? secondPassExhaustedWithoutDistinctRoute
+            ? 'No distinct bounded source variant remained after first-pass gap analysis.'
+            : coverageAssessment?.needsSecondPass
+              ? 'The bounded second pass completed with remaining recorded coverage gaps.'
+              : 'The bounded second pass completed and satisfied the local coverage policy.'
           : secondPassState === 'planned'
             ? coverageAssessment!.reasons.join(' ')
             : secondPassState === 'not_needed'

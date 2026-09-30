@@ -225,6 +225,7 @@ describe('knowledge-driven query interpretation', () => {
       state: 'planned',
       variant: 'flaky browser tests',
     });
+    expect(plan.secondPass.routes.filter((route) => route.adapterKey === 'github')).toHaveLength(0);
   });
 
   it('preserves source syntax before normalization and distinguishes local-first from locality', () => {
@@ -553,7 +554,11 @@ describe('bounded research planning', () => {
       state: 'planned',
       sourceClass: 'general_web',
     });
-    expect(plan.secondPass).toMatchObject({ state: 'planned' });
+    expect(plan.secondPass).toMatchObject({
+      state: 'completed',
+      trigger: 'No distinct bounded source variant remained after first-pass gap analysis.',
+      routes: [],
+    });
     expect(plan.requiredCoverage.sourceClasses).toContain('general_web');
   });
 });
