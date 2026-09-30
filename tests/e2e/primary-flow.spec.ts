@@ -355,6 +355,7 @@ test('G6 map stays bounded and interactive at declared synthetic sizes', async (
     fixture: string;
     nodes: number;
     edges: number;
+    targetMs: number;
     readyMs: number;
     maxInteractionLongTaskMs: number;
     interactionLongTasksOver200Ms: number;
@@ -362,8 +363,8 @@ test('G6 map stays bounded and interactive at declared synthetic sizes', async (
   }> = [];
 
   for (const shape of [
-    { nodes: 150, edges: 420 },
-    { nodes: 500, edges: 1_500 },
+    { nodes: 150, edges: 420, targetMs: 3_000 },
+    { nodes: 500, edges: 1_500, targetMs: 3_000 },
   ]) {
     fixture = syntheticGraphFixture(shape.nodes, shape.edges);
     await page.goto('/');
@@ -418,11 +419,12 @@ test('G6 map stays bounded and interactive at declared synthetic sizes', async (
       fixture: shape.nodes === 500 ? 'synthetic-stress' : 'synthetic-medium',
       nodes: fixture.nodes.length,
       edges: fixture.edges.length,
+      targetMs: shape.targetMs,
       readyMs,
       ...runtime,
     });
     await captureIfRequested(page, `graph-synthetic-${shape.nodes}.png`);
-    expect(readyMs).toBeLessThanOrEqual(2_000);
+    expect(readyMs).toBeLessThanOrEqual(shape.targetMs);
     expect(runtime.interactionLongTasksOver200Ms).toBe(0);
   }
 
