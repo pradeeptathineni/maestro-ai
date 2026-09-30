@@ -1,6 +1,6 @@
 import { phase06QueryEvaluationV1 } from './phase06-evaluation.js';
 
-export type EvaluationQueryFamily =
+type EvaluationQueryFamily =
   | 'ultra_broad'
   | 'typed_broad'
   | 'problem_statement'
