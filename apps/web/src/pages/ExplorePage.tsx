@@ -13,9 +13,8 @@ import type {
 import { Badge, Empty, ErrorPanel, Loading, StateBadge } from '../ui.js';
 import { useWorkspaceProjects } from '../workspace-queries.js';
 
-const ExplorerMap = lazy(async () => ({
-  default: (await import('../ExplorerMap.js')).ExplorerMap,
-}));
+const loadExplorerMap = () => import('../ExplorerMap.js');
+const ExplorerMap = lazy(async () => ({ default: (await loadExplorerMap()).ExplorerMap }));
 
 interface ExplorerHistoryItem {
   id: string;
@@ -227,6 +226,18 @@ export function ExplorePage() {
     queryFn: () =>
       api<ExplorerResultPage>(`/api/v1/explorer/result-sets/${resultSetId}?${resultQuery}`),
   });
+  useEffect(() => {
+    if (!results.data || !resultSetId) return;
+    let cancelled = false;
+    const timer = window.setTimeout(() => {
+      if (cancelled) return;
+      void loadExplorerMap().then((module) => module.preloadExplorerMapRenderer());
+    }, 0);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [resultSetId, results.data]);
   const graph = useQuery({
     queryKey: ['explorer-graph', resultSetId, graphQueryString],
     enabled: Boolean(resultSetId) && view === 'map',

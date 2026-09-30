@@ -2,6 +2,17 @@ import { useEffect, useRef, useState } from 'react';
 import type { Graph as G6Graph } from '@antv/g6';
 import type { ExplorerGraphData } from './types.js';
 
+function importRenderer() {
+  return import('@antv/g6');
+}
+
+let rendererModule: ReturnType<typeof importRenderer> | null = null;
+
+export function preloadExplorerMapRenderer() {
+  rendererModule ??= importRenderer();
+  return rendererModule;
+}
+
 const conciseGroupLabels: Record<string, string> = {
   'Agent control planes': 'Agent control',
   'Agent workflow evaluation': 'Agent UX evaluation',
@@ -36,7 +47,7 @@ export function ExplorerMap({
       if (!container.current) return;
       setRenderState('loading');
       try {
-        const { Graph, NodeEvent } = await import('@antv/g6');
+        const { Graph, NodeEvent } = await preloadExplorerMapRenderer();
         if (disposed || !container.current) return;
         graphRef.current?.destroy();
         const groups = data.nodes.filter((node) => node.type === 'capability_group');
