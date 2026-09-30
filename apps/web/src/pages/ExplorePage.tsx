@@ -76,12 +76,58 @@ interface SearchSession extends ExplorerSession {
   discoveryOperations: Array<{ id: string; adapterKey: string; state: string }>;
 }
 
+interface TaxonomyResponse {
+  facets: Array<{
+    key: string;
+    values: Array<{ stableKey: string; label: string; count: number }>;
+  }>;
+}
+
 const resultSetPattern =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const resultPageSize = 10;
 
 function signalLabel(item: ExplorerResultItem): string {
   return item.signalDisplay === null ? 'Excluded' : `Signal ${item.signalDisplay}`;
+}
+
+function matchLabel(item: ExplorerResultItem): string {
+  return `${item.matchBand ?? label(item.relevanceOrdinal)} Match`;
+}
+
+function confidenceLabel(item: ExplorerResultItem): string {
+  const detail = item.evidenceConfidenceDetail;
+  if (detail) return `${detail.band} evidence confidence · ${detail.display}%`;
+  return `${formatFractionPercent(item.evidenceConfidence)} legacy evidence confidence`;
+}
+
+function sourceCoverage(item: ExplorerResultItem): number {
+  return item.evidenceConfidenceDetail?.coverage ?? item.evidenceCoverage;
+}
+
+function trendLabel(item: ExplorerResultItem): string {
+  return item.trendState ? label(item.trendState) : 'Trend unavailable';
+}
+
+function signalExplanation(item: ExplorerItemDetail): string {
+  const scored = item.valueInputs
+    .filter((input) => input.adjusted !== null)
+    .sort((left, right) => (right.adjusted ?? 0) - (left.adjusted ?? 0));
+  const strongest = scored.slice(0, 2).map((input) => label(input.key));
+  const gaps = [
+    ...new Set([
+      ...item.missing,
+      ...item.valueInputs.flatMap((input) => input.missing),
+      ...(item.evidenceConfidenceDetail?.limitations ?? []),
+    ]),
+  ];
+  const drivers = strongest.length
+    ? `${strongest.join(' and ')} are the strongest measured dimensions.`
+    : 'No measured dimension is strong enough to identify as a driver.';
+  const qualification = gaps.length
+    ? `The estimate is tempered by ${gaps.slice(0, 2).join(' ').trim()}`
+    : 'No additional policy-visible evidence gap was recorded.';
+  return `${item.signalBand ?? signalStateLabel(item.displayState)} is a query-independent, type-aware estimate. ${drivers} ${qualification}`;
 }
 
 function signalStateLabel(state: string): string {
@@ -121,6 +167,8 @@ export function ExplorePage() {
   const [view, setView] = useState<'list' | 'map'>('list');
   const [sort, setSort] = useState('recommended');
   const [kind, setKind] = useState('');
+  const [entityClass, setEntityClass] = useState('');
+  const [matchBand, setMatchBand] = useState('');
   const [evidenceState, setEvidenceState] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [compareIds, setCompareIds] = useState<string[]>([]);
@@ -145,6 +193,10 @@ export function ExplorePage() {
     queryKey: ['integrations'],
     queryFn: () => api<{ items: IntegrationStatus[] }>('/api/v1/integrations'),
   });
+  const taxonomy = useQuery({
+    queryKey: ['taxonomy-facets'],
+    queryFn: () => api<TaxonomyResponse>('/api/v1/taxonomy/facets'),
+  });
   const discoveryOperations = useQueries({
     queries: discoveryOperationIds.map((operationId) => ({
       queryKey: ['discovery-operation', operationId],
@@ -157,9 +209,11 @@ export function ExplorePage() {
   const resultQuery = useMemo(() => {
     const query = new URLSearchParams({ limit: String(resultPageSize), sort });
     if (kind) query.set('kind', kind);
+    if (entityClass) query.set('entityClass', entityClass);
+    if (matchBand) query.set('matchBand', matchBand);
     if (evidenceState) query.set('evidenceState', evidenceState);
     return query.toString();
-  }, [evidenceState, kind, sort]);
+  }, [entityClass, evidenceState, kind, matchBand, sort]);
   const graphQueryString = useMemo(() => {
     const query = new URLSearchParams(resultQuery);
     query.set('limit', '100');
@@ -368,7 +422,17 @@ export function ExplorePage() {
     ...discoveryOperations.map((operation) => operation.error),
     watch.error,
     loadMore.error,
+    taxonomy.error,
   ].filter(Boolean);
+  const entityClassOptions =
+    taxonomy.data?.facets
+      .find((facet) => facet.key === 'entity_class')
+      ?.values.filter((value) => value.count > 0)
+      .map((value) => ({
+        value: value.stableKey.replace(/^entity-class:/, ''),
+        label: value.label,
+        count: value.count,
+      })) ?? [];
   const discoveryIntegrations =
     integrations.data?.items.filter(
       (integration) => integration.sourceClass !== 'local_semantic',
@@ -393,6 +457,15 @@ export function ExplorePage() {
     (operation) =>
       operation.isPending || ['queued', 'running'].includes(operation.data?.state ?? ''),
   );
+  const detailMissing = detail.data
+    ? [
+        ...new Set([
+          ...detail.data.missing,
+          ...detail.data.valueInputs.flatMap((input) => input.missing),
+          ...(detail.data.evidenceConfidenceDetail?.limitations ?? []),
+        ]),
+      ]
+    : [];
 
   function toggleComparison(id: string): void {
     setComparison(null);
@@ -415,7 +488,7 @@ export function ExplorePage() {
         <h1 id="explorer-heading">Find existing tools for what you need</h1>
         <p>
           Describe what you need. Maestro searches its local index and every source you have
-          enabled, then shows a query-specific signal, confidence, and evidence for each result.
+          enabled, then keeps query Match separate from intrinsic Signal, confidence, and evidence.
         </p>
         <form
           className="explorer-query"
@@ -448,7 +521,7 @@ export function ExplorePage() {
         </form>
         <div className="privacy-line">
           <span>Local index available offline</span>
-          <span>Every result gets a 0–100 signal estimate</span>
+          <span>Match answers the query; Signal describes the entity</span>
           <span>
             {enabledDiscoveryCount
               ? `${enabledDiscoveryCount} connected source${enabledDiscoveryCount === 1 ? '' : 's'} enabled`
@@ -597,7 +670,8 @@ export function ExplorePage() {
             {results.data.resultSet.projectContextId ? (
               <p className="authority-note">
                 Project fit is unknown and blocked until provider-specific gates and preferences are
-                assessed. This context is bound to the snapshot but does not alter the query signal.
+                assessed. This context is bound to the snapshot but alters neither Match nor
+                intrinsic Signal.
               </p>
             ) : null}
             <form
@@ -645,8 +719,8 @@ export function ExplorePage() {
             </summary>
             <div className="source-results-body">
               <p className="hint">
-                Source results are scored immediately from query relevance and available metadata.
-                Low confidence remains visible until stronger evidence is attached.
+                Live leads receive a preliminary query score from source metadata. It is not the
+                intrinsic Signal assigned only after evidence-backed corpus admission.
               </p>
               {discoveryOperationIds.length ? (
                 <>
@@ -672,14 +746,14 @@ export function ExplorePage() {
                             <h3>{candidate.title}</h3>
                             <p>{candidate.summary}</p>
                           </div>
-                          <div className="query-signal">
-                            <strong>Signal {candidate.signalDisplay}</strong>
+                          <div className="query-signal live-lead-score">
+                            <strong>Lead score {candidate.signalDisplay}</strong>
                             <span>
                               {label(candidate.relevanceOrdinal)} relevance ·{' '}
                               {signalStateLabel(candidate.displayState)}
                             </span>
                             <small>
-                              {formatFractionPercent(candidate.evidenceCoverage)} evidence coverage
+                              {formatFractionPercent(candidate.evidenceCoverage)} metadata coverage
                             </small>
                           </div>
                           <a
@@ -738,8 +812,8 @@ export function ExplorePage() {
                 <span>Top result</span>
                 <strong>{visibleItems[0].name}</strong>
                 <small>
-                  {label(visibleItems[0].relevanceOrdinal)} match · {signalLabel(visibleItems[0])} ·{' '}
-                  {formatFractionPercent(visibleItems[0].evidenceCoverage)} evidence coverage
+                  {matchLabel(visibleItems[0])} · {signalLabel(visibleItems[0])} ·{' '}
+                  {confidenceLabel(visibleItems[0])}
                 </small>
               </button>
             ) : null}
@@ -748,10 +822,9 @@ export function ExplorePage() {
                 Sort
                 <select value={sort} onChange={(event) => setSort(event.target.value)}>
                   <option value="recommended">Recommended</option>
-                  <option value="signal">Query signal</option>
-                  <option value="relevance">Relevance</option>
-                  <option value="evidence">Evidence coverage</option>
-                  <option value="maintenance">Conservative value</option>
+                  <option value="match">Match</option>
+                  <option value="signal">Signal</option>
+                  <option value="evidence">Evidence confidence</option>
                   <option value="name">Name</option>
                 </select>
               </label>
@@ -767,7 +840,31 @@ export function ExplorePage() {
                 </select>
               </label>
               <label>
-                Evidence state
+                Entity class
+                <select
+                  value={entityClass}
+                  onChange={(event) => setEntityClass(event.target.value)}
+                >
+                  <option value="">All classes</option>
+                  {entityClassOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label} ({option.count})
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Match
+                <select value={matchBand} onChange={(event) => setMatchBand(event.target.value)}>
+                  <option value="">All bands</option>
+                  <option value="Direct">Direct</option>
+                  <option value="Strong">Strong</option>
+                  <option value="Related">Related</option>
+                  <option value="Peripheral">Peripheral</option>
+                </select>
+              </label>
+              <label>
+                Signal state
                 <select
                   value={evidenceState}
                   onChange={(event) => setEvidenceState(event.target.value)}
@@ -814,8 +911,8 @@ export function ExplorePage() {
                     </label>
                     <div className="result-identity">
                       <div className="card-topline">
+                        <Badge>{label(item.entityClass)}</Badge>
                         <Badge>{label(item.kind)}</Badge>
-                        <Badge>{signalStateLabel(item.displayState)}</Badge>
                       </div>
                       <h3>{item.name}</h3>
                       <p>{item.description}</p>
@@ -828,7 +925,7 @@ export function ExplorePage() {
                       </div>
                     </div>
                     <div className="result-reason">
-                      <strong>{label(item.relevanceOrdinal)} match</strong>
+                      <strong>{matchLabel(item)}</strong>
                       <p>{item.explanation}</p>
                       {primaryCaveat(item) ? (
                         <small>Limitation: {primaryCaveat(item)}</small>
@@ -836,10 +933,12 @@ export function ExplorePage() {
                     </div>
                     <div className="query-signal">
                       <strong>{signalLabel(item)}</strong>
-                      <span>{signalStateLabel(item.displayState)}</span>
-                      <small>
-                        {formatFractionPercent(item.evidenceCoverage)} evidence coverage
-                      </small>
+                      <span>
+                        {item.signalBand ?? signalStateLabel(item.displayState)} ·{' '}
+                        {trendLabel(item)}
+                      </span>
+                      <small>{confidenceLabel(item)}</small>
+                      <small>{formatFractionPercent(sourceCoverage(item))} source coverage</small>
                     </div>
                     <button
                       className="button secondary compact"
@@ -944,27 +1043,61 @@ export function ExplorePage() {
                   </thead>
                   <tbody>
                     <tr>
-                      <th>Kind</th>
+                      <th>Entity class</th>
+                      {comparison.items.map((item) => (
+                        <td key={item.id}>{label(item.entityClass)}</td>
+                      ))}
+                    </tr>
+                    <tr>
+                      <th>Subtype</th>
                       {comparison.items.map((item) => (
                         <td key={item.id}>{label(item.kind)}</td>
                       ))}
                     </tr>
                     <tr>
-                      <th>Relevance</th>
+                      <th>Match</th>
                       {comparison.items.map((item) => (
-                        <td key={item.id}>{label(item.relevanceOrdinal)}</td>
+                        <td key={item.id}>{matchLabel(item)}</td>
                       ))}
                     </tr>
                     <tr>
                       <th>Signal</th>
                       {comparison.items.map((item) => (
-                        <td key={item.id}>{signalLabel(item)}</td>
+                        <td key={item.id}>
+                          {signalLabel(item)} ·{' '}
+                          {item.signalBand ?? signalStateLabel(item.displayState)}
+                        </td>
                       ))}
                     </tr>
                     <tr>
-                      <th>Coverage</th>
+                      <th>Evidence confidence</th>
                       {comparison.items.map((item) => (
-                        <td key={item.id}>{formatFractionPercent(item.evidenceCoverage)}</td>
+                        <td key={item.id}>{confidenceLabel(item)}</td>
+                      ))}
+                    </tr>
+                    <tr>
+                      <th>Trend</th>
+                      {comparison.items.map((item) => (
+                        <td key={item.id}>{trendLabel(item)}</td>
+                      ))}
+                    </tr>
+                    <tr>
+                      <th>Source coverage</th>
+                      {comparison.items.map((item) => (
+                        <td key={item.id}>{formatFractionPercent(sourceCoverage(item))}</td>
+                      ))}
+                    </tr>
+                    <tr>
+                      <th>Relationships</th>
+                      {comparison.items.map((item) => (
+                        <td key={item.id}>
+                          {item.relations
+                            .map(
+                              (relation) =>
+                                `${label(relation.type)} ${relation.targetName ?? relation.targetCapabilityName ?? ''}`,
+                            )
+                            .join('; ') || 'None recorded'}
+                        </td>
                       ))}
                     </tr>
                     <tr>
@@ -1040,11 +1173,23 @@ export function ExplorePage() {
             </button>
           </div>
           <p id="detail-summary">{detail.data.description}</p>
+          <div className="chip-row detail-facets" aria-label="Entity facets">
+            <span className="facet-chip explicit">Class: {label(detail.data.entityClass)}</span>
+            <span className="facet-chip">Subtype: {label(detail.data.kind)}</span>
+            <span className="facet-chip">Group: {detail.data.capabilityGroup}</span>
+            {detail.data.capabilities.slice(0, 5).map((capability) => (
+              <span className="facet-chip" key={capability}>
+                {label(capability)}
+              </span>
+            ))}
+          </div>
           <div className="signal-callout">
             <strong>{signalLabel(detail.data)}</strong>
             <span>
-              {detail.data.policyVersion} · {label(detail.data.relevanceOrdinal)} relevance
+              {detail.data.signalBand ?? signalStateLabel(detail.data.displayState)} ·{' '}
+              {confidenceLabel(detail.data)}
             </span>
+            <small>{trendLabel(detail.data)} · query-independent intrinsic estimate</small>
           </div>
           {detail.data.providerId ? (
             <button
@@ -1065,9 +1210,44 @@ export function ExplorePage() {
               Open document source
             </a>
           ) : null}
-          <h3>Why it appears</h3>
-          <p>{detail.data.explanation}</p>
+          <h3>Why it matched</h3>
+          <p>
+            <strong>{matchLabel(detail.data)}</strong> · {detail.data.explanation}
+          </p>
+          <div className="chip-row detail-facets" aria-label="Match path">
+            {detail.data.matchedConcepts.map((concept) => (
+              <span className="facet-chip inferred" key={concept.id}>
+                {label(concept.facetKey)}: {concept.label}
+              </span>
+            ))}
+            {detail.data.matchedFields.map((field) => (
+              <span className="facet-chip" key={field}>
+                {label(field)} field
+              </span>
+            ))}
+          </div>
+          <h3>Why Signal is high or low</h3>
+          <p>{signalExplanation(detail.data)}</p>
+          <div className="signal-facts">
+            <div>
+              <strong>Evidence confidence</strong>
+              <span>{confidenceLabel(detail.data)}</span>
+            </div>
+            <div>
+              <strong>Source coverage</strong>
+              <span>{formatFractionPercent(sourceCoverage(detail.data))}</span>
+            </div>
+            <div>
+              <strong>Trend</strong>
+              <span>{trendLabel(detail.data)}</span>
+              <small>{detail.data.trend?.reasons.join(' ') || 'No comparable history yet.'}</small>
+            </div>
+          </div>
           <h3>Signal calculation</h3>
+          <p className="muted">
+            {detail.data.policyVersion}. Values are normalized within a type profile; Match is not
+            an input.
+          </p>
           <div className="input-grid">
             {detail.data.valueInputs.map((input) => (
               <div key={input.key}>
@@ -1081,10 +1261,21 @@ export function ExplorePage() {
                   confidence {formatFractionPercent(input.confidence)} · coverage{' '}
                   {formatFractionPercent(input.coverage)} · prior {input.prior}
                 </small>
+                {input.reasons.length ? <small>{input.reasons.join(' ')}</small> : null}
+                {input.missing.length ? (
+                  <small className="missing-text">Missing: {input.missing.join('; ')}</small>
+                ) : null}
               </div>
             ))}
           </div>
           <h3>Sources and evidence</h3>
+          <p className="muted">
+            {detail.data.evidence.length} bound evidence item
+            {detail.data.evidence.length === 1 ? '' : 's'} across{' '}
+            {detail.data.evidenceConfidenceDetail?.sourceGroupIds.length ?? 0} declared source group
+            {(detail.data.evidenceConfidenceDetail?.sourceGroupIds.length ?? 0) === 1 ? '' : 's'}.
+            Coverage does not imply independent corroboration.
+          </p>
           {detail.data.evidence.length ? (
             detail.data.evidence.map((item) => (
               <article className="evidence-mini" key={`${item.id}:${item.dimensionKey}`}>
@@ -1105,6 +1296,37 @@ export function ExplorePage() {
             <p className="muted">
               No evidence item is bound. The estimate uses declared priors and the policy's
               uncertainty deduction.
+            </p>
+          )}
+          <h3>Relationships</h3>
+          {detail.data.relations.length ? (
+            <ul className="relationship-list">
+              {detail.data.relations.map((relation, index) => (
+                <li
+                  key={`${relation.type}:${relation.targetProviderId ?? relation.targetCapabilityId ?? index}`}
+                >
+                  <strong>{label(relation.type)}</strong>{' '}
+                  {relation.targetName ?? relation.targetCapabilityName ?? 'Related entity'}
+                  <span>
+                    {relation.scope ?? relation.rationale ?? 'No narrower scope recorded.'} ·{' '}
+                    {label(relation.status)}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="muted">No evidence-bearing relationship is recorded for this snapshot.</p>
+          )}
+          <h3>Missing evidence and limits</h3>
+          {detailMissing.length ? (
+            <ul className="missing-evidence-list">
+              {detailMissing.map((missing) => (
+                <li key={missing}>{missing}</li>
+              ))}
+            </ul>
+          ) : (
+            <p className="muted">
+              No policy-visible gap is recorded; this is not a claim of complete market knowledge.
             </p>
           )}
           <p className="drawer-hash">
@@ -1154,8 +1376,8 @@ export function ExplorePage() {
           </div>
           <div>
             <span>2</span>
-            <strong>Review the signal</strong>
-            <p>See relevance, confidence, evidence, and missing information.</p>
+            <strong>Review Match and Signal</strong>
+            <p>See why it matched, intrinsic strength, confidence, trend, and missing evidence.</p>
           </div>
           <div>
             <span>3</span>

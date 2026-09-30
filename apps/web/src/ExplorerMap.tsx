@@ -106,8 +106,13 @@ export function ExplorerMap({
               target: edge.target,
               data: { type: edge.type, status: edge.status, scope: edge.scope },
               style: {
-                stroke: edge.status === 'provisional' ? '#b58a3a' : '#8ba99a',
+                stroke: edge.id.startsWith('grouping:')
+                  ? '#8ba99a'
+                  : edge.status === 'provisional'
+                    ? '#b87824'
+                    : '#315b87',
                 lineDash: edge.status === 'provisional' ? [5, 4] : undefined,
+                lineWidth: edge.id.startsWith('grouping:') ? 1 : 2,
               },
             })),
           },
@@ -208,8 +213,9 @@ export function ExplorerMap({
       </div>
       <p className="map-count" role="status">
         Showing {data.visibleCount} of {data.filteredCount}; {data.hiddenCount} hidden by the
-        bounded neighborhood. Capability hubs organize the overview; search, select a dot, or open
-        the keyboard list for names and detail.
+        bounded neighborhood. Capability hubs organize the overview and direct item-to-item lines
+        preserve recorded relationships; search, select a dot, or open the keyboard list for the
+        complete text alternative.
       </p>
       <div className="map-canvas" ref={container} aria-hidden="true" />
       {renderState === 'loading' ? (
@@ -235,6 +241,9 @@ export function ExplorerMap({
         </span>
         <span>
           <i className="legend-line" /> Provides or is about a mechanism
+        </span>
+        <span>
+          <i className="legend-line relationship" /> Recorded item relationship
         </span>
       </div>
       <section className="map-accessible-tree" aria-labelledby="map-tree-heading">
@@ -267,9 +276,27 @@ export function ExplorerMap({
                     {item.kind.replaceAll('_', ' ')} · {item.group}
                   </span>
                   <span>
-                    {item.relation.type.replaceAll('_', ' ')} · {item.relation.scope} ·{' '}
-                    {item.relation.status.replaceAll('_', ' ')}
+                    {item.matchBand ?? 'Legacy'} Match ·{' '}
+                    {item.signalDisplay === null
+                      ? 'Signal unavailable'
+                      : `Signal ${item.signalDisplay}`}{' '}
+                    · {Math.round(item.evidenceConfidence * 100)}% evidence confidence ·{' '}
+                    {(item.trendState ?? 'trend unavailable').replaceAll('_', ' ')}
                   </span>
+                  {item.relationships.map((relationship) => (
+                    <span
+                      key={`${relationship.type}:${relationship.targetName}:${relationship.scope}`}
+                    >
+                      {relationship.type.replaceAll('_', ' ')} {relationship.targetName} ·{' '}
+                      {relationship.status.replaceAll('_', ' ')}
+                    </span>
+                  ))}
+                  {!item.relationships.length ? (
+                    <span>
+                      {item.relation.type.replaceAll('_', ' ')} · {item.relation.scope} ·{' '}
+                      {item.relation.status.replaceAll('_', ' ')}
+                    </span>
+                  ) : null}
                   <small>{item.explanation}</small>
                 </button>
               </li>

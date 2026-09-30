@@ -112,11 +112,16 @@ function syntheticGraphFixture(totalNodes: number, totalEdges: number) {
       kind: provider.kind,
       group: provider.group,
       explanation: 'Synthetic performance fixture; not catalog knowledge.',
+      matchBand: 'Related',
+      signalDisplay: provider.signalDisplay,
+      evidenceConfidence: 0.5,
+      trendState: 'unknown',
       relation: {
         type: 'provides',
         scope: 'synthetic graph performance fixture',
         status: provider.displayState === 'provisional' ? 'provisional' : 'source_supported',
       },
+      relationships: [],
     })),
   };
 }
@@ -257,7 +262,11 @@ test('query-first explorer keeps list, map, detail, comparison, and save on one 
   await expect(page.getByRole('dialog')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Close detail' })).toBeFocused();
   await expect(page.getByRole('heading', { name: 'Signal calculation' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Why it matched' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Why Signal is high or low' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Sources and evidence' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Relationships' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Missing evidence and limits' })).toBeVisible();
   await captureIfRequested(page, 'explorer-1440-detail.png');
   await page.keyboard.press('Escape');
   await expect(firstInspect).toBeFocused();
@@ -286,7 +295,12 @@ test('query-first explorer keeps list, map, detail, comparison, and save on one 
   const browseMapItems = page.getByRole('button', { name: /Browse \d+ items/ });
   await expect(browseMapItems).toBeVisible();
   await browseMapItems.click();
-  await expect(page.getByText(/query-result capability grouping/).first()).toBeVisible();
+  await expect(
+    page
+      .locator('.map-accessible-tree')
+      .getByText(/Match.*Signal/)
+      .first(),
+  ).toBeVisible();
   await page.getByRole('button', { name: 'Hide item list' }).click();
   await captureIfRequested(page, 'explorer-1440-map.png');
 
@@ -419,7 +433,7 @@ test('G6 map stays bounded and interactive at declared synthetic sizes', async (
       reportPath,
       `${JSON.stringify(
         {
-          benchmarkId: 'phase06-g6-bounded-map-v1',
+          benchmarkId: 'bounded-g6-map-v2',
           executedAt: new Date().toISOString(),
           browser: 'Playwright Chromium',
           statement: 'Synthetic fixtures measure renderer mechanics, not knowledge quality.',
@@ -449,7 +463,8 @@ test('corpus separates saved leads from indexed knowledge and scores an explicit
   expect(page.url()).not.toContain('context');
   await expect(page.getByText('Query-scored records')).toBeVisible();
   await expect(page.getByText(/^Signal \d+$/).first()).toBeVisible();
-  await expect(page.getByText(/Every displayed match has a numeric estimate/i)).toBeVisible();
+  await expect(page.getByText(/Match answers the query/i)).toBeVisible();
+  await expect(page.getByText(/evidence confidence/i).first()).toBeVisible();
   await expectNoSeriousAccessibilityViolations(page);
   await captureIfRequested(page, 'corpus-1440-search.png');
 
@@ -579,8 +594,10 @@ test('connected source results remain visibly preliminary and source-linked', as
   await expect(sourceResults.getByText('Source plan and live leads')).toBeVisible();
   await sourceResults.locator('summary').click();
   await expect(page.getByText('example/context-tool')).toBeVisible();
-  await expect(page.getByText('Signal 34', { exact: true })).toBeVisible();
-  await expect(page.getByText('Preliminary', { exact: true }).last()).toBeVisible();
+  await expect(page.getByText('Lead score 34', { exact: true })).toBeVisible();
+  await expect(
+    page.locator('.source-result-row').getByText('Preliminary', { exact: true }).first(),
+  ).toBeVisible();
   await expect(page.getByRole('link', { name: 'Open source' })).toHaveAttribute(
     'href',
     'https://github.com/example/context-tool',

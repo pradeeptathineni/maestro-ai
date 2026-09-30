@@ -329,6 +329,7 @@ export interface ExplorerResultItem {
   providerId: string | null;
   documentId?: string | null;
   subjectType: 'implementation' | 'document';
+  entityClass: string;
   providerRevision: number | null;
   capabilityGroup: string;
   matchedFields: string[];
@@ -343,13 +344,44 @@ export interface ExplorerResultItem {
   relevanceOrdinal: string;
   relevanceValue: number;
   relevanceMethod: string;
+  matchScore: number | null;
+  matchBand: 'Direct' | 'Strong' | 'Related' | 'Peripheral' | null;
+  matchedConceptIds: string[];
   valueCentral: number;
   valueUncertainty: number;
   valueConservative: number;
   evidenceCoverage: number;
+  evidenceConfidence: number;
+  evidenceConfidenceDetail: {
+    policyVersion: string;
+    score: number;
+    display: number;
+    band: 'High' | 'Moderate' | 'Low' | 'Insufficient';
+    directness: number;
+    independence: number;
+    applicability: number;
+    freshness: number;
+    coverage: number;
+    contradiction: number;
+    limitations: string[];
+    sourceGroupIds: string[];
+    evidenceIds: string[];
+  } | null;
   signalUnrounded: number;
   signalDisplay: number | null;
   displayState: string;
+  signalBand: string | null;
+  trendState: string | null;
+  trend: {
+    policyVersion: string;
+    state: string;
+    windowStart: string;
+    windowEnd: string;
+    observationCount: number;
+    independentSourceCount: number;
+    change: number | null;
+    reasons: string[];
+  } | null;
   missing: string[];
   policyVersion: string;
 }
@@ -409,6 +441,7 @@ export interface ExplorerItemDetail extends ExplorerResultItem {
   resultSetId: string;
   canonicalUri?: string;
   relevanceAnchors: Record<string, unknown>;
+  matchedConcepts: Array<{ id: string; facetKey: string; label: string }>;
   valueInputs: Array<{
     key: string;
     raw: number | null;
@@ -440,11 +473,14 @@ export interface ExplorerItemDetail extends ExplorerResultItem {
   }>;
   relations: Array<{
     type: string;
-    scope: string;
-    confidence: number;
-    targetProviderId: string;
-    targetName: string;
-    sourceUrl: string | null;
+    scope?: string;
+    rationale?: string;
+    confidence?: number;
+    targetProviderId?: string | null;
+    targetName?: string | null;
+    targetCapabilityId?: string | null;
+    targetCapabilityName?: string | null;
+    sourceUrl?: string | null;
     status: string;
   }>;
 }
@@ -480,6 +516,16 @@ export interface ExplorerGraphData {
     kind: string;
     group: string;
     explanation: string;
+    matchBand: ExplorerResultItem['matchBand'];
+    signalDisplay: number | null;
+    evidenceConfidence: number;
+    trendState: string | null;
     relation: { type: string; scope: string; status: string };
+    relationships: Array<{
+      type: string;
+      scope: string;
+      status: string;
+      targetName: string;
+    }>;
   }>;
 }

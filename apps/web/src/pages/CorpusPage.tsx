@@ -20,8 +20,18 @@ interface CorpusItem {
   relevanceOrdinal: string | null;
   signalDisplay: number | null;
   evidenceCoverage: number | null;
+  evidenceConfidence: number | null;
+  evidenceConfidenceDetail: {
+    display: number;
+    band: string;
+    coverage: number;
+    sourceGroupIds: string[];
+    limitations: string[];
+  } | null;
   displayState: string | null;
   signalBand: string | null;
+  signalPolicyVersion: string | null;
+  trend: { state: string; reasons: string[] } | null;
   signalExplanation: string | null;
 }
 
@@ -137,8 +147,8 @@ export function CorpusPage() {
           <div>
             <h2 id="corpus-controls-heading">Search and filter</h2>
             <p>
-              Enter a need to calculate query-specific signals. Leave it empty to browse saved
-              records by source, kind, or review state.
+              Enter a need to add query Match. Intrinsic Signal remains visible while browsing
+              admitted knowledge; source leads stay visibly preliminary.
             </p>
           </div>
         </div>
@@ -261,8 +271,8 @@ export function CorpusPage() {
               </div>
               <p className="hint">
                 {corpus.data.scoringApplied
-                  ? 'Every displayed match has a numeric estimate. Confidence and review state remain separate.'
-                  : 'Browse mode does not invent a universal score. Search for a need to calculate query-specific signals.'}
+                  ? 'Match answers the query. Signal, confidence, trend, and review state remain separate.'
+                  : 'Browse mode shows query-independent Signal for admitted knowledge and no intrinsic Signal for unreviewed leads.'}
               </p>
             </div>
             {corpus.data.items.length ? (
@@ -290,21 +300,45 @@ export function CorpusPage() {
                       </small>
                       {item.matchedTerms.length ? (
                         <p className="matched-terms">
-                          Matched: {item.matchedTerms.slice(0, 8).join(', ')}
+                          {item.relevanceOrdinal
+                            ? `${label(item.relevanceOrdinal)} Match`
+                            : 'Matched'}
+                          : {item.matchedTerms.slice(0, 8).join(', ')}
                         </p>
                       ) : null}
+                      {item.signalExplanation ? (
+                        <p className="signal-explanation">{item.signalExplanation}</p>
+                      ) : null}
                     </div>
-                    {corpus.data.scoringApplied ? (
-                      <div className="query-signal">
-                        <strong>Signal {item.signalDisplay}</strong>
+                    {item.layer === 'source_lead' && item.signalDisplay !== null ? (
+                      <div className="query-signal live-lead-score">
+                        <strong>Lead score {item.signalDisplay}</strong>
                         <span>
-                          {item.relevanceOrdinal
-                            ? `${label(item.relevanceOrdinal)} relevance · `
-                            : ''}
+                          {item.relevanceOrdinal ? `${label(item.relevanceOrdinal)} Match` : ''} ·{' '}
                           {evidenceLabel(item.displayState)}
                         </span>
                         <small>
-                          {formatFractionPercent(item.evidenceCoverage ?? 0)} evidence coverage
+                          Preliminary metadata estimate; no intrinsic Signal until evidence-backed
+                          admission.
+                        </small>
+                      </div>
+                    ) : item.signalDisplay !== null ? (
+                      <div className="query-signal">
+                        <strong>Signal {item.signalDisplay}</strong>
+                        <span>
+                          {item.signalBand ?? evidenceLabel(item.displayState)} ·{' '}
+                          {item.trend ? label(item.trend.state) : 'Trend unavailable'}
+                        </span>
+                        <small>
+                          {item.evidenceConfidenceDetail?.band ?? 'Legacy'} evidence confidence ·{' '}
+                          {formatFractionPercent(item.evidenceConfidence ?? 0)}
+                        </small>
+                        <small>
+                          {formatFractionPercent(
+                            item.evidenceConfidenceDetail?.coverage ?? item.evidenceCoverage ?? 0,
+                          )}{' '}
+                          source coverage · {item.sources.length} source class
+                          {item.sources.length === 1 ? '' : 'es'}
                         </small>
                       </div>
                     ) : null}
