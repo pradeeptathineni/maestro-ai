@@ -406,7 +406,8 @@ async function main(): Promise<void> {
       configuration: {
         retrieval: `deterministic-v3 + retrieval-fabric-v5 + ${fusionPolicy} + structured-rerank-v1`,
         fusionPolicy,
-        currentSignalPolicy: 'query-signal-v2',
+        currentSignalPolicy: 'intrinsic-signal-v3',
+        compatibilityQuerySignalPolicy: 'query-signal-v2',
         historicalReplayPolicy: 'query-signal-v1',
         resultCutoff: 20,
         database: version.rows[0]!.version,

@@ -72,6 +72,7 @@ export interface RerankedRetrievalCandidate extends FusedRetrievalCandidate {
   rerankPosition: number;
   rerankScore: number;
   matchScore: number;
+  matchBand: 'Direct' | 'Strong' | 'Related' | 'Peripheral';
   reasons: string[];
 }
 
@@ -658,6 +659,14 @@ export function structuredRerank(
           rerankPosition: 0,
           rerankScore: precise(rerankScore),
           matchScore,
+          matchBand:
+            matchScore >= 70
+              ? ('Direct' as const)
+              : matchScore >= 45
+                ? ('Strong' as const)
+                : matchScore >= 25
+                  ? ('Related' as const)
+                  : ('Peripheral' as const),
           reasons,
         },
       ];

@@ -937,6 +937,46 @@ export const knowledgeEntityRevisions = catalog.table(
   (table) => [unique().on(table.entityId, table.revision)],
 );
 
+export const intrinsicSignalRuns = catalog.table(
+  'intrinsic_signal_runs',
+  {
+    id: uuid().primaryKey(),
+    knowledgeEntityId: uuid('knowledge_entity_id')
+      .notNull()
+      .references(() => knowledgeEntities.id),
+    entityRevisionId: uuid('entity_revision_id')
+      .notNull()
+      .references(() => knowledgeEntityRevisions.id),
+    policyId: uuid('policy_id')
+      .notNull()
+      .references(() => scorePolicies.id),
+    policyVersion: text('policy_version').notNull(),
+    profile: text().notNull(),
+    inputHash: text('input_hash').notNull(),
+    dimensionInputs: jsonb('dimension_inputs').notNull(),
+    central: numeric({ precision: 9, scale: 6 }).notNull(),
+    uncertainty: numeric({ precision: 9, scale: 6 }).notNull(),
+    conservative: numeric({ precision: 9, scale: 6 }).notNull(),
+    signalDisplay: integer('signal_display').notNull(),
+    displayState: text('display_state').notNull(),
+    band: text().notNull(),
+    evidenceConfidence: numeric('evidence_confidence', { precision: 9, scale: 6 }).notNull(),
+    evidenceConfidenceDetail: jsonb('evidence_confidence_detail').notNull(),
+    trendPolicyVersion: text('trend_policy_version').notNull(),
+    trendState: text('trend_state').notNull(),
+    trendWindowStart: timestamp('trend_window_start', { withTimezone: true }).notNull(),
+    trendWindowEnd: timestamp('trend_window_end', { withTimezone: true }).notNull(),
+    trendDetail: jsonb('trend_detail').notNull(),
+    evidenceIds: uuid('evidence_ids').array().notNull().default([]),
+    generatedAt: timestamp('generated_at', { withTimezone: true }).notNull(),
+    supersededBy: uuid('superseded_by'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    unique().on(table.knowledgeEntityId, table.entityRevisionId, table.policyId, table.inputHash),
+  ],
+);
+
 export const entityFacetAssignments = catalog.table(
   'entity_facet_assignments',
   {
@@ -1172,6 +1212,7 @@ export const queryCandidateFusions = workspace.table(
     rerankPosition: integer('rerank_position').notNull(),
     rerankScore: numeric('rerank_score', { precision: 12, scale: 6 }).notNull(),
     matchScore: integer('match_score').notNull(),
+    matchBand: text('match_band'),
     matchedTerms: text('matched_terms').array().notNull().default([]),
     matchedConceptIds: uuid('matched_concept_ids').array().notNull().default([]),
     entityResolution: jsonb('entity_resolution').notNull(),
@@ -1230,6 +1271,7 @@ export const queryDocumentResults = workspace.table(
     caveats: text().array().notNull().default([]),
     missing: text().array().notNull().default([]),
     inputHash: text('input_hash').notNull(),
+    intrinsicSignalRunId: uuid('intrinsic_signal_run_id').references(() => intrinsicSignalRuns.id),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [unique().on(table.resultSetId, table.documentId)],
@@ -1278,6 +1320,7 @@ export const queryResultItems = workspace.table('query_result_items', {
   workspaceId: uuid('workspace_id').notNull(),
   resultSetId: uuid('result_set_id').notNull(),
   querySignalRunId: uuid('query_signal_run_id').notNull(),
+  intrinsicSignalRunId: uuid('intrinsic_signal_run_id').references(() => intrinsicSignalRuns.id),
   providerId: uuid('provider_id').notNull(),
   providerRevision: integer('provider_revision').notNull(),
   position: integer().notNull(),

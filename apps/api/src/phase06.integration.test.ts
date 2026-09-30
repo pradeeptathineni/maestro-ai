@@ -82,7 +82,7 @@ describe('Phase 06 explorer and authoring contracts', () => {
     }>();
     expect(firstPage.resultSet).toMatchObject({
       id: session.resultSetId,
-      signalPolicyVersion: 'query-signal-v2',
+      signalPolicyVersion: 'intrinsic-signal-v3',
     });
     expect(firstPage.items).toHaveLength(5);
     const second = await app.inject({
@@ -320,7 +320,7 @@ describe('Phase 06 explorer and authoring contracts', () => {
     expect(detail.statusCode).toBe(200);
     expect(detail.json()).toMatchObject({
       resultSetId: session.resultSetId,
-      policyVersion: 'query-signal-v2',
+      policyVersion: 'intrinsic-signal-v3',
       valueInputs: expect.any(Array),
       evidence: expect.any(Array),
     });

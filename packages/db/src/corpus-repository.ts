@@ -7,9 +7,14 @@ import {
   type QueryInterpretation,
 } from '../../domain/src/index.js';
 import {
+  calculateIntrinsicSignalV3,
+  calculateTrend,
   calculateQuerySignalV2,
+  intrinsicInputsFromLegacyValueProfile,
+  intrinsicSignalProfile,
   querySignalKindProfile,
   querySignalPolicyV2,
+  type IntrinsicSignalResult,
   type QuerySignalResult,
   type QueryValueInput,
 } from '../../scoring/src/index.js';
@@ -49,8 +54,11 @@ interface ScoredCorpusRow extends CorpusRow {
   signalUnrounded: number | null;
   evidenceCoverage: number | null;
   displayState: QuerySignalResult['displayState'] | null;
-  signalBand: QuerySignalResult['band'] | null;
-  signalPolicyVersion: QuerySignalResult['policyVersion'] | null;
+  signalBand: QuerySignalResult['band'] | IntrinsicSignalResult['band'] | null;
+  signalPolicyVersion:
+    QuerySignalResult['policyVersion'] | IntrinsicSignalResult['policyVersion'] | null;
+  evidenceConfidence: number | null;
+  trend: IntrinsicSignalResult['trend'] | null;
   signalExplanation: string | null;
 }
 
@@ -175,6 +183,8 @@ function assessRow(
       displayState: null,
       signalBand: null,
       signalPolicyVersion: null,
+      evidenceConfidence: null,
+      trend: null,
       signalExplanation: null,
     };
   }
@@ -198,6 +208,8 @@ function assessRow(
       displayState: scored.displayState as QuerySignalResult['displayState'],
       signalBand: scored.signalBand as QuerySignalResult['band'],
       signalPolicyVersion: scored.signalPolicyVersion as QuerySignalResult['policyVersion'],
+      evidenceConfidence: Number(scored.evidenceCoverage),
+      trend: null,
       signalExplanation:
         'Preliminary estimate from query relevance and attributed source metadata. It is not reviewed knowledge.',
     };
@@ -209,7 +221,7 @@ function assessRow(
     searchText: row.searchText,
   });
   if (relevance.ordinal === 'no_match') return null;
-  const signal =
+  const legacyValue =
     cachedImplementationSignal(row, relevance.value) ??
     calculateQuerySignalV2({
       relevanceOrdinal: relevance.ordinal,
@@ -218,21 +230,57 @@ function assessRow(
       kindProfile: querySignalKindProfile(row.kind),
       provisional: row.state !== 'reviewed',
     });
+  const values = valueProfile(row.valueProfile);
+  const profile = intrinsicSignalProfile(row.kind);
+  const applicable = values.filter((dimension) => dimension.applicability === 'applicable');
+  const mean = (selector: (dimension: QueryValueInput) => number) =>
+    applicable.length
+      ? applicable.reduce((sum, dimension) => sum + selector(dimension), 0) / applicable.length
+      : 0;
+  const observedAt = new Date(row.observedAt);
+  const windowEnd = Number.isFinite(observedAt.valueOf()) ? observedAt : new Date(0);
+  const windowStart = new Date(windowEnd.getTime() - 90 * 24 * 60 * 60 * 1000);
+  const trend = calculateTrend([], {
+    windowStart: windowStart.toISOString(),
+    windowEnd: windowEnd.toISOString(),
+    now: windowEnd.toISOString(),
+  });
+  const intrinsic = calculateIntrinsicSignalV3({
+    profile,
+    dimensions: intrinsicInputsFromLegacyValueProfile(values, {
+      profile,
+      observedAt: windowEnd.toISOString(),
+    }),
+    evidenceConfidence: {
+      directness: mean((dimension) => dimension.confidence),
+      independence: row.sources.length >= 2 ? 0.8 : 0.35,
+      applicability: mean((dimension) => dimension.coverage),
+      freshness: row.state === 'stale' ? 0.2 : 0.8,
+      coverage: mean((dimension) => dimension.coverage),
+      contradiction: applicable.some((dimension) => dimension.state === 'contradicted') ? 1 : 0,
+      sourceGroupIds: row.sources,
+      evidenceIds: [...new Set(values.flatMap((dimension) => dimension.evidenceIds))],
+    },
+    trend,
+    provisional: row.state !== 'reviewed',
+  });
   return {
     ...row,
     matchedTerms: relevance.matchedTerms,
     relevanceOrdinal: relevance.ordinal,
     relevanceValue: relevance.value,
-    signalDisplay: signal.signalDisplay,
-    signalUnrounded: signal.signalUnrounded,
-    evidenceCoverage: signal.evidenceCoverage,
-    displayState: signal.displayState,
-    signalBand: signal.band,
-    signalPolicyVersion: signal.policyVersion,
+    signalDisplay: intrinsic.display,
+    signalUnrounded: intrinsic.conservative,
+    evidenceCoverage: legacyValue.evidenceCoverage,
+    displayState: intrinsic.displayState,
+    signalBand: intrinsic.band,
+    signalPolicyVersion: intrinsic.policyVersion,
+    evidenceConfidence: intrinsic.evidenceConfidence.score,
+    trend: intrinsic.trend,
     signalExplanation:
       row.state === 'reviewed'
-        ? 'Query-specific estimate from the current indexed value profile and bound evidence.'
-        : `Query-specific estimate from a ${row.state} index record; review state qualifies confidence.`,
+        ? 'Query-independent intrinsic estimate from the current type-aware value profile and bound evidence.'
+        : `Query-independent intrinsic estimate from a ${row.state} index record; review state qualifies confidence.`,
   };
 }
 
@@ -263,11 +311,7 @@ async function loadCorpus(pool: Pool, workspaceId: string): Promise<CorpusRow[]>
             kp.aliases, kp.capability_keys AS capabilities, kp.search_text AS "searchText",
             COALESCE(source_data.sources, ARRAY['local_catalog']::text[]) AS sources,
             source_data."canonicalUri", COALESCE(source_data."observedAt", kp.indexed_at)::text AS "observedAt",
-            CASE WHEN kp.query_value_conservative IS NULL
-                       OR kp.query_evidence_coverage IS NULL
-                       OR kp.kind_profile IN ('model', 'practice', 'technique', 'concept',
-                                              'convention', 'protocol', 'standard')
-                 THEN kp.value_profile ELSE NULL::jsonb END AS "valueProfile",
+            kp.value_profile AS "valueProfile",
             kp.query_value_conservative::float8 AS "cachedValueConservative",
             kp.query_evidence_coverage::float8 AS "cachedEvidenceCoverage",
             NULL::jsonb AS "sourcePayload"

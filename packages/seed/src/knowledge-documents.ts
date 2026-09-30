@@ -1,6 +1,10 @@
 import type { PoolClient } from 'pg';
 import { hashCanonical, stableUuid } from '../../domain/src/index.js';
-import { querySignalPolicyV2, type QueryValueInput } from '../../scoring/src/index.js';
+import {
+  intrinsicSignalPolicyV3,
+  querySignalPolicyV2,
+  type QueryValueInput,
+} from '../../scoring/src/index.js';
 
 const namespace = 'maestro-ai:discovery-knowledge-v1';
 const observedAt = '2026-09-30T12:00:00.000Z';
@@ -209,6 +213,18 @@ export async function importKnowledgeDocuments(client: PoolClient): Promise<void
       id('policy', querySignalPolicyV2.version),
       querySignalPolicyV2.version,
       json(querySignalPolicyV2),
+      observedAt,
+    ],
+  );
+  await client.query(
+    `INSERT INTO catalog.score_policies
+       (id, policy_key, version, policy_document, code_revision, created_at)
+     VALUES ($1, 'intrinsic-signal', $2, $3, 'signals-phase-08', $4)
+     ON CONFLICT (policy_key, version) DO NOTHING`,
+    [
+      id('policy', intrinsicSignalPolicyV3.version),
+      intrinsicSignalPolicyV3.version,
+      json(intrinsicSignalPolicyV3),
       observedAt,
     ],
   );

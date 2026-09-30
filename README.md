@@ -109,7 +109,8 @@ origin. OpenAPI is available one layer down at `/api/documentation`.
   rate limits, safe problem details, structured redaction, and OTel-compatible spans
 - `apps/worker`: Graphile Worker intake adapter and transactional-outbox dispatcher
 - `packages/domain`: pure identity, URL, query/bundle, gate, and decision-receipt contracts
-- `packages/scoring`: pure versioned consideration, query-signal, project-fit, and verification policies
+- `packages/scoring`: pure versioned intrinsic Signal, Match-adjacent confidence/trend,
+  historical query-signal replay, project-fit, and verification policies
 - `packages/db`: Drizzle declarations, checked migrations, and explicit repositories
 - `packages/seed`: offline reviewed manifest, audit, and idempotent importer
 

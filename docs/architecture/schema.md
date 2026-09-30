@@ -66,6 +66,15 @@ The default Phase 08 policy is normalized weighted fusion; reciprocal-rank fusio
 as the comparison baseline over the identical frozen pool. Neither policy changes intrinsic Signal
 or grants discovery, installation, or execution authority.
 
+Migration `0019` adds immutable `intrinsic_signal_runs` for the query-independent
+`intrinsic-signal-v3` policy. Each receipt binds one canonical entity revision to type-aware,
+cohort-normalized inputs, evidence-confidence detail, an explicit trend window, and the exact
+policy/input hash. New query result items reference that public catalog receipt while the historical
+`query_signal_runs` and embedded document score fields remain intact for v1/v2 replay. Match stays
+in query-scoped retrieval lineage with a score, band, reasons, and concept path; it is never folded
+into intrinsic Signal. Pre-`0019` query results retain their original policy and nullable intrinsic
+reference.
+
 The readiness gate checks the ordered repository migrations; catalog cardinality remains diagnostic
 data rather than readiness.
 

@@ -61,6 +61,7 @@ describe('reviewed PostgreSQL contract', () => {
       '0016_faceted_knowledge.sql',
       '0017_research_planner.sql',
       '0018_retrieval_fabric.sql',
+      '0019_intrinsic_signal.sql',
     ]);
     expect(migrations.rows.every((row) => /^[a-f0-9]{64}$/.test(row.sha256))).toBe(true);
   });
@@ -171,7 +172,7 @@ describe('reviewed PostgreSQL contract', () => {
   });
 
   it('keeps reviewed SQL and Drizzle table/column declarations aligned', async () => {
-    expect(await checkSchemaDefinitions(pool)).toEqual({ checkedTables: 90, errors: [] });
+    expect(await checkSchemaDefinitions(pool)).toEqual({ checkedTables: 91, errors: [] });
   });
 
   it('projects every historical provider and document into the faceted knowledge model', async () => {
@@ -295,6 +296,9 @@ describe('reviewed PostgreSQL contract', () => {
       hits: number;
       fusions: number;
       compared: number;
+      intrinsic: number;
+      bandedMatches: number;
+      signalPolicy: string;
       poolHash: string;
     }>(
       `SELECT
@@ -310,6 +314,18 @@ describe('reviewed PostgreSQL contract', () => {
              AND reciprocal_rank > 0 AND normalized_weighted_rank > 0
              AND reciprocal_rerank_position > 0
              AND normalized_weighted_rerank_position > 0) AS compared,
+         (SELECT count(*)::int FROM catalog.intrinsic_signal_runs signal
+           WHERE signal.id IN (
+             SELECT intrinsic_signal_run_id FROM workspace.query_result_items
+               WHERE result_set_id = $1
+             UNION
+             SELECT intrinsic_signal_run_id FROM workspace.query_document_results
+               WHERE result_set_id = $1
+           )) AS intrinsic,
+         (SELECT count(*)::int FROM workspace.query_candidate_fusions
+           WHERE result_set_id = $1 AND match_band IS NOT NULL) AS "bandedMatches",
+         (SELECT signal_policy_version FROM workspace.query_result_sets WHERE id = $1)
+           AS "signalPolicy",
          (SELECT candidate_pool_hash FROM workspace.query_result_sets WHERE id = $1) AS "poolHash"`,
       [session.resultSetId],
     );
@@ -318,11 +334,24 @@ describe('reviewed PostgreSQL contract', () => {
       hits: expect.any(Number),
       fusions: expect.any(Number),
       compared: expect.any(Number),
+      intrinsic: expect.any(Number),
+      bandedMatches: expect.any(Number),
+      signalPolicy: 'intrinsic-signal-v3',
       poolHash: session.retrieval.candidatePoolHash,
     });
     expect(lineage.rows[0]!.hits).toBeGreaterThan(0);
     expect(lineage.rows[0]!.fusions).toBeGreaterThan(0);
     expect(lineage.rows[0]!.compared).toBe(lineage.rows[0]!.fusions);
+    expect(lineage.rows[0]!.intrinsic).toBeGreaterThan(0);
+    expect(lineage.rows[0]!.bandedMatches).toBe(lineage.rows[0]!.fusions);
+    const intrinsic = await pool.query<{ id: string }>(
+      `SELECT id FROM catalog.intrinsic_signal_runs ORDER BY created_at DESC LIMIT 1`,
+    );
+    await expect(
+      pool.query(`UPDATE catalog.intrinsic_signal_runs SET band = 'rewritten' WHERE id = $1`, [
+        intrinsic.rows[0]!.id,
+      ]),
+    ).rejects.toMatchObject({ code: '55000' });
   });
 
   it('keeps first-class knowledge documents and their query results immutable', async () => {
