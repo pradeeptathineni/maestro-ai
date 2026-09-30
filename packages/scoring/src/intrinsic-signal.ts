@@ -89,6 +89,15 @@ export interface IntrinsicSignalResult {
   inputEvidenceIds: string[];
 }
 
+export interface CompatibilityIntrinsicSignalInput {
+  kind: string;
+  valueProfile: QueryValueInput[];
+  observedAt: string;
+  evidenceSourceGroups: string[];
+  freshness: number;
+  provisional: boolean;
+}
+
 const dimensions: IntrinsicDimensionKey[] = [
   'reach',
   'authority',
@@ -449,5 +458,47 @@ export function intrinsicInputsFromLegacyValueProfile(
       missing: source.missing,
       evidenceIds: source.evidenceIds,
     };
+  });
+}
+
+export function calculateCompatibilityIntrinsicSignal(
+  input: CompatibilityIntrinsicSignalInput,
+): IntrinsicSignalResult {
+  const profile = intrinsicSignalProfile(input.kind);
+  const applicable = input.valueProfile.filter(
+    (dimension) => dimension.applicability === 'applicable',
+  );
+  const mean = (selector: (dimension: QueryValueInput) => number): number =>
+    applicable.length
+      ? applicable.reduce((sum, dimension) => sum + selector(dimension), 0) / applicable.length
+      : 0;
+  const windowEnd = new Date(input.observedAt);
+  if (!Number.isFinite(windowEnd.valueOf())) {
+    throw new Error('Compatibility Signal observedAt must be a valid timestamp.');
+  }
+  const windowStart = new Date(windowEnd.getTime() - 90 * 24 * 60 * 60 * 1000);
+  const trend = calculateTrend([], {
+    windowStart: windowStart.toISOString(),
+    windowEnd: windowEnd.toISOString(),
+    now: windowEnd.toISOString(),
+  });
+  return calculateIntrinsicSignalV3({
+    profile,
+    dimensions: intrinsicInputsFromLegacyValueProfile(input.valueProfile, {
+      profile,
+      observedAt: windowEnd.toISOString(),
+    }),
+    evidenceConfidence: {
+      directness: mean((dimension) => dimension.confidence),
+      independence: input.evidenceSourceGroups.length >= 2 ? 0.8 : 0.35,
+      applicability: mean((dimension) => dimension.coverage),
+      freshness: input.freshness,
+      coverage: mean((dimension) => dimension.coverage),
+      contradiction: applicable.some((dimension) => dimension.state === 'contradicted') ? 1 : 0,
+      sourceGroupIds: input.evidenceSourceGroups,
+      evidenceIds: [...new Set(input.valueProfile.flatMap((dimension) => dimension.evidenceIds))],
+    },
+    trend,
+    provisional: input.provisional,
   });
 }

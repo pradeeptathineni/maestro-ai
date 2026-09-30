@@ -30,12 +30,9 @@ import {
   type RetrievalRanking,
 } from '../../domain/src/index.js';
 import {
-  calculateIntrinsicSignalV3,
-  calculateTrend,
+  calculateCompatibilityIntrinsicSignal,
   calculateQuerySignalV2,
-  intrinsicInputsFromLegacyValueProfile,
   intrinsicSignalPolicyV3,
-  intrinsicSignalProfile,
   querySignalKindProfile,
   querySignalPolicyV2,
   type IntrinsicSignalResult,
@@ -136,6 +133,9 @@ interface ResultItemRow extends JsonRow {
   displayState: string;
   capabilityGroup: string;
   subjectType: 'implementation' | 'document';
+  entityClass: string;
+  matchScore: number | null;
+  matchBand: 'Direct' | 'Strong' | 'Related' | 'Peripheral' | null;
 }
 
 function json(value: unknown): string {
@@ -187,42 +187,12 @@ function intrinsicFromCompatibilityProfile(input: {
   observedAt: Date;
   evidenceSourceGroups: string[];
 }): IntrinsicSignalResult {
-  const profile = intrinsicSignalProfile(input.kind);
-  const evidenceIds = [
-    ...new Set(input.valueProfile.flatMap((dimension) => dimension.evidenceIds)),
-  ].sort();
-  const applicable = input.valueProfile.filter(
-    (dimension) => dimension.applicability === 'applicable',
-  );
-  const mean = (selector: (dimension: QueryValueInput) => number): number =>
-    applicable.length
-      ? applicable.reduce((sum, dimension) => sum + selector(dimension), 0) / applicable.length
-      : 0;
-  const observedAt = input.observedAt.toISOString();
-  const windowEnd = input.observedAt;
-  const windowStart = new Date(windowEnd.getTime() - 90 * 24 * 60 * 60 * 1000);
-  const trend = calculateTrend([], {
-    windowStart: windowStart.toISOString(),
-    windowEnd: windowEnd.toISOString(),
-    now: windowEnd.toISOString(),
-  });
-  return calculateIntrinsicSignalV3({
-    profile,
-    dimensions: intrinsicInputsFromLegacyValueProfile(input.valueProfile, {
-      profile,
-      observedAt,
-    }),
-    evidenceConfidence: {
-      directness: mean((dimension) => dimension.confidence),
-      independence: input.evidenceSourceGroups.length >= 2 ? 0.8 : 0.35,
-      applicability: mean((dimension) => dimension.coverage),
-      freshness: ['stale', 'withdrawn'].includes(input.publicationState) ? 0.2 : 0.8,
-      coverage: mean((dimension) => dimension.coverage),
-      contradiction: applicable.some((dimension) => dimension.state === 'contradicted') ? 1 : 0,
-      sourceGroupIds: input.evidenceSourceGroups,
-      evidenceIds,
-    },
-    trend,
+  return calculateCompatibilityIntrinsicSignal({
+    kind: input.kind,
+    valueProfile: input.valueProfile,
+    observedAt: input.observedAt.toISOString(),
+    evidenceSourceGroups: input.evidenceSourceGroups,
+    freshness: ['stale', 'withdrawn'].includes(input.publicationState) ? 0.2 : 0.8,
     provisional: ['lead', 'proposed'].includes(input.publicationState),
   });
 }
@@ -1705,7 +1675,9 @@ function cursorView(query: ResultPageQuery): Record<string, unknown> {
   return {
     sort: query.sort ?? 'recommended',
     kind: query.kind ?? null,
+    entityClass: query.entityClass ?? null,
     capability: query.capability ?? null,
+    matchBand: query.matchBand ?? null,
     evidenceState: query.evidenceState ?? null,
   };
 }
@@ -1751,6 +1723,8 @@ function sortRows(rows: ResultItemRow[], sort: ResultPageQuery['sort']): ResultI
   switch (sort) {
     case 'recommended':
       return copy.sort((left, right) => left.position - right.position);
+    case 'match':
+      return byNumber((row) => row.matchScore ?? row.relevanceValue);
     case 'relevance':
       return byNumber((row) => row.relevanceValue);
     case 'evidence':
@@ -1800,8 +1774,12 @@ async function resultRows(
   const providerFilters = [
     'qri.result_set_id = $1',
     'qri.workspace_id = $2',
-    query.kind ? `p.kind = $${providerValues.push(query.kind)}` : null,
+    query.kind ? `pdr.kind = $${providerValues.push(query.kind)}` : null,
+    query.entityClass
+      ? `replace(COALESCE(entity_class.stable_key, fallback_entity_class.stable_key), 'entity-class:', '') = $${providerValues.push(query.entityClass)}`
+      : null,
     query.capability ? `$${providerValues.push(query.capability)} = ANY(kp.capability_keys)` : null,
+    query.matchBand ? `qcf.match_band = $${providerValues.push(query.matchBand)}` : null,
     query.evidenceState
       ? `COALESCE(isr.display_state, qsr.display_state) = $${providerValues.push(query.evidenceState)}`
       : null,
@@ -1809,9 +1787,11 @@ async function resultRows(
   const providerRows = await pool.query<ResultItemRow>(
     `SELECT qri.id, qri.position, qri.provider_id AS "providerId",
             NULL::uuid AS "documentId", 'implementation'::text AS "subjectType",
+            replace(COALESCE(entity_class.stable_key, fallback_entity_class.stable_key),
+                    'entity-class:', '') AS "entityClass",
             qri.provider_revision AS "providerRevision", qri.capability_group AS "capabilityGroup",
             qri.matched_fields AS "matchedFields", qri.explanation, qri.caveats,
-            p.canonical_name AS name, p.kind, p.description,
+            pdr.canonical_name AS name, pdr.kind, pdr.description,
             kp.publication_state AS "publicationState", kp.aliases,
             kp.capability_keys AS capabilities,
             qsr.relevance_ordinal AS "relevanceOrdinal",
@@ -1838,9 +1818,18 @@ async function resultRows(
      FROM workspace.query_result_items qri
      JOIN workspace.query_signal_runs qsr ON qsr.id = qri.query_signal_run_id
      LEFT JOIN catalog.intrinsic_signal_runs isr ON isr.id = qri.intrinsic_signal_run_id
-     JOIN catalog.providers p ON p.id = qri.provider_id
+     JOIN catalog.provider_display_revisions pdr
+       ON pdr.id = qsr.provider_display_revision_id
      JOIN catalog.knowledge_projections kp
        ON kp.provider_id = qri.provider_id AND kp.provider_revision = qri.provider_revision
+     LEFT JOIN catalog.knowledge_entities entity ON entity.provider_id = qri.provider_id
+     LEFT JOIN catalog.knowledge_entity_revisions entity_revision
+       ON entity_revision.entity_id = entity.id
+      AND entity_revision.revision = qri.provider_revision
+     LEFT JOIN catalog.concepts entity_class
+       ON entity_class.id = entity_revision.entity_class_concept_id
+     JOIN catalog.concepts fallback_entity_class
+       ON fallback_entity_class.id = catalog.entity_class_for_provider_kind(pdr.kind)
      LEFT JOIN workspace.query_candidate_fusions qcf
        ON qcf.result_set_id = qri.result_set_id AND qcf.provider_id = qri.provider_id
      WHERE ${providerFilters.join(' AND ')}`,
@@ -1851,7 +1840,9 @@ async function resultRows(
     'qdr.result_set_id = $1',
     'qdr.workspace_id = $2',
     query.kind ? `kd.document_kind = $${documentValues.push(query.kind)}` : null,
+    query.entityClass ? `$${documentValues.push(query.entityClass)} = 'document'` : null,
     query.capability ? `$${documentValues.push(query.capability)} = ANY(kd.mechanism_keys)` : null,
+    query.matchBand ? `qcf.match_band = $${documentValues.push(query.matchBand)}` : null,
     query.evidenceState
       ? `COALESCE(isr.display_state, qdr.display_state) = $${documentValues.push(query.evidenceState)}`
       : null,
@@ -1859,6 +1850,7 @@ async function resultRows(
   const documentRows = await pool.query<ResultItemRow>(
     `SELECT qdr.id, qdr.rank_position AS position, NULL::uuid AS "providerId",
             qdr.document_id AS "documentId", 'document'::text AS "subjectType",
+            'document'::text AS "entityClass",
             NULL::integer AS "providerRevision",
             COALESCE(kd.mechanism_keys[1], 'Research and learning') AS "capabilityGroup",
             qdr.matched_fields AS "matchedFields", qdr.explanation, qdr.caveats,
@@ -1950,6 +1942,8 @@ export async function getExplorerItem(
   const item = await pool.query<JsonRow>(
     `SELECT qri.id, qri.result_set_id AS "resultSetId", qri.provider_id AS "providerId",
             'implementation'::text AS "subjectType",
+            replace(COALESCE(entity_class.stable_key, fallback_entity_class.stable_key),
+                    'entity-class:', '') AS "entityClass",
             qri.provider_revision AS "providerRevision", qri.capability_group AS "capabilityGroup",
             qri.matched_fields AS "matchedFields", qri.explanation, qri.caveats,
             pdr.canonical_name AS name, pdr.kind, pdr.description,
@@ -1978,13 +1972,30 @@ export async function getExplorerItem(
             qcf.rerank_score::float8 AS "rerankScore",
             qcf.reciprocal_contributions AS "reciprocalContributions",
             qcf.normalized_weighted_contributions AS "normalizedWeightedContributions",
-            qcf.entity_resolution AS "entityResolution"
+            qcf.entity_resolution AS "entityResolution",
+            COALESCE((
+              SELECT jsonb_agg(jsonb_build_object(
+                'id', concept.id,
+                'facetKey', concept.facet_key,
+                'label', concept.preferred_label
+              ) ORDER BY concept.facet_key, concept.preferred_label, concept.id)
+              FROM catalog.concepts concept
+              WHERE concept.id = ANY(qcf.matched_concept_ids)
+            ), '[]'::jsonb) AS "matchedConcepts"
      FROM workspace.query_result_items qri
      JOIN workspace.query_signal_runs qsr ON qsr.id = qri.query_signal_run_id
      LEFT JOIN catalog.intrinsic_signal_runs isr ON isr.id = qri.intrinsic_signal_run_id
      JOIN catalog.provider_display_revisions pdr ON pdr.id = qsr.provider_display_revision_id
      JOIN catalog.knowledge_projections kp
        ON kp.provider_id = qri.provider_id AND kp.provider_revision = qri.provider_revision
+     LEFT JOIN catalog.knowledge_entities entity ON entity.provider_id = qri.provider_id
+     LEFT JOIN catalog.knowledge_entity_revisions entity_revision
+       ON entity_revision.entity_id = entity.id
+      AND entity_revision.revision = qri.provider_revision
+     LEFT JOIN catalog.concepts entity_class
+       ON entity_class.id = entity_revision.entity_class_concept_id
+     JOIN catalog.concepts fallback_entity_class
+       ON fallback_entity_class.id = catalog.entity_class_for_provider_kind(pdr.kind)
      LEFT JOIN workspace.query_candidate_fusions qcf
        ON qcf.result_set_id = qri.result_set_id AND qcf.provider_id = qri.provider_id
      WHERE qri.id = $1 AND qri.result_set_id = $2 AND qri.workspace_id = $3`,
@@ -1993,6 +2004,7 @@ export async function getExplorerItem(
   if (!item.rowCount) {
     const document = await pool.query<JsonRow>(
       `SELECT qdr.id, qdr.result_set_id AS "resultSetId", 'document'::text AS "subjectType",
+              'document'::text AS "entityClass",
               NULL::uuid AS "providerId", qdr.document_id AS "documentId",
               kd.title AS name, kd.document_kind AS kind, kd.summary AS description,
               kd.publication_state AS "publicationState", kd.mechanism_keys AS capabilities,
@@ -2025,6 +2037,15 @@ export async function getExplorerItem(
               qcf.reciprocal_contributions AS "reciprocalContributions",
               qcf.normalized_weighted_contributions AS "normalizedWeightedContributions",
               qcf.entity_resolution AS "entityResolution",
+              COALESCE((
+                SELECT jsonb_agg(jsonb_build_object(
+                  'id', concept.id,
+                  'facetKey', concept.facet_key,
+                  'label', concept.preferred_label
+                ) ORDER BY concept.facet_key, concept.preferred_label, concept.id)
+                FROM catalog.concepts concept
+                WHERE concept.id = ANY(qcf.matched_concept_ids)
+              ), '[]'::jsonb) AS "matchedConcepts",
               so.id AS "sourceObservationId", so.observed_at AS "observedAt",
               so.retrieval_method AS "retrievalMethod", so.adapter_version AS "adapterVersion",
               so.handling_status AS "handlingStatus", s.title AS "sourceTitle",
@@ -2049,8 +2070,13 @@ export async function getExplorerItem(
        LEFT JOIN catalog.providers p ON p.id = kds.provider_id
        LEFT JOIN catalog.capability_definitions cd ON cd.id = kds.capability_definition_id
        WHERE kds.document_id = $1
+         AND kds.created_at <= (
+           SELECT result_set.created_at
+           FROM workspace.query_result_sets result_set
+           WHERE result_set.id = $2 AND result_set.workspace_id = $3
+         )
        ORDER BY kds.relation_type, COALESCE(p.canonical_name, cd.name)`,
-      [document.rows[0]!.documentId],
+      [document.rows[0]!.documentId, resultSetId, workspaceId],
     );
     const sourceEvidence = {
       id: document.rows[0]!.sourceObservationId,
@@ -2097,9 +2123,13 @@ export async function getExplorerItem(
      JOIN catalog.providers target ON target.id = pr.object_provider_id
      LEFT JOIN catalog.source_observations so ON so.id = pr.source_observation_id
      LEFT JOIN catalog.sources s ON s.id = so.source_id
-     WHERE pr.subject_provider_id = $1 AND (pr.valid_to IS NULL OR pr.valid_to > now())
+     JOIN workspace.query_result_sets result_set
+       ON result_set.id = $2 AND result_set.workspace_id = $3
+     WHERE pr.subject_provider_id = $1
+       AND pr.valid_from <= result_set.created_at
+       AND (pr.valid_to IS NULL OR pr.valid_to > result_set.created_at)
      ORDER BY pr.relation_type, target.canonical_name`,
-    [item.rows[0]!.providerId],
+    [item.rows[0]!.providerId, resultSetId, workspaceId],
   );
   return { ...item.rows[0], evidence: evidence.rows, relations: relations.rows };
 }
@@ -2113,6 +2143,12 @@ export async function getExplorerGraph(
   const page = await resultRows(pool, workspaceId, resultSetId, query);
   const limit = Math.min(Math.max(query.limit ?? 40, 1), 150);
   const visible = page.rows.slice(0, limit);
+  const providerNodeById = new Map(
+    visible.flatMap((row) => (row.providerId ? [[row.providerId, row] as const] : [])),
+  );
+  const documentNodeById = new Map(
+    visible.flatMap((row) => (row.documentId ? [[row.documentId, row] as const] : [])),
+  );
   const groupNames = [...new Set(visible.map((row) => row.capabilityGroup))].sort();
   const groupNodes = groupNames.map((group) => ({
     id: `group:${hashCanonical(group).slice(0, 16)}`,
@@ -2134,8 +2170,8 @@ export async function getExplorerGraph(
     displayState: row.displayState,
   }));
   const groupId = new Map(groupNodes.map((node) => [node.group, node.id]));
-  const edges = visible.map((row) => ({
-    id: `${row.subjectType === 'document' ? 'about' : 'provides'}:${row.id}`,
+  const groupingEdges = visible.map((row) => ({
+    id: `grouping:${row.subjectType === 'document' ? 'about' : 'provides'}:${row.id}`,
     source: row.id,
     target: groupId.get(row.capabilityGroup),
     type: row.subjectType === 'document' ? 'about' : 'provides',
@@ -2145,6 +2181,151 @@ export async function getExplorerGraph(
         : 'query-result capability grouping',
     status: row.publicationState === 'reviewed' ? 'source_supported' : 'provisional',
   }));
+  const providerRelations = providerNodeById.size
+    ? await pool.query<{
+        subjectProviderId: string;
+        objectProviderId: string;
+        type: string;
+        scope: string;
+        status: string;
+      }>(
+        `SELECT relation.subject_provider_id::text AS "subjectProviderId",
+                relation.object_provider_id::text AS "objectProviderId",
+                relation.relation_type AS type, relation.applicability_scope AS scope,
+                CASE WHEN relation.source_observation_id IS NULL
+                  THEN 'provisional' ELSE 'source_supported' END AS status
+         FROM catalog.provider_relations relation
+         WHERE relation.subject_provider_id = ANY($1::uuid[])
+           AND relation.object_provider_id = ANY($1::uuid[])
+           AND relation.valid_from <= $2
+           AND (relation.valid_to IS NULL OR relation.valid_to > $2)
+         ORDER BY relation.relation_type, relation.subject_provider_id,
+                  relation.object_provider_id, relation.valid_from`,
+        [[...providerNodeById.keys()], page.metadata.createdAt],
+      )
+    : { rows: [] };
+  const documentRelations =
+    documentNodeById.size && providerNodeById.size
+      ? await pool.query<{
+          documentId: string;
+          providerId: string;
+          type: string;
+          scope: string;
+        }>(
+          `SELECT subject.document_id::text AS "documentId",
+                subject.provider_id::text AS "providerId", subject.relation_type AS type,
+                subject.rationale AS scope
+         FROM catalog.knowledge_document_subjects subject
+         WHERE subject.document_id = ANY($1::uuid[])
+           AND subject.provider_id = ANY($2::uuid[])
+           AND subject.created_at <= $3
+         ORDER BY subject.relation_type, subject.document_id, subject.provider_id`,
+          [[...documentNodeById.keys()], [...providerNodeById.keys()], page.metadata.createdAt],
+        )
+      : { rows: [] };
+  const documentSubjects = documentNodeById.size
+    ? await pool.query<{
+        documentId: string;
+        capabilityKey: string;
+        targetName: string;
+        type: string;
+        scope: string;
+      }>(
+        `SELECT subject.document_id::text AS "documentId",
+                capability.stable_key AS "capabilityKey", capability.name AS "targetName",
+                subject.relation_type AS type, subject.rationale AS scope
+         FROM catalog.knowledge_document_subjects subject
+         JOIN catalog.capability_definitions capability
+           ON capability.id = subject.capability_definition_id
+         WHERE subject.document_id = ANY($1::uuid[])
+           AND subject.created_at <= $2
+         ORDER BY subject.relation_type, subject.document_id, capability.stable_key`,
+        [[...documentNodeById.keys()], page.metadata.createdAt],
+      )
+    : { rows: [] };
+  const relationshipEdges = [
+    ...providerRelations.rows.flatMap((relation) => {
+      const source = providerNodeById.get(relation.subjectProviderId);
+      const target = providerNodeById.get(relation.objectProviderId);
+      if (!source || !target) return [];
+      return [
+        {
+          id: `relation:${hashCanonical(relation).slice(0, 20)}`,
+          source: source.id,
+          target: target.id,
+          type: relation.type,
+          scope: relation.scope,
+          status: relation.status,
+        },
+      ];
+    }),
+    ...documentRelations.rows.flatMap((relation) => {
+      const source = documentNodeById.get(relation.documentId);
+      const target = providerNodeById.get(relation.providerId);
+      if (!source || !target) return [];
+      return [
+        {
+          id: `document-relation:${hashCanonical(relation).slice(0, 20)}`,
+          source: source.id,
+          target: target.id,
+          type: relation.type,
+          scope: relation.scope,
+          status: 'source_supported',
+        },
+      ];
+    }),
+    ...documentSubjects.rows.flatMap((relation) => {
+      const source = documentNodeById.get(relation.documentId);
+      const target = groupId.get(relation.capabilityKey);
+      if (!source || !target) return [];
+      return [
+        {
+          id: `document-subject:${hashCanonical(relation).slice(0, 20)}`,
+          source: source.id,
+          target,
+          type: relation.type,
+          scope: relation.scope,
+          status: 'source_supported',
+        },
+      ];
+    }),
+  ];
+  const relationshipsByItem = new Map<
+    string,
+    Array<{ type: string; scope: string; status: string; targetName: string }>
+  >();
+  const visibleById = new Map(visible.map((row) => [row.id, row]));
+  for (const subject of documentSubjects.rows) {
+    const source = documentNodeById.get(subject.documentId);
+    if (!source) continue;
+    relationshipsByItem.set(source.id, [
+      ...(relationshipsByItem.get(source.id) ?? []),
+      {
+        type: subject.type,
+        scope: subject.scope,
+        status: 'source_supported',
+        targetName: subject.targetName,
+      },
+    ]);
+  }
+  for (const edge of relationshipEdges) {
+    const source = visibleById.get(edge.source);
+    const target = visibleById.get(edge.target);
+    if (!source || !target) continue;
+    relationshipsByItem.set(source.id, [
+      ...(relationshipsByItem.get(source.id) ?? []),
+      { type: edge.type, scope: edge.scope, status: edge.status, targetName: target.name },
+    ]);
+    relationshipsByItem.set(target.id, [
+      ...(relationshipsByItem.get(target.id) ?? []),
+      {
+        type: `inverse_${edge.type}`,
+        scope: edge.scope,
+        status: edge.status,
+        targetName: source.name,
+      },
+    ]);
+  }
   return {
     resultSetId,
     resultSetRevision: page.metadata.revision,
@@ -2152,13 +2333,17 @@ export async function getExplorerGraph(
     visibleCount: visible.length,
     hiddenCount: Math.max(0, page.rows.length - visible.length),
     nodes: [...groupNodes, ...providerNodes],
-    edges,
+    edges: [...groupingEdges, ...relationshipEdges],
     accessibleItems: visible.map((row) => ({
       id: row.id,
       name: row.name,
       kind: row.kind,
       group: row.capabilityGroup,
       explanation: row.explanation,
+      matchBand: row.matchBand,
+      signalDisplay: row.signalDisplay,
+      evidenceConfidence: row.evidenceConfidence,
+      trendState: row.trendState,
       relation: {
         type: row.subjectType === 'document' ? 'about' : 'provides',
         scope:
@@ -2167,6 +2352,7 @@ export async function getExplorerGraph(
             : 'query-result capability grouping',
         status: row.publicationState === 'reviewed' ? 'source_supported' : 'provisional',
       },
+      relationships: relationshipsByItem.get(row.id) ?? [],
     })),
   };
 }
@@ -2185,8 +2371,12 @@ export async function compareExplorerItems(
     items,
     differenceFields: [
       'relevanceOrdinal',
+      'matchBand',
       'displayState',
       'signalDisplay',
+      'evidenceConfidence',
+      'trendState',
+      'entityClass',
       'evidenceCoverage',
       'kind',
       'capabilities',

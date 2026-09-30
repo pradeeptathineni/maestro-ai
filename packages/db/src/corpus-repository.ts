@@ -7,11 +7,8 @@ import {
   type QueryInterpretation,
 } from '../../domain/src/index.js';
 import {
-  calculateIntrinsicSignalV3,
-  calculateTrend,
+  calculateCompatibilityIntrinsicSignal,
   calculateQuerySignalV2,
-  intrinsicInputsFromLegacyValueProfile,
-  intrinsicSignalProfile,
   querySignalKindProfile,
   querySignalPolicyV2,
   type IntrinsicSignalResult,
@@ -58,6 +55,7 @@ interface ScoredCorpusRow extends CorpusRow {
   signalPolicyVersion:
     QuerySignalResult['policyVersion'] | IntrinsicSignalResult['policyVersion'] | null;
   evidenceConfidence: number | null;
+  evidenceConfidenceDetail: IntrinsicSignalResult['evidenceConfidence'] | null;
   trend: IntrinsicSignalResult['trend'] | null;
   signalExplanation: string | null;
 }
@@ -166,26 +164,46 @@ function sourceFacets(rows: ScoredCorpusRow[]): Array<{ value: string; count: nu
     .sort((left, right) => right.count - left.count || left.value.localeCompare(right.value));
 }
 
+function intrinsicCorpusSignal(row: CorpusRow): IntrinsicSignalResult {
+  const values = valueProfile(row.valueProfile);
+  const observedAt = new Date(row.observedAt);
+  const windowEnd = Number.isFinite(observedAt.valueOf()) ? observedAt : new Date(0);
+  return calculateCompatibilityIntrinsicSignal({
+    kind: row.kind,
+    valueProfile: values,
+    observedAt: windowEnd.toISOString(),
+    evidenceSourceGroups: row.sources,
+    freshness: row.state === 'stale' ? 0.2 : 0.8,
+    provisional: row.state !== 'reviewed',
+  });
+}
+
 function assessRow(
   row: CorpusRow,
   interpretation: QueryInterpretation | null,
   assessRelevance: ReturnType<typeof compileLexicalRelevance> | null,
 ): ScoredCorpusRow | null {
   if (!interpretation) {
+    const intrinsic = row.layer === 'source_lead' ? null : intrinsicCorpusSignal(row);
     return {
       ...row,
       matchedTerms: [],
       relevanceOrdinal: null,
       relevanceValue: null,
-      signalDisplay: null,
-      signalUnrounded: null,
-      evidenceCoverage: null,
-      displayState: null,
-      signalBand: null,
-      signalPolicyVersion: null,
-      evidenceConfidence: null,
-      trend: null,
-      signalExplanation: null,
+      signalDisplay: intrinsic?.display ?? null,
+      signalUnrounded: intrinsic?.conservative ?? null,
+      evidenceCoverage: intrinsic?.evidenceConfidence.coverage ?? null,
+      displayState: intrinsic?.displayState ?? null,
+      signalBand: intrinsic?.band ?? null,
+      signalPolicyVersion: intrinsic?.policyVersion ?? null,
+      evidenceConfidence: intrinsic?.evidenceConfidence.score ?? null,
+      evidenceConfidenceDetail: intrinsic?.evidenceConfidence ?? null,
+      trend: intrinsic?.trend ?? null,
+      signalExplanation: intrinsic
+        ? row.state === 'reviewed'
+          ? 'Query-independent intrinsic estimate from the current type-aware value profile and bound evidence.'
+          : `Query-independent intrinsic estimate from a ${row.state} index record; review state qualifies confidence.`
+        : null,
     };
   }
   if (row.layer === 'source_lead') {
@@ -209,6 +227,7 @@ function assessRow(
       signalBand: scored.signalBand as QuerySignalResult['band'],
       signalPolicyVersion: scored.signalPolicyVersion as QuerySignalResult['policyVersion'],
       evidenceConfidence: Number(scored.evidenceCoverage),
+      evidenceConfidenceDetail: null,
       trend: null,
       signalExplanation:
         'Preliminary estimate from query relevance and attributed source metadata. It is not reviewed knowledge.',
@@ -230,40 +249,7 @@ function assessRow(
       kindProfile: querySignalKindProfile(row.kind),
       provisional: row.state !== 'reviewed',
     });
-  const values = valueProfile(row.valueProfile);
-  const profile = intrinsicSignalProfile(row.kind);
-  const applicable = values.filter((dimension) => dimension.applicability === 'applicable');
-  const mean = (selector: (dimension: QueryValueInput) => number) =>
-    applicable.length
-      ? applicable.reduce((sum, dimension) => sum + selector(dimension), 0) / applicable.length
-      : 0;
-  const observedAt = new Date(row.observedAt);
-  const windowEnd = Number.isFinite(observedAt.valueOf()) ? observedAt : new Date(0);
-  const windowStart = new Date(windowEnd.getTime() - 90 * 24 * 60 * 60 * 1000);
-  const trend = calculateTrend([], {
-    windowStart: windowStart.toISOString(),
-    windowEnd: windowEnd.toISOString(),
-    now: windowEnd.toISOString(),
-  });
-  const intrinsic = calculateIntrinsicSignalV3({
-    profile,
-    dimensions: intrinsicInputsFromLegacyValueProfile(values, {
-      profile,
-      observedAt: windowEnd.toISOString(),
-    }),
-    evidenceConfidence: {
-      directness: mean((dimension) => dimension.confidence),
-      independence: row.sources.length >= 2 ? 0.8 : 0.35,
-      applicability: mean((dimension) => dimension.coverage),
-      freshness: row.state === 'stale' ? 0.2 : 0.8,
-      coverage: mean((dimension) => dimension.coverage),
-      contradiction: applicable.some((dimension) => dimension.state === 'contradicted') ? 1 : 0,
-      sourceGroupIds: row.sources,
-      evidenceIds: [...new Set(values.flatMap((dimension) => dimension.evidenceIds))],
-    },
-    trend,
-    provisional: row.state !== 'reviewed',
-  });
+  const intrinsic = intrinsicCorpusSignal(row);
   return {
     ...row,
     matchedTerms: relevance.matchedTerms,
@@ -276,6 +262,7 @@ function assessRow(
     signalBand: intrinsic.band,
     signalPolicyVersion: intrinsic.policyVersion,
     evidenceConfidence: intrinsic.evidenceConfidence.score,
+    evidenceConfidenceDetail: intrinsic.evidenceConfidence,
     trend: intrinsic.trend,
     signalExplanation:
       row.state === 'reviewed'

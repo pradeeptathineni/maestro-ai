@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   calculateEvidenceConfidence,
+  calculateCompatibilityIntrinsicSignal,
   calculateIntrinsicSignalV3,
   calculateTrend,
   type IntrinsicDimensionInput,
@@ -78,6 +79,42 @@ describe('intrinsic-signal-v3', () => {
     expect(replay).toEqual(first);
     expect(first).not.toHaveProperty('relevanceValue');
     expect(first.policyVersion).toBe('intrinsic-signal-v3');
+  });
+
+  it('projects historical value profiles through one deterministic compatibility seam', () => {
+    const valueProfile = (
+      ['reuse_leverage', 'adoption_ease', 'maturity', 'provenance_clarity'] as const
+    ).map((key) => ({
+      key,
+      raw: 70,
+      confidence: 0.8,
+      coverage: 0.75,
+      applicability: 'applicable' as const,
+      state: 'present' as const,
+      reasons: ['Compatibility fixture.'],
+      missing: [],
+      evidenceIds: [`evidence-${key}`],
+    }));
+    const projected = calculateCompatibilityIntrinsicSignal({
+      kind: 'cli',
+      valueProfile,
+      observedAt,
+      evidenceSourceGroups: ['publisher', 'independent'],
+      freshness: 0.8,
+      provisional: false,
+    });
+    expect(projected).toMatchObject({
+      policyVersion: 'intrinsic-signal-v3',
+      profile: 'implementation',
+      trend: { state: 'unknown', policyVersion: 'trend-v1' },
+      evidenceConfidence: { policyVersion: 'evidence-confidence-v1' },
+    });
+    expect(projected.inputEvidenceIds).toEqual([
+      'evidence-adoption_ease',
+      'evidence-maturity',
+      'evidence-provenance_clarity',
+      'evidence-reuse_leverage',
+    ]);
   });
 
   it('separates a weakly evidenced newcomer from its rapidly rising trend', () => {

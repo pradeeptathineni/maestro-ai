@@ -189,6 +189,28 @@ describe('Phase 06 explorer and authoring contracts', () => {
     );
     expect(documentBody.items.length).toBeGreaterThan(0);
     expect(documentBody.items.every((item) => item.entityClass === 'document')).toBe(true);
+
+    const browse = await app.inject({
+      method: 'GET',
+      url: '/api/v1/corpus?layer=indexed_knowledge&limit=5',
+      headers: hostHeaders,
+    });
+    expect(browse.statusCode).toBe(200);
+    expect(browse.json()).toMatchObject({
+      scoringApplied: false,
+      items: expect.arrayContaining([
+        expect.objectContaining({
+          signalDisplay: expect.any(Number),
+          signalBand: expect.any(String),
+          signalPolicyVersion: 'intrinsic-signal-v3',
+          evidenceConfidence: expect.any(Number),
+          evidenceConfidenceDetail: expect.objectContaining({
+            policyVersion: 'evidence-confidence-v1',
+          }),
+          trend: expect.objectContaining({ policyVersion: 'trend-v1' }),
+        }),
+      ]),
+    });
   });
 
   it('dogfoods the explorer with a signal estimate for every returned tool', async () => {
@@ -292,8 +314,38 @@ describe('Phase 06 explorer and authoring contracts', () => {
       url: `/api/v1/explorer/result-sets/${session.resultSetId}?limit=10`,
       headers: hostHeaders,
     });
-    const items = list.json<{ items: Array<{ id: string }> }>().items;
+    const items = list.json<{
+      items: Array<{
+        id: string;
+        entityClass: string;
+        matchBand: string;
+        signalBand: string;
+        evidenceConfidence: number;
+        trendState: string;
+      }>;
+    }>().items;
     expect(items.length).toBeGreaterThanOrEqual(2);
+    expect(items[0]).toMatchObject({
+      entityClass: expect.any(String),
+      matchBand: expect.stringMatching(/^(Direct|Strong|Related|Peripheral)$/),
+      signalBand: expect.any(String),
+      evidenceConfidence: expect.any(Number),
+      trendState: expect.any(String),
+    });
+    const filtered = await app.inject({
+      method: 'GET',
+      url: `/api/v1/explorer/result-sets/${session.resultSetId}?limit=50&sort=match&entityClass=${encodeURIComponent(items[0]!.entityClass)}&matchBand=${encodeURIComponent(items[0]!.matchBand)}`,
+      headers: hostHeaders,
+    });
+    expect(filtered.statusCode).toBe(200);
+    expect(
+      filtered
+        .json<{ items: typeof items }>()
+        .items.every(
+          (item) =>
+            item.entityClass === items[0]!.entityClass && item.matchBand === items[0]!.matchBand,
+        ),
+    ).toBe(true);
     const graph = await app.inject({
       method: 'GET',
       url: `/api/v1/explorer/result-sets/${session.resultSetId}/graph?limit=3`,
@@ -304,7 +356,15 @@ describe('Phase 06 explorer and authoring contracts', () => {
       resultSetId: session.resultSetId,
       visibleCount: 3,
       hiddenCount: expect.any(Number),
-      accessibleItems: expect.any(Array),
+      accessibleItems: expect.arrayContaining([
+        expect.objectContaining({
+          matchBand: expect.any(String),
+          signalDisplay: expect.any(Number),
+          evidenceConfidence: expect.any(Number),
+          trendState: expect.any(String),
+          relationships: expect.any(Array),
+        }),
+      ]),
     });
     const expandedGraph = await app.inject({
       method: 'GET',
@@ -321,6 +381,13 @@ describe('Phase 06 explorer and authoring contracts', () => {
     expect(detail.json()).toMatchObject({
       resultSetId: session.resultSetId,
       policyVersion: 'intrinsic-signal-v3',
+      entityClass: expect.any(String),
+      matchBand: expect.any(String),
+      matchedConcepts: expect.any(Array),
+      evidenceConfidenceDetail: expect.objectContaining({
+        policyVersion: 'evidence-confidence-v1',
+      }),
+      trend: expect.objectContaining({ policyVersion: 'trend-v1' }),
       valueInputs: expect.any(Array),
       evidence: expect.any(Array),
     });
@@ -365,9 +432,36 @@ describe('Phase 06 explorer and authoring contracts', () => {
     expect(detail.statusCode).toBe(200);
     expect(detail.json()).toMatchObject({
       subjectType: 'document',
+      entityClass: 'document',
+      matchBand: expect.any(String),
+      matchedConcepts: expect.any(Array),
       valueInputs: expect.any(Array),
       evidence: [expect.objectContaining({ dimensionKey: 'document_identity' })],
     });
+    const graph = await app.inject({
+      method: 'GET',
+      url: `/api/v1/explorer/result-sets/${session.resultSetId}/graph?limit=100`,
+      headers: hostHeaders,
+    });
+    expect(graph.statusCode).toBe(200);
+    expect(graph.json<{ edges: Array<{ id: string; type: string }> }>().edges).toContainEqual(
+      expect.objectContaining({
+        id: expect.stringMatching(/^document-subject:/),
+        type: 'evaluates',
+      }),
+    );
+    expect(
+      graph
+        .json<{
+          accessibleItems: Array<{
+            id: string;
+            relationships: Array<{ type: string; targetName: string }>;
+          }>;
+        }>()
+        .accessibleItems.find((item) => item.id === document!.id)?.relationships,
+    ).toContainEqual(
+      expect.objectContaining({ type: 'evaluates', targetName: 'Learned prompt compression' }),
+    );
     const saved = await app.inject({
       method: 'POST',
       url: `/api/v1/explorer/result-sets/${session.resultSetId}/shortlists`,

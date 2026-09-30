@@ -168,6 +168,7 @@ export const ResultPageQuerySchema = Type.Object({
   sort: Type.Optional(
     Type.Union([
       Type.Literal('recommended'),
+      Type.Literal('match'),
       Type.Literal('signal'),
       Type.Literal('relevance'),
       Type.Literal('evidence'),
@@ -177,7 +178,16 @@ export const ResultPageQuerySchema = Type.Object({
     ]),
   ),
   kind: Type.Optional(Type.String({ maxLength: 80 })),
+  entityClass: Type.Optional(Type.String({ maxLength: 80 })),
   capability: Type.Optional(Type.String({ maxLength: 120 })),
+  matchBand: Type.Optional(
+    Type.Union([
+      Type.Literal('Direct'),
+      Type.Literal('Strong'),
+      Type.Literal('Related'),
+      Type.Literal('Peripheral'),
+    ]),
+  ),
   evidenceState: Type.Optional(
     Type.Union([
       Type.Literal('available'),
