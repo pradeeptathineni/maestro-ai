@@ -3,7 +3,12 @@ import {
   createGraphileJobQueue,
   createGitHubMetadataAdapter,
 } from '../../../packages/adapters/src/index.js';
-import { createPool, databaseUrl, recoverDueWatches } from '../../../packages/db/src/index.js';
+import {
+  createPool,
+  databaseUrl,
+  recoverDueWatches,
+  recoverStaleResearchRuns,
+} from '../../../packages/db/src/index.js';
 import { dispatchOutbox } from './outbox.js';
 import { createTaskList } from './tasks.js';
 
@@ -41,11 +46,13 @@ const dispatch = async (): Promise<void> => {
 };
 const recoverSchedules = async (): Promise<void> => {
   if (stopping) return;
-  await recoverDueWatches(pool).catch((error: unknown) => {
-    process.stderr.write(
-      `Watch recovery failed: ${error instanceof Error ? error.message : String(error)}\n`,
-    );
-  });
+  await Promise.all([recoverDueWatches(pool), recoverStaleResearchRuns(pool)]).catch(
+    (error: unknown) => {
+      process.stderr.write(
+        `Recovery failed: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    },
+  );
 };
 await recoverSchedules();
 await dispatch();
