@@ -1116,7 +1116,7 @@ export async function getExplorerResultPage(
   resultSetId: string,
   query: ResultPageQuery,
 ): Promise<unknown> {
-  const [page, discoveryOperations] = await Promise.all([
+  const [page, discoveryOperations, researchRun] = await Promise.all([
     resultRows(pool, workspaceId, resultSetId, query),
     pool.query<{ id: string; adapterKey: string; state: string }>(
       `SELECT id, adapter_key AS "adapterKey", state, plan_route_id AS "planRouteId",
@@ -1126,6 +1126,20 @@ export async function getExplorerResultPage(
        WHERE result_set_id = $1 AND workspace_id = $2
          AND adapter_key <> 'local_semantic'
        ORDER BY created_at, id`,
+      [resultSetId, workspaceId],
+    ),
+    pool.query<{
+      id: string;
+      mode: string;
+      strategy: string;
+      state: string;
+      safeDetail: string;
+    }>(
+      `SELECT id, mode, strategy, state, safe_detail AS "safeDetail"
+       FROM ops.research_runs
+       WHERE result_set_id = $1 AND workspace_id = $2
+       ORDER BY created_at DESC, id DESC
+       LIMIT 1`,
       [resultSetId, workspaceId],
     ),
   ]);
@@ -1146,6 +1160,7 @@ export async function getExplorerResultPage(
     filteredCount: page.rows.length,
     items,
     discoveryOperations: discoveryOperations.rows,
+    researchRun: researchRun.rows[0] ?? null,
     nextCursor:
       hasMore && items.length ? encodeCursor(resultSetId, items.at(-1)!.id, viewHash) : null,
   };

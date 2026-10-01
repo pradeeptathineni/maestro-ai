@@ -855,6 +855,17 @@ describe('Phase 06 explorer and authoring contracts', () => {
         }),
       ],
     });
+    const defaultCorpus = await app.inject({
+      method: 'POST',
+      url: '/api/v1/corpus/search',
+      headers: mutationHeaders,
+      payload: { query: 'controlled discovery' },
+    });
+    expect(
+      defaultCorpus
+        .json<{ items: Array<{ id: string; layer: string }> }>()
+        .items.some((item) => item.id === candidateId && item.layer === 'source_lead'),
+    ).toBe(false);
     const admitted = await app.inject({
       method: 'POST',
       url: `/api/v1/discovery/candidates/${candidateId}/admit`,

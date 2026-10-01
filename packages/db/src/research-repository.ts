@@ -59,6 +59,12 @@ function json(value: unknown): string {
   return JSON.stringify(value);
 }
 
+function reportedTokens(usage: unknown, key: 'inputTokens' | 'outputTokens'): number | null {
+  if (!usage || typeof usage !== 'object' || Array.isArray(usage)) return null;
+  const value = (usage as Record<string, unknown>)[key];
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
 function researchPolicy(row: ClaimedResearchRun): ResearchPolicy {
   return {
     mode: row.mode,
@@ -466,6 +472,17 @@ export async function processResearchRun(
       modelCalls += 1;
       const response = await activeModel.propose(request);
       modelTrace.lastCall = { request, response };
+      const inputTokens = reportedTokens(response.usage, 'inputTokens');
+      const outputTokens = reportedTokens(response.usage, 'outputTokens');
+      if (
+        (inputTokens !== null && inputTokens > row.maxInputTokens) ||
+        (outputTokens !== null && outputTokens > row.maxOutputTokens)
+      ) {
+        throw new ResearchProtocolError(
+          'budget_exceeded',
+          'Model-reported usage exceeded the configured per-call token boundary.',
+        );
+      }
       return response;
     },
   };
@@ -478,6 +495,7 @@ export async function processResearchRun(
         sourceKey: event.action.sourceKey,
         queryHash: hashCanonical(event.action.query),
         candidateIds: event.candidateIds,
+        candidates: event.candidates,
       });
       return;
     }
@@ -645,11 +663,39 @@ export async function getResearchRun(
       [researchRunId, workspaceId],
     ),
   ]);
+  const candidates = new Map<string, ResearchCandidate>();
+  for (const event of events.rows as Array<{ eventType: string; payload: unknown }>) {
+    if (
+      event.eventType !== 'source_result' ||
+      !event.payload ||
+      typeof event.payload !== 'object'
+    ) {
+      continue;
+    }
+    const snapshots = (event.payload as { candidates?: unknown }).candidates;
+    if (!Array.isArray(snapshots)) continue;
+    for (const snapshot of snapshots) {
+      if (!snapshot || typeof snapshot !== 'object' || Array.isArray(snapshot)) continue;
+      const candidate = snapshot as Partial<ResearchCandidate>;
+      if (
+        typeof candidate.id !== 'string' ||
+        typeof candidate.sourceKey !== 'string' ||
+        typeof candidate.title !== 'string' ||
+        typeof candidate.summary !== 'string' ||
+        typeof candidate.canonicalUri !== 'string'
+      ) {
+        continue;
+      }
+      if (!candidates.has(candidate.id))
+        candidates.set(candidate.id, candidate as ResearchCandidate);
+    }
+  }
   return {
     ...run.rows[0],
     proposals: proposals.rows,
     events: events.rows,
     operations: operations.rows,
+    candidates: [...candidates.values()],
   };
 }
 

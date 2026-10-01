@@ -25,6 +25,7 @@ interface RunView {
   proposals: Array<{ proposalType: string; output: unknown }>;
   events: Array<{ eventType: string; payload: unknown }>;
   operations: Array<unknown>;
+  candidates: Array<{ id: string; title: string; canonicalUri: string }>;
   consumedModelCalls: number;
   disclosure: { privateProjectContextIncluded: boolean };
   receipt: { candidateIds: string[] } | null;
@@ -188,6 +189,15 @@ describe('bounded model-led research persistence', () => {
     ]);
     expect(run.events.map((event) => event.eventType)).toContain('source_result');
     expect(run.receipt?.candidateIds).toEqual([candidateId]);
+    expect(run.candidates).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: candidateId,
+          title: 'Unseen-domain implementation',
+          canonicalUri: 'https://example.test/photonic-compiler',
+        }),
+      ]),
+    );
     expect(run.consumedModelCalls).toBe(3);
     expect(run.disclosure.privateProjectContextIncluded).toBe(false);
     expect(

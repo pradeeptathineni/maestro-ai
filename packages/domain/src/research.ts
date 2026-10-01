@@ -113,6 +113,7 @@ export type ResearchJournalEvent =
       step: number;
       action: ResearchAction;
       candidateIds: string[];
+      candidates: ResearchCandidate[];
     };
 
 export interface ResearchSkillDependencies {
@@ -618,7 +619,7 @@ async function executeActions(
       ...action,
       maxResults: Math.min(action.maxResults, remaining),
     });
-    const acceptedIds: string[] = [];
+    const acceptedCandidates: ResearchCandidate[] = [];
     for (const candidate of result.slice(0, remaining)) {
       if (candidate.sourceKey !== action.sourceKey) {
         throw new ResearchProtocolError(
@@ -633,15 +634,18 @@ async function executeActions(
         );
       }
       if (!candidates.has(candidate.id)) {
-        candidates.set(candidate.id, candidate);
-        acceptedIds.push(candidate.id);
+        const [accepted] = compactResearchCandidates([candidate]);
+        if (!accepted) continue;
+        candidates.set(accepted.id, accepted);
+        acceptedCandidates.push(accepted);
       }
     }
     await journal(dependencies, {
       type: 'source_result',
       step,
       action,
-      candidateIds: acceptedIds,
+      candidateIds: acceptedCandidates.map((candidate) => candidate.id),
+      candidates: acceptedCandidates,
     });
   }
 }

@@ -72,8 +72,49 @@ interface DiscoveryOperation {
   candidates: DiscoveryCandidate[];
 }
 
+interface ResearchCandidate {
+  id: string;
+  sourceKey: string;
+  title: string;
+  summary: string;
+  canonicalUri: string;
+  observedAt?: string | null;
+}
+
+interface ResearchSynthesis {
+  summary: string;
+  groups: Array<{ label: string; description: string; candidateIds: string[] }>;
+  items: Array<{
+    candidateId: string;
+    reason: string;
+    uncertainty: string | null;
+    citationCandidateIds: string[];
+  }>;
+  limitations: string[];
+}
+
+interface ResearchRun {
+  id: string;
+  mode: 'search' | 'corpus';
+  strategy: 'model' | 'deterministic_fallback';
+  state: string;
+  modelIdentifier: string | null;
+  stopReason: string | null;
+  safeDetail: string;
+  candidates: ResearchCandidate[];
+  proposals: Array<{ proposalType: string; output: unknown }>;
+  operations: Array<{ id: string; sourceKey: string; state: string }>;
+}
+
 interface SearchSession extends ExplorerSession {
   discoveryOperations: Array<{ id: string; adapterKey: string; state: string }>;
+  researchRun: {
+    id: string;
+    mode: 'search' | 'corpus';
+    strategy: 'model' | 'deterministic_fallback';
+    state: string;
+    safeDetail: string;
+  } | null;
 }
 
 const resultSetPattern =
@@ -128,6 +169,7 @@ export function ExplorePage() {
   const [projectContextId, setProjectContextId] = useState('');
   const [shortlistName, setShortlistName] = useState('Search shortlist');
   const [discoveryOperationIds, setDiscoveryOperationIds] = useState<string[]>([]);
+  const [researchRunId, setResearchRunId] = useState<string | null>(null);
   const [notice, setNotice] = useState('');
   const [additionalPage, setAdditionalPage] = useState<{
     viewKey: string;
@@ -152,6 +194,13 @@ export function ExplorePage() {
       refetchInterval: (query: { state: { data?: DiscoveryOperation } }) =>
         ['queued', 'running'].includes(query.state.data?.state ?? '') ? 1_000 : false,
     })),
+  });
+  const researchRun = useQuery({
+    queryKey: ['research-run', researchRunId],
+    enabled: Boolean(researchRunId),
+    queryFn: () => api<ResearchRun>(`/api/v1/research/runs/${researchRunId}`),
+    refetchInterval: (query: { state: { data?: ResearchRun } }) =>
+      ['queued', 'running'].includes(query.state.data?.state ?? '') ? 1_000 : false,
   });
 
   const resultQuery = useMemo(() => {
@@ -225,16 +274,19 @@ export function ExplorePage() {
       setCompareIds([]);
       setComparison(null);
       setDiscoveryOperationIds(session.discoveryOperations.map((operation) => operation.id));
+      setResearchRunId(session.researchRun?.id ?? null);
       setClarification('');
       const activeOperationCount = session.discoveryOperations.filter((operation) =>
         ['queued', 'running'].includes(operation.state),
       ).length;
       setNotice(
-        activeOperationCount
-          ? `${session.counts.assessed} indexed results are ready. ${activeOperationCount} connected source search${activeOperationCount === 1 ? ' is' : 'es are'} running.`
-          : session.discoveryOperations.length
-            ? `${session.counts.assessed} indexed results are ready. The source plan was recorded; no connected source request was queued.`
-            : `${session.counts.assessed} indexed results are ready. No connected source is enabled.`,
+        session.researchRun?.state === 'queued'
+          ? `${session.counts.assessed} indexed results are ready. Model-led live research is running.`
+          : activeOperationCount
+            ? `${session.counts.assessed} indexed results are ready. ${activeOperationCount} connected source search${activeOperationCount === 1 ? ' is' : 'es are'} running.`
+            : session.discoveryOperations.length
+              ? `${session.counts.assessed} indexed results are ready. The source plan was recorded; no connected source request was queued.`
+              : `${session.counts.assessed} indexed results are ready. No connected source is enabled.`,
       );
       void client.invalidateQueries({ queryKey: ['explorer-history'] });
     },
@@ -347,6 +399,7 @@ export function ExplorePage() {
   useEffect(() => {
     if (!results.data) return;
     setDiscoveryOperationIds(results.data.discoveryOperations.map((operation) => operation.id));
+    setResearchRunId(results.data.researchRun?.id ?? null);
   }, [results.data]);
   const interpretation = results.data?.resultSet.interpretation;
   const additionalItems = additionalPage?.viewKey === resultViewKey ? additionalPage.items : [];
@@ -366,6 +419,7 @@ export function ExplorePage() {
     refresh.error,
     redact.error,
     ...discoveryOperations.map((operation) => operation.error),
+    researchRun.error,
     watch.error,
     loadMore.error,
   ].filter(Boolean);
@@ -392,6 +446,12 @@ export function ExplorePage() {
   const connectedSearchesPending = discoveryOperations.some(
     (operation) =>
       operation.isPending || ['queued', 'running'].includes(operation.data?.state ?? ''),
+  );
+  const researchSynthesis = researchRun.data?.proposals.find(
+    (proposal) => proposal.proposalType === 'synthesis',
+  )?.output as ResearchSynthesis | undefined;
+  const researchCandidates = new Map(
+    (researchRun.data?.candidates ?? []).map((candidate) => [candidate.id, candidate]),
   );
 
   function toggleComparison(id: string): void {
@@ -635,80 +695,168 @@ export function ExplorePage() {
             </form>
           </details>
 
-          <details className="source-results">
-            <summary>
-              <div>
-                <p className="eyebrow">Connected sources</p>
-                <strong>Source plan and live leads</strong>
-              </div>
-              <span>{discoveryOperationIds.length} planned route states</span>
-            </summary>
-            <div className="source-results-body">
-              <p className="hint">
-                Source results are scored immediately from query relevance and available metadata.
-                Low confidence remains visible until stronger evidence is attached.
-              </p>
-              {discoveryOperationIds.length ? (
-                <>
-                  <div className="source-status-row" aria-live="polite">
-                    {discoveryOperations.map((operation, index) => (
-                      <span key={discoveryOperationIds[index]}>
-                        <strong>
-                          {label(operation.data?.adapterKey ?? `source ${index + 1}`)}
-                        </strong>
-                        <StateBadge state={operation.data?.state ?? 'running'} />
-                      </span>
-                    ))}
-                  </div>
-                  {connectedCandidates.length ? (
-                    <div className="source-result-list">
-                      {connectedCandidates.map((candidate) => (
-                        <article className="source-result-row" key={candidate.id}>
-                          <div className="result-identity">
-                            <div className="card-topline">
-                              <Badge>{label(candidate.kindHint ?? 'source result')}</Badge>
-                              <Badge>{signalStateLabel(candidate.displayState)}</Badge>
-                            </div>
-                            <h3>{candidate.title}</h3>
-                            <p>{candidate.summary}</p>
-                          </div>
-                          <div className="query-signal">
-                            <strong>Signal {candidate.signalDisplay}</strong>
-                            <span>
-                              {label(candidate.relevanceOrdinal)} relevance ·{' '}
-                              {signalStateLabel(candidate.displayState)}
-                            </span>
-                            <small>
-                              {formatFractionPercent(candidate.evidenceCoverage)} evidence coverage
-                            </small>
-                          </div>
-                          <a
-                            className="button secondary compact"
-                            href={candidate.canonicalUri}
-                            rel="noreferrer"
-                            target="_blank"
-                          >
-                            Open source
-                          </a>
-                        </article>
+          {researchRun.data?.strategy === 'model' ? (
+            <details className="source-results" open>
+              <summary>
+                <div>
+                  <p className="eyebrow">Model-led live research</p>
+                  <strong>Planned, refined, and evidence-bound results</strong>
+                </div>
+                <StateBadge state={researchRun.data.state} />
+              </summary>
+              <div className="source-results-body">
+                <p className="hint">{researchRun.data.safeDetail}</p>
+                {researchSynthesis ? (
+                  <>
+                    <div className="section-heading">
+                      <div>
+                        <h2>Research synthesis</h2>
+                        <p>{researchSynthesis.summary}</p>
+                      </div>
+                      <p className="hint">
+                        {researchRun.data.modelIdentifier
+                          ? `Proposed by ${researchRun.data.modelIdentifier}; constrained and validated by the host.`
+                          : 'Model output was constrained and validated by the host.'}
+                      </p>
+                    </div>
+                    <div className="chip-row" aria-label="Research groups">
+                      {researchSynthesis.groups.map((group) => (
+                        <span
+                          className="facet-chip explicit"
+                          key={group.label}
+                          title={group.description}
+                        >
+                          {group.label} ({group.candidateIds.length})
+                        </span>
                       ))}
                     </div>
-                  ) : (
-                    <p className="hint">
-                      {connectedSearchesPending
-                        ? 'Connected source searches are still running.'
-                        : 'No live leads were returned. Route states above preserve skipped, unsupported, disabled, failed, and empty outcomes.'}
-                    </p>
-                  )}
-                </>
-              ) : (
-                <p className="source-empty">
-                  No connected source is enabled. The local index still works without network
-                  access. <Link to="/workspace#integrations">Configure sources</Link>
+                    <div className="source-result-list">
+                      {researchSynthesis.items.map((item) => {
+                        const candidate = researchCandidates.get(item.candidateId);
+                        if (!candidate) return null;
+                        return (
+                          <article className="source-result-row" key={candidate.id}>
+                            <div className="result-identity">
+                              <div className="card-topline">
+                                <Badge>{label(candidate.sourceKey)}</Badge>
+                                <Badge>Model selected</Badge>
+                              </div>
+                              <h3>{candidate.title}</h3>
+                              <p>{candidate.summary}</p>
+                            </div>
+                            <div className="query-signal">
+                              <strong>Why it surfaced</strong>
+                              <span>{item.reason}</span>
+                              {item.uncertainty ? <small>{item.uncertainty}</small> : null}
+                            </div>
+                            <a
+                              className="button secondary compact"
+                              href={candidate.canonicalUri}
+                              rel="noreferrer"
+                              target="_blank"
+                            >
+                              Open evidence
+                            </a>
+                          </article>
+                        );
+                      })}
+                    </div>
+                    {researchSynthesis.limitations.length ? (
+                      <p className="hint">Limits: {researchSynthesis.limitations.join(' ')}</p>
+                    ) : null}
+                  </>
+                ) : ['queued', 'running'].includes(researchRun.data.state) ? (
+                  <Loading message="Researching enabled sources and checking evidence gaps…" />
+                ) : (
+                  <p className="source-empty">
+                    No validated synthesis was produced. Any acquired evidence remains in the run
+                    record, and the deterministic source path remains available.
+                  </p>
+                )}
+              </div>
+            </details>
+          ) : null}
+
+          {researchRun.data?.strategy !== 'model' ? (
+            <details className="source-results">
+              <summary>
+                <div>
+                  <p className="eyebrow">Connected sources</p>
+                  <strong>Source plan and live leads</strong>
+                </div>
+                <span>{discoveryOperationIds.length} planned route states</span>
+              </summary>
+              <div className="source-results-body">
+                {researchRun.data?.strategy === 'deterministic_fallback' ? (
+                  <p className="authority-note">{researchRun.data.safeDetail}</p>
+                ) : null}
+                <p className="hint">
+                  Source results are scored immediately from query relevance and available metadata.
+                  Low confidence remains visible until stronger evidence is attached.
                 </p>
-              )}
-            </div>
-          </details>
+                {discoveryOperationIds.length ? (
+                  <>
+                    <div className="source-status-row" aria-live="polite">
+                      {discoveryOperations.map((operation, index) => (
+                        <span key={discoveryOperationIds[index]}>
+                          <strong>
+                            {label(operation.data?.adapterKey ?? `source ${index + 1}`)}
+                          </strong>
+                          <StateBadge state={operation.data?.state ?? 'running'} />
+                        </span>
+                      ))}
+                    </div>
+                    {connectedCandidates.length ? (
+                      <div className="source-result-list">
+                        {connectedCandidates.map((candidate) => (
+                          <article className="source-result-row" key={candidate.id}>
+                            <div className="result-identity">
+                              <div className="card-topline">
+                                <Badge>{label(candidate.kindHint ?? 'source result')}</Badge>
+                                <Badge>{signalStateLabel(candidate.displayState)}</Badge>
+                              </div>
+                              <h3>{candidate.title}</h3>
+                              <p>{candidate.summary}</p>
+                            </div>
+                            <div className="query-signal">
+                              <strong>Signal {candidate.signalDisplay}</strong>
+                              <span>
+                                {label(candidate.relevanceOrdinal)} relevance ·{' '}
+                                {signalStateLabel(candidate.displayState)}
+                              </span>
+                              <small>
+                                {formatFractionPercent(candidate.evidenceCoverage)} evidence
+                                coverage
+                              </small>
+                            </div>
+                            <a
+                              className="button secondary compact"
+                              href={candidate.canonicalUri}
+                              rel="noreferrer"
+                              target="_blank"
+                            >
+                              Open source
+                            </a>
+                          </article>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="hint">
+                        {connectedSearchesPending
+                          ? 'Connected source searches are still running.'
+                          : 'No live leads were returned. Route states above preserve skipped, unsupported, disabled, failed, and empty outcomes.'}
+                      </p>
+                    )}
+                  </>
+                ) : (
+                  <p className="source-empty">
+                    No connected source is enabled. The local index still works without network
+                    access. <Link to="/workspace#integrations">Configure sources</Link>
+                  </p>
+                )}
+              </div>
+            </details>
+          ) : null}
 
           <section className="explorer-workbench" aria-labelledby="results-heading">
             <div className="workbench-toolbar">

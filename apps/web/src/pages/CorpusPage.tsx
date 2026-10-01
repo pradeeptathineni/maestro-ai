@@ -1,4 +1,4 @@
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery } from '@tanstack/react-query';
 import { type FormEvent, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { api, formatDate, formatFractionPercent, label } from '../api.js';
@@ -41,6 +41,36 @@ interface CorpusResponse {
   nextCursor: string | null;
 }
 
+interface CorpusResearchRun {
+  id: string;
+  strategy: 'model' | 'deterministic_fallback';
+  state: string;
+  modelIdentifier: string | null;
+  safeDetail: string;
+  candidates: Array<{
+    id: string;
+    sourceKey: string;
+    title: string;
+    summary: string;
+    canonicalUri: string;
+  }>;
+  proposals: Array<{
+    proposalType: string;
+    output: unknown;
+  }>;
+}
+
+interface CorpusSynthesis {
+  summary: string;
+  groups: Array<{ label: string; description: string; candidateIds: string[] }>;
+  items: Array<{
+    candidateId: string;
+    reason: string;
+    uncertainty: string | null;
+  }>;
+  limitations: string[];
+}
+
 function evidenceLabel(state: string | null): string {
   if (state === 'available') return 'Source-backed';
   if (state === 'provisional') return 'Preliminary';
@@ -52,6 +82,7 @@ export function CorpusPage() {
   const [parameters, setParameters] = useSearchParams();
   const [appliedQuery, setAppliedQuery] = useState('');
   const [draftQuery, setDraftQuery] = useState('');
+  const [researchRunId, setResearchRunId] = useState<string | null>(null);
   const [previousCursors, setPreviousCursors] = useState<string[]>([]);
   const queryString = useMemo(() => {
     const query = new URLSearchParams();
@@ -73,6 +104,32 @@ export function CorpusPage() {
       });
     },
   });
+  const startResearch = useMutation({
+    mutationFn: async (query: string) => {
+      const session = await api<{ id: string }>('/api/v1/explorer/sessions', {
+        method: 'POST',
+        body: JSON.stringify({ query, searchConnectedSources: false }),
+      });
+      return api<{ id: string; state: string; strategy: string }>(
+        `/api/v1/explorer/sessions/${session.id}/research-runs`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            mode: 'corpus',
+            idempotencyKey: `corpus:${session.id}:research-skill-v1`,
+          }),
+        },
+      );
+    },
+    onSuccess: (run) => setResearchRunId(run.id),
+  });
+  const researchRun = useQuery({
+    queryKey: ['corpus-research-run', researchRunId],
+    enabled: Boolean(researchRunId),
+    queryFn: () => api<CorpusResearchRun>(`/api/v1/research/runs/${researchRunId}`),
+    refetchInterval: (query: { state: { data?: CorpusResearchRun } }) =>
+      ['queued', 'running'].includes(query.state.data?.state ?? '') ? 1_000 : false,
+  });
 
   function replaceParameter(key: string, value: string): void {
     const next = new URLSearchParams(parameters);
@@ -89,15 +146,26 @@ export function CorpusPage() {
     next.delete('cursor');
     setPreviousCursors([]);
     setParameters(next);
-    setAppliedQuery(draftQuery.trim());
+    const normalized = draftQuery.trim();
+    setAppliedQuery(normalized);
+    setResearchRunId(null);
+    if (normalized) startResearch.mutate(normalized);
   }
 
   function clearFilters(): void {
     setDraftQuery('');
     setAppliedQuery('');
+    setResearchRunId(null);
     setPreviousCursors([]);
     setParameters({});
   }
+
+  const synthesis = researchRun.data?.proposals.find(
+    (proposal) => proposal.proposalType === 'synthesis',
+  )?.output as CorpusSynthesis | undefined;
+  const researchCandidates = new Map(
+    (researchRun.data?.candidates ?? []).map((candidate) => [candidate.id, candidate]),
+  );
 
   function nextPage(): void {
     if (!corpus.data?.nextCursor) return;
@@ -120,9 +188,9 @@ export function CorpusPage() {
   return (
     <div className="page-shell corpus-page">
       <PageHeader
-        eyebrow="Saved research"
-        title="Browse saved technology research"
-        description="The corpus combines reviewed or proposed index records with attributed leads saved from live searches. The two layers remain visibly separate."
+        eyebrow="Admitted knowledge"
+        title="Browse the durable research corpus"
+        description="The corpus contains reviewed or explicitly proposed knowledge. Live Search findings stay in research history until they pass an admission decision."
         action={
           <Link className="button primary" to="/explore">
             Start a search
@@ -164,7 +232,6 @@ export function CorpusPage() {
               <option value="">All layers</option>
               <option value="indexed_knowledge">Indexed knowledge</option>
               <option value="knowledge_document">Knowledge documents</option>
-              <option value="source_lead">Source leads</option>
             </select>
           </label>
           <label>
@@ -217,6 +284,8 @@ export function CorpusPage() {
 
       {corpus.isPending ? <Loading message="Loading the local research corpus…" /> : null}
       {corpus.error ? <ErrorPanel error={corpus.error} /> : null}
+      {startResearch.error ? <ErrorPanel error={startResearch.error} /> : null}
+      {researchRun.error ? <ErrorPanel error={researchRun.error} /> : null}
       {corpus.data ? (
         <>
           <section className="corpus-summary" aria-label="Corpus scope">
@@ -234,6 +303,72 @@ export function CorpusPage() {
             </div>
             <p>{corpus.data.scope.statement}</p>
           </section>
+
+          {appliedQuery && (startResearch.isPending || researchRun.data) ? (
+            <section className="source-results" aria-labelledby="corpus-synthesis-heading">
+              <div className="source-results-body">
+                <div className="section-heading">
+                  <div>
+                    <p className="eyebrow">Corpus research</p>
+                    <h2 id="corpus-synthesis-heading">Organized from admitted evidence</h2>
+                  </div>
+                  {researchRun.data ? <Badge>{label(researchRun.data.state)}</Badge> : null}
+                </div>
+                {startResearch.isPending ||
+                ['queued', 'running'].includes(researchRun.data?.state ?? '') ? (
+                  <Loading message="Reviewing corpus evidence and checking coverage gaps…" />
+                ) : synthesis ? (
+                  <>
+                    <p>{synthesis.summary}</p>
+                    <div className="chip-row" aria-label="Corpus research groups">
+                      {synthesis.groups.map((group) => (
+                        <span
+                          className="facet-chip explicit"
+                          key={group.label}
+                          title={group.description}
+                        >
+                          {group.label} ({group.candidateIds.length})
+                        </span>
+                      ))}
+                    </div>
+                    <div className="source-result-list">
+                      {synthesis.items.map((item) => {
+                        const candidate = researchCandidates.get(item.candidateId);
+                        if (!candidate) return null;
+                        return (
+                          <article className="source-result-row" key={candidate.id}>
+                            <div className="result-identity">
+                              <Badge>{label(candidate.sourceKey)}</Badge>
+                              <h3>{candidate.title}</h3>
+                              <p>{candidate.summary}</p>
+                            </div>
+                            <div className="query-signal">
+                              <strong>Why it surfaced</strong>
+                              <span>{item.reason}</span>
+                              {item.uncertainty ? <small>{item.uncertainty}</small> : null}
+                            </div>
+                            <a
+                              className="button secondary compact"
+                              href={candidate.canonicalUri}
+                              rel="noreferrer"
+                              target="_blank"
+                            >
+                              Open evidence
+                            </a>
+                          </article>
+                        );
+                      })}
+                    </div>
+                    {synthesis.limitations.length ? (
+                      <p className="hint">Limits: {synthesis.limitations.join(' ')}</p>
+                    ) : null}
+                  </>
+                ) : researchRun.data ? (
+                  <p className="authority-note">{researchRun.data.safeDetail}</p>
+                ) : null}
+              </div>
+            </section>
+          ) : null}
 
           <section aria-labelledby="corpus-results-heading">
             <div className="section-heading">
@@ -260,7 +395,7 @@ export function CorpusPage() {
                             ? 'Implementation'
                             : item.layer === 'knowledge_document'
                               ? 'Knowledge document'
-                              : 'Source lead'}
+                              : 'Legacy source lead'}
                         </Badge>
                         <Badge>{label(item.state)}</Badge>
                         <Badge>{label(item.kind)}</Badge>

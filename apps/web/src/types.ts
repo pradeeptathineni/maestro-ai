@@ -402,6 +402,13 @@ export interface ExplorerResultPage {
     sourcePlanState?: string;
     safeDetail?: string;
   }>;
+  researchRun: {
+    id: string;
+    mode: 'search' | 'corpus';
+    strategy: 'model' | 'deterministic_fallback';
+    state: string;
+    safeDetail: string;
+  } | null;
   nextCursor: string | null;
 }
 
