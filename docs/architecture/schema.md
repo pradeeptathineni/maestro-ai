@@ -35,9 +35,11 @@ model proposals, source-action links, leases, and terminal receipts. Migration `
 research acquisition to its declared result limit and hardens research-run history and state
 transitions. Migration `0018` prevents late proposals, source operations, source links, or events
 from extending a terminal research history. Migration `0019` requires every research source
-operation to match the active run's exact
-workspace, query session, and immutable result-set snapshot. The readiness gate requires all
-nineteen repository migrations; catalog cardinality is diagnostic data, not readiness.
+operation to match the active run's exact workspace, query session, and immutable result-set
+snapshot. Migration `0020` serializes research child inserts and source-operation updates with
+parent finalization, so recovery cannot be crossed by a late evidence or attempt commit. The
+readiness gate requires all twenty repository migrations; catalog cardinality is diagnostic data,
+not readiness.
 
 Drizzle declarations mirror queryable concepts but do not replace reviewed SQL. Startup never uses
 schema push. Corrections to immutable evidence, score, context, and decision records require a new

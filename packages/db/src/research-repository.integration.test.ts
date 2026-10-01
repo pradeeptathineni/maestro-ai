@@ -22,13 +22,15 @@ import {
   processResearchRun,
   recoverStaleResearchRuns,
   requestResearchRun,
+  waitForResearchDiscoveryTerminal,
 } from './research-repository.js';
 
 interface RunView {
   id: string;
+  resultSetId: string;
   state: string;
   strategy: string;
-  proposals: Array<{ proposalType: string; output: unknown }>;
+  proposals: Array<{ proposalType: string; output: unknown; citations: string[] }>;
   events: Array<{ eventType: string; payload: unknown }>;
   operations: Array<unknown>;
   candidates: Array<{ id: string; title: string; canonicalUri: string }>;
@@ -51,7 +53,11 @@ function payloadCandidates(request: ResearchModelRequest): Array<{ id: string }>
 
 function fixtureModel(
   requests: ResearchModelRequest[],
-  options: { invalidRefinementCitation?: boolean } = {},
+  options: {
+    invalidRefinementCitation?: boolean;
+    distinctSummaryCitation?: boolean;
+    wideAction?: boolean;
+  } = {},
 ): ResearchModel {
   return {
     async propose(request) {
@@ -61,6 +67,9 @@ function fixtureModel(
         publicQuery?: string;
       };
       const candidateId = payloadCandidates(request)[0]?.id ?? 'no-candidate';
+      const summaryCandidateId = options.distinctSummaryCitation
+        ? (payloadCandidates(request)[1]?.id ?? candidateId)
+        : candidateId;
       if (request.proposalType === 'plan') {
         return {
           modelIdentifier: 'fixture-research-model',
@@ -75,7 +84,7 @@ function fixtureModel(
                 sourceKey: payload.allowedSourceKeys?.[0] ?? 'missing',
                 query: payload.publicQuery ?? 'public research query',
                 purpose: 'Find directly relevant implementations and documentation.',
-                maxResults: 5,
+                maxResults: options.wideAction ? 20 : 5,
               },
             ],
             stopTests: ['Stop when directly relevant evidence can be cited.'],
@@ -105,7 +114,7 @@ function fixtureModel(
           contextAssessment: 'sufficient',
           abstentionReason: null,
           summary: 'The run found directly relevant, attributable evidence.',
-          summaryCitationCandidateIds: [candidateId],
+          summaryCitationCandidateIds: [summaryCandidateId],
           groups: [
             {
               label: 'Direct evidence',
@@ -141,6 +150,10 @@ describe('bounded model-led research persistence', () => {
 
   beforeAll(async () => {
     pool = createPool(testDatabaseUrl());
+    await pool.query(
+      `UPDATE ops.source_adapter_configs SET daily_call_limit = 1000
+       WHERE adapter_key = 'local_semantic'`,
+    );
     await configureAdapter(pool, 'local_semantic', {
       enabled: true,
       baseUrl: 'http://127.0.0.1:18080/v1',
@@ -156,6 +169,10 @@ describe('bounded model-led research persistence', () => {
     await configureAdapter(pool, 'github', { enabled: false });
     await configureAdapter(pool, 'mcp_registry', { enabled: false });
     await configureAdapter(pool, 'local_semantic', { enabled: false });
+    await pool.query(
+      `UPDATE ops.source_adapter_configs SET daily_call_limit = 20
+       WHERE adapter_key = 'local_semantic'`,
+    );
     await pool.end();
   });
 
@@ -244,6 +261,85 @@ describe('bounded model-led research persistence', () => {
     });
   });
 
+  it('persists distinct synthesis-summary citations as exact source anchors', async () => {
+    const sessionId = await createSession(pool, 'distinct summary evidence anchors');
+    const requested = (await requestResearchRun(pool, localWorkspaceId, sessionId, {
+      mode: 'search',
+      idempotencyKey: `integration-summary-anchors-${randomUUID()}`,
+    })) as { id: string };
+    const itemCandidateId = randomUUID();
+    const summaryCandidateId = randomUUID();
+    await processResearchRun(
+      pool,
+      { researchRunId: requested.id, workspaceId: localWorkspaceId },
+      {
+        model: fixtureModel([], { distinctSummaryCitation: true }),
+        sources: {
+          async search(action) {
+            return {
+              state: 'complete',
+              candidates: [
+                {
+                  id: itemCandidateId,
+                  sourceKey: action.sourceKey,
+                  title: 'Item evidence',
+                  summary: 'Evidence selected as the synthesized item.',
+                  canonicalUri: 'https://example.test/item-evidence',
+                },
+                {
+                  id: summaryCandidateId,
+                  sourceKey: action.sourceKey,
+                  title: 'Summary evidence',
+                  summary: 'Different evidence cited by the synthesis summary.',
+                  canonicalUri: 'https://example.test/summary-evidence',
+                },
+              ],
+            };
+          },
+        },
+      },
+    );
+    const run = (await getResearchRun(pool, localWorkspaceId, requested.id)) as RunView;
+    const synthesis = run.proposals.find((proposal) => proposal.proposalType === 'synthesis');
+    expect(synthesis?.citations).toEqual([summaryCandidateId, itemCandidateId]);
+  });
+
+  it('closes a queued v1 run without mixing protocol versions or calling the model', async () => {
+    const sessionId = await createSession(pool, 'historical queued protocol handling');
+    const template = (await requestResearchRun(pool, localWorkspaceId, sessionId, {
+      mode: 'search',
+      idempotencyKey: `integration-v2-template-${randomUUID()}`,
+    })) as { id: string };
+    const historicalId = randomUUID();
+    await pool.query(
+      `INSERT INTO ops.research_runs
+         (id, workspace_id, query_session_id, result_set_id, idempotency_key,
+          mode, strategy, state, skill_version, protocol_version, query_hash, policy_hash,
+          model_adapter_key, model_identifier, model_config_hash, allowed_source_keys,
+          budget, disclosure, reserved_model_calls, safe_detail)
+       SELECT $1, workspace_id, query_session_id, result_set_id, $2,
+              mode, strategy, 'queued', skill_version, 'research-protocol-v1', query_hash,
+              policy_hash, model_adapter_key, model_identifier, model_config_hash,
+              allowed_source_keys, budget, disclosure, reserved_model_calls,
+              'Historical queued run awaiting version-aware handling.'
+       FROM ops.research_runs WHERE id = $3 AND workspace_id = $4`,
+      [historicalId, `integration-historical-${randomUUID()}`, template.id, localWorkspaceId],
+    );
+    const calls: ResearchModelRequest[] = [];
+    await processResearchRun(
+      pool,
+      { researchRunId: historicalId, workspaceId: localWorkspaceId },
+      { model: fixtureModel(calls) },
+    );
+    const run = (await getResearchRun(pool, localWorkspaceId, historicalId)) as RunView & {
+      errorCode: string;
+    };
+    expect(run).toMatchObject({ state: 'failed', errorCode: 'protocol_version_unsupported' });
+    expect(run.proposals).toEqual([]);
+    expect(run.events.map((event) => event.eventType)).toEqual(['run_failed']);
+    expect(calls).toEqual([]);
+  });
+
   it('records and rejects a model proposal that cites nonexistent evidence', async () => {
     const sessionId = await createSession(pool, 'unseen materials simulation methods');
     const requested = (await requestResearchRun(pool, localWorkspaceId, sessionId, {
@@ -282,6 +378,41 @@ describe('bounded model-led research persistence', () => {
     );
   });
 
+  it('rejects an oversized complete model envelope before the next dispatch', async () => {
+    const sessionId = await createSession(pool, 'large bounded research envelope');
+    const requested = (await requestResearchRun(pool, localWorkspaceId, sessionId, {
+      mode: 'search',
+      idempotencyKey: `integration-input-envelope-${randomUUID()}`,
+    })) as { id: string };
+    const calls: ResearchModelRequest[] = [];
+    await processResearchRun(
+      pool,
+      { researchRunId: requested.id, workspaceId: localWorkspaceId },
+      {
+        model: fixtureModel(calls, { wideAction: true }),
+        sources: {
+          async search(action) {
+            return {
+              state: 'complete',
+              candidates: Array.from({ length: 20 }, (_, index) => ({
+                id: randomUUID(),
+                sourceKey: action.sourceKey,
+                title: `Oversized boundary candidate ${index} ${'t'.repeat(450)}`,
+                summary: `Untrusted source text ${index} ${'x'.repeat(1_950)}`,
+                canonicalUri: `https://example.test/oversized/${index}`,
+              })),
+            };
+          },
+        },
+      },
+    );
+    const run = (await getResearchRun(pool, localWorkspaceId, requested.id)) as RunView & {
+      errorCode: string;
+    };
+    expect(run).toMatchObject({ state: 'failed', errorCode: 'budget_exceeded' });
+    expect(calls.map((request) => request.proposalType)).toEqual(['plan']);
+  });
+
   it('terminally accounts for an expired worker lease without replaying calls', async () => {
     const sessionId = await createSession(pool, 'lease recovery evidence');
     const requested = (await requestResearchRun(pool, localWorkspaceId, sessionId, {
@@ -301,6 +432,211 @@ describe('bounded model-led research persistence', () => {
     expect(run.state).toBe('failed');
     expect(run.events.map((event) => event.eventType)).toContain('run_recovered');
     expect(run.consumedModelCalls).toBe(0);
+  });
+
+  it('waits for a discovery operation claimed by a competing dispatcher', async () => {
+    const sessionId = await createSession(pool, 'competing dispatcher evidence');
+    const requested = (await requestResearchRun(pool, localWorkspaceId, sessionId, {
+      mode: 'search',
+      idempotencyKey: `integration-competing-dispatch-${randomUUID()}`,
+    })) as { id: string };
+    const run = (await getResearchRun(pool, localWorkspaceId, requested.id)) as RunView;
+    const operation = (await requestDiscovery(
+      pool,
+      localWorkspaceId,
+      sessionId,
+      {
+        adapterKey: 'mcp_registry',
+        approvedPublicQuery: 'competing dispatcher evidence',
+        idempotencyKey: `integration-competing-source-${randomUUID()}`,
+        intent: 'explore',
+      },
+      {
+        planRouteId: 'competing-source',
+        variantIndex: 1,
+        routingReason: 'Exercise the outbox and inline dispatch race.',
+        sourcePlanState: 'planned',
+        outboundQuery: 'competing dispatcher evidence',
+        researchRunId: requested.id,
+        researchStep: 0,
+        researchActionKey: 'competing-source',
+        resultSetId: run.resultSetId,
+        resultLimit: 1,
+        dispatch: 'inline',
+      },
+    )) as { id: string };
+    await pool.query(
+      `UPDATE ops.discovery_operations
+       SET state = 'running', started_at = now(), finished_at = NULL, updated_at = now()
+       WHERE id = $1 AND workspace_id = $2`,
+      [operation.id, localWorkspaceId],
+    );
+    const completion = new Promise<void>((resolve, reject) => {
+      setTimeout(() => {
+        pool
+          .query(
+            `UPDATE ops.discovery_operations
+             SET state = 'complete', result_count = 0,
+                 safe_detail = 'Competing dispatcher completed.', finished_at = now(), updated_at = now()
+             WHERE id = $1 AND workspace_id = $2`,
+            [operation.id, localWorkspaceId],
+          )
+          .then(() => resolve(), reject);
+      }, 75);
+    });
+    await expect(
+      waitForResearchDiscoveryTerminal(pool, localWorkspaceId, operation.id),
+    ).resolves.toMatchObject({ state: 'complete', safeDetail: 'Competing dispatcher completed.' });
+    await completion;
+  });
+
+  it('rejects a research source operation bound to a different result-set snapshot', async () => {
+    const sessionId = await createSession(pool, 'frozen research result set');
+    const otherSessionId = await createSession(pool, 'different result set');
+    const requested = (await requestResearchRun(pool, localWorkspaceId, sessionId, {
+      mode: 'search',
+      idempotencyKey: `integration-result-set-binding-${randomUUID()}`,
+    })) as { id: string };
+    const run = (await getResearchRun(pool, localWorkspaceId, requested.id)) as RunView;
+    const other = await pool.query<{ resultSetId: string }>(
+      `SELECT id AS "resultSetId" FROM workspace.query_result_sets
+       WHERE query_session_id = $1 AND workspace_id = $2 ORDER BY revision DESC LIMIT 1`,
+      [otherSessionId, localWorkspaceId],
+    );
+    const operation = (await requestDiscovery(
+      pool,
+      localWorkspaceId,
+      sessionId,
+      {
+        adapterKey: 'mcp_registry',
+        approvedPublicQuery: 'frozen research result set',
+        idempotencyKey: `integration-result-set-operation-${randomUUID()}`,
+        intent: 'explore',
+      },
+      {
+        planRouteId: 'frozen-result-set',
+        variantIndex: 1,
+        routingReason: 'Negative invariant probe.',
+        sourcePlanState: 'planned',
+        outboundQuery: 'frozen research result set',
+        researchRunId: requested.id,
+        researchStep: 0,
+        researchActionKey: 'frozen-result-set',
+        resultSetId: run.resultSetId,
+        resultLimit: 1,
+        dispatch: 'inline',
+      },
+    )) as { id: string };
+    await expect(
+      pool.query(
+        `UPDATE ops.discovery_operations SET result_set_id = $3
+         WHERE id = $1 AND workspace_id = $2`,
+        [operation.id, localWorkspaceId, other.rows[0]!.resultSetId],
+      ),
+    ).rejects.toThrow(/must match its run snapshot/);
+  });
+
+  it('serializes stale-run recovery against a running source finalization', async () => {
+    const sessionId = await createSession(pool, 'recovery crossing source finalization');
+    const requested = (await requestResearchRun(pool, localWorkspaceId, sessionId, {
+      mode: 'search',
+      idempotencyKey: `integration-crossing-recovery-${randomUUID()}`,
+    })) as { id: string };
+    const run = (await getResearchRun(pool, localWorkspaceId, requested.id)) as RunView;
+    const operation = (await requestDiscovery(
+      pool,
+      localWorkspaceId,
+      sessionId,
+      {
+        adapterKey: 'mcp_registry',
+        approvedPublicQuery: 'recovery crossing source finalization',
+        idempotencyKey: `integration-crossing-source-${randomUUID()}`,
+        intent: 'explore',
+      },
+      {
+        planRouteId: 'crossing-source',
+        variantIndex: 1,
+        routingReason: 'Prove recovery wins without a late child commit.',
+        sourcePlanState: 'planned',
+        outboundQuery: 'recovery crossing source finalization',
+        researchRunId: requested.id,
+        researchStep: 0,
+        researchActionKey: 'crossing-source',
+        resultSetId: run.resultSetId,
+        resultLimit: 1,
+        dispatch: 'inline',
+      },
+    )) as { id: string };
+    await pool.query(
+      `UPDATE ops.research_runs
+       SET state = 'running', lease_token = $3, lease_until = now() - interval '1 minute',
+           started_at = now() - interval '2 minutes', updated_at = now()
+       WHERE id = $1 AND workspace_id = $2 AND state = 'queued'`,
+      [requested.id, localWorkspaceId, randomUUID()],
+    );
+    await pool.query(
+      `UPDATE ops.discovery_operations
+       SET state = 'queued', reserved_calls = 1, finished_at = NULL, updated_at = now()
+       WHERE id = $1 AND workspace_id = $2`,
+      [operation.id, localWorkspaceId],
+    );
+    let enteredResolve!: () => void;
+    let releaseResolve!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      enteredResolve = resolve;
+    });
+    const release = new Promise<void>((resolve) => {
+      releaseResolve = resolve;
+    });
+    const adapter: DiscoveryAdapter = {
+      key: 'mcp_registry',
+      version: 'fixture-v1',
+      async search() {
+        enteredResolve();
+        await release;
+        return {
+          state: 'complete',
+          leads: [
+            {
+              externalId: `late-${operation.id}`,
+              canonicalUri: 'https://example.test/late-source',
+              title: 'Late source result',
+              summary: 'This result must not commit after parent recovery.',
+              kindHint: 'tool',
+              payload: { late: true },
+              provenance: {
+                adapter: 'mcp_registry',
+                adapterVersion: 'fixture-v1',
+                source: 'fixture',
+                observedAt: new Date(0).toISOString(),
+                reviewState: 'lead',
+              },
+            },
+          ],
+          responseBytes: 100,
+          httpStatus: 200,
+          rateLimit: { remaining: null, resetAt: null, retryAfter: null },
+        };
+      },
+    };
+    const processing = processDiscoveryOperation(
+      pool,
+      { operationId: operation.id, workspaceId: localWorkspaceId },
+      adapter,
+    );
+    await entered;
+    expect(await recoverStaleResearchRuns(pool)).toBe(1);
+    releaseResolve();
+    await processing;
+
+    const recovered = (await getResearchRun(pool, localWorkspaceId, requested.id)) as RunView;
+    const operationView = (await getDiscoveryOperation(pool, localWorkspaceId, operation.id)) as {
+      state: string;
+      attempts: unknown[];
+      candidates: unknown[];
+    };
+    expect(recovered.state).toBe('failed');
+    expect(operationView).toMatchObject({ state: 'failed', attempts: [], candidates: [] });
   });
 
   it('fails without a model call when configuration changes before claim', async () => {
@@ -337,7 +673,7 @@ describe('bounded model-led research persistence', () => {
          VALUES ($1, $2, $3, 0, 'run_failed', $4, '{}'::jsonb)`,
         [randomUUID(), requested.id, localWorkspaceId, '0'.repeat(64)],
       ),
-    ).rejects.toThrow(/terminal research runs cannot accept new child records/);
+    ).rejects.toThrow(/terminal research runs cannot accept (?:new child records|child writes)/);
     await configureAdapter(pool, 'local_semantic', {
       enabled: true,
       baseUrl: 'http://127.0.0.1:18080/v1',
@@ -349,7 +685,6 @@ describe('bounded model-led research persistence', () => {
 
   it('enforces the declared result limit before persistence', async () => {
     const sessionId = await createSession(pool, 'bounded acquisition evidence');
-    await pool.query(`DELETE FROM ops.adapter_daily_budgets WHERE adapter_key = 'mcp_registry'`);
     const operation = (await requestDiscovery(
       pool,
       localWorkspaceId,
@@ -370,6 +705,12 @@ describe('bounded model-led research persistence', () => {
         dispatch: 'inline',
       },
     )) as { id: string };
+    await pool.query(
+      `UPDATE ops.discovery_operations
+       SET state = 'queued', reserved_calls = 1, finished_at = NULL, updated_at = now()
+       WHERE id = $1 AND workspace_id = $2`,
+      [operation.id, localWorkspaceId],
+    );
     const observedLimits: number[] = [];
     const adapter: DiscoveryAdapter = {
       key: 'mcp_registry',

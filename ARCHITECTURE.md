@@ -50,6 +50,11 @@ model interface currently has one explicit loopback OpenAI-compatible implementa
 cloud fallback, automatic model download, or model router. The model choice and token economics are
 evaluation variables, not product ontology.
 
+Stored protocol-v1 syntheses are normalized only at the presentation boundary and remain immutable.
+The worker refuses queued historical-protocol jobs without calling a model or source. Research child
+writes take a parent-row lock, and source dispatch waits for a competing worker to reach a terminal
+state before synthesis can continue.
+
 The existing deterministic query and retrieval policies remain versioned for Phase 06/07 replay.
 When no model is configured, they remain the declared fallback. They also support exact identity,
 literal constraints, candidate generation, must-find checks, and model-output auditing. New

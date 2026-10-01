@@ -62,6 +62,7 @@ describe('reviewed PostgreSQL contract', () => {
       '0017_research_run_integrity.sql',
       '0018_research_child_terminal_guard.sql',
       '0019_research_result_set_binding.sql',
+      '0020_research_child_serialization.sql',
     ]);
     expect(migrations.rows.every((row) => /^[a-f0-9]{64}$/.test(row.sha256))).toBe(true);
   });

@@ -15,8 +15,8 @@ import { useWorkspaceProjects } from '../workspace-queries.js';
 import {
   ResearchCitationList,
   ResearchEvidenceList,
+  normalizeResearchEvidenceSynthesis,
   type ResearchEvidenceCandidate,
-  type ResearchEvidenceSynthesis,
 } from '../ResearchEvidenceList.js';
 
 const ExplorerMap = lazy(async () => ({
@@ -453,9 +453,9 @@ export function ExplorePage() {
     (operation) =>
       operation.isPending || ['queued', 'running'].includes(operation.data?.state ?? ''),
   );
-  const researchSynthesis = researchRun.data?.proposals.find(
-    (proposal) => proposal.proposalType === 'synthesis',
-  )?.output as ResearchEvidenceSynthesis | undefined;
+  const researchSynthesis = normalizeResearchEvidenceSynthesis(
+    researchRun.data?.proposals.find((proposal) => proposal.proposalType === 'synthesis')?.output,
+  );
   const researchCandidates = new Map(
     (researchRun.data?.candidates ?? []).map((candidate) => [candidate.id, candidate]),
   );
@@ -743,6 +743,11 @@ export function ExplorePage() {
                       citationCandidateIds={researchSynthesis.summaryCitationCandidateIds}
                       labelText="Summary evidence"
                     />
+                    {researchSynthesis.protocolVersion === 'research-protocol-v1' ? (
+                      <p className="hint">
+                        Historical v1 synthesis replayed with its original evidence citations.
+                      </p>
+                    ) : null}
                     {researchSynthesis.abstentionReason ? (
                       <p className="authority-note">
                         Abstained: {researchSynthesis.abstentionReason}

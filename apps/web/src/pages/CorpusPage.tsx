@@ -5,8 +5,8 @@ import { api, formatDate, formatFractionPercent, label } from '../api.js';
 import {
   ResearchCitationList,
   ResearchEvidenceList,
+  normalizeResearchEvidenceSynthesis,
   type ResearchEvidenceCandidate,
-  type ResearchEvidenceSynthesis,
 } from '../ResearchEvidenceList.js';
 import { Badge, Empty, ErrorPanel, Loading, PageHeader } from '../ui.js';
 
@@ -149,9 +149,9 @@ export function CorpusPage() {
     setParameters({});
   }
 
-  const synthesis = researchRun.data?.proposals.find(
-    (proposal) => proposal.proposalType === 'synthesis',
-  )?.output as ResearchEvidenceSynthesis | undefined;
+  const synthesis = normalizeResearchEvidenceSynthesis(
+    researchRun.data?.proposals.find((proposal) => proposal.proposalType === 'synthesis')?.output,
+  );
   const researchCandidates = new Map(
     (researchRun.data?.candidates ?? []).map((candidate) => [candidate.id, candidate]),
   );
@@ -317,6 +317,11 @@ export function CorpusPage() {
                       citationCandidateIds={synthesis.summaryCitationCandidateIds}
                       labelText="Summary evidence"
                     />
+                    {synthesis.protocolVersion === 'research-protocol-v1' ? (
+                      <p className="hint">
+                        Historical v1 synthesis replayed with its original evidence citations.
+                      </p>
+                    ) : null}
                     {synthesis.abstentionReason ? (
                       <p className="authority-note">Abstained: {synthesis.abstentionReason}</p>
                     ) : null}

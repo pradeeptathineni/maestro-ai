@@ -1,6 +1,10 @@
-import type { Pool } from 'pg';
+import { setTimeout as delay } from 'node:timers/promises';
+import type { Pool, PoolClient } from 'pg';
 import type { ResearchRunBody } from '../../contracts/src/index.js';
-import { createLocalResearchModel } from '../../adapters/src/index.js';
+import {
+  createLocalResearchModel,
+  localResearchRequestByteLength,
+} from '../../adapters/src/index.js';
 import {
   executeResearchSkill,
   hashCanonical,
@@ -35,6 +39,16 @@ const DEFAULT_RESEARCH_BUDGET = {
 } as const;
 const MODEL_CALL_RESERVATION = DEFAULT_RESEARCH_BUDGET.maxSteps + 1;
 const RESEARCH_LEASE_SECONDS = 180;
+const DISCOVERY_TERMINAL_STATES = new Set([
+  'partial',
+  'complete',
+  'failed',
+  'cancelled',
+  'not_configured',
+  'budget_denied',
+  'skipped',
+  'unsupported',
+]);
 
 interface ResearchTaskPayload {
   researchRunId: string;
@@ -51,6 +65,8 @@ interface ClaimedResearchRun {
   mode: 'search' | 'corpus';
   allowedSourceKeys: string[];
   budget: typeof DEFAULT_RESEARCH_BUDGET;
+  skillVersion: string;
+  protocolVersion: string;
   modelConfigHash: string;
   expectedModelIdentifier: string;
   modelEnabled: boolean;
@@ -92,6 +108,9 @@ function proposalCitations(output: unknown): string[] {
   if (Array.isArray(record.citedCandidateIds)) {
     for (const id of record.citedCandidateIds) if (typeof id === 'string') ids.add(id);
   }
+  if (Array.isArray(record.summaryCitationCandidateIds)) {
+    for (const id of record.summaryCitationCandidateIds) if (typeof id === 'string') ids.add(id);
+  }
   if (Array.isArray(record.items)) {
     for (const value of record.items) {
       if (!value || typeof value !== 'object' || Array.isArray(value)) continue;
@@ -103,6 +122,53 @@ function proposalCitations(output: unknown): string[] {
     }
   }
   return [...ids];
+}
+
+interface DiscoveryTerminalView {
+  state: string;
+  safeDetail: string | null;
+}
+
+export async function waitForResearchDiscoveryTerminal(
+  pool: Pool,
+  workspaceId: string,
+  operationId: string,
+): Promise<DiscoveryTerminalView> {
+  const read = () =>
+    pool.query<DiscoveryTerminalView & { timeoutMs: number }>(
+      `SELECT operation.state, operation.safe_detail AS "safeDetail",
+              config.timeout_ms AS "timeoutMs"
+       FROM ops.discovery_operations operation
+       JOIN ops.source_adapter_configs config ON config.adapter_key = operation.adapter_key
+       WHERE operation.id = $1 AND operation.workspace_id = $2`,
+      [operationId, workspaceId],
+    );
+  let result = await read();
+  if (!result.rowCount) {
+    throw new ResearchProtocolError(
+      'source_contract_violation',
+      'The requested source operation was not available for evidence collection.',
+    );
+  }
+  const deadline =
+    Date.now() + Math.min(60_000, Math.max(1_000, result.rows[0]!.timeoutMs + 5_000));
+  while (!DISCOVERY_TERMINAL_STATES.has(result.rows[0]!.state)) {
+    if (Date.now() >= deadline) {
+      throw new ResearchProtocolError(
+        'source_contract_violation',
+        'The source operation did not reach a terminal state inside its bounded dispatch window.',
+      );
+    }
+    await delay(50);
+    result = await read();
+    if (!result.rowCount) {
+      throw new ResearchProtocolError(
+        'source_contract_violation',
+        'The requested source operation disappeared before evidence collection completed.',
+      );
+    }
+  }
+  return result.rows[0]!;
 }
 
 async function writeRunEvent(
@@ -252,14 +318,9 @@ async function executeLiveAction(
       workspaceId: row.workspaceId,
     });
   }
-  const [operation, candidates] = await Promise.all([
-    pool.query<{ state: string; safeDetail: string | null }>(
-      `SELECT state, safe_detail AS "safeDetail"
-       FROM ops.discovery_operations WHERE id = $1 AND workspace_id = $2`,
-      [requested.id, row.workspaceId],
-    ),
-    pool.query<ResearchCandidate>(
-      `SELECT candidate.id, candidate.adapter_key AS "sourceKey", candidate.title,
+  const operation = await waitForResearchDiscoveryTerminal(pool, row.workspaceId, requested.id);
+  const candidates = await pool.query<ResearchCandidate>(
+    `SELECT candidate.id, candidate.adapter_key AS "sourceKey", candidate.title,
             candidate.summary, candidate.canonical_uri AS "canonicalUri",
             candidate.created_at::text AS "observedAt",
             config.source_class AS "sourceClass", candidate.review_state AS "reviewState",
@@ -268,12 +329,11 @@ async function executeLiveAction(
      JOIN ops.discovery_candidates candidate ON candidate.id = link.discovery_candidate_id
      JOIN ops.source_adapter_configs config ON config.adapter_key = candidate.adapter_key
      WHERE link.operation_id = $1 AND link.workspace_id = $2
-     ORDER BY candidate.title, candidate.id
-     LIMIT $3`,
-      [requested.id, row.workspaceId, action.maxResults],
-    ),
-  ]);
-  const operationState = operation.rows[0]?.state ?? 'failed';
+      ORDER BY candidate.title, candidate.id
+      LIMIT $3`,
+    [requested.id, row.workspaceId, action.maxResults],
+  );
+  const operationState = operation.state;
   const state =
     operationState === 'complete' && candidates.rowCount === 0
       ? 'empty'
@@ -294,7 +354,7 @@ async function executeLiveAction(
     candidates: candidates.rows,
     operationId: requested.id,
     safeDetail:
-      operation.rows[0]?.safeDetail ??
+      operation.safeDetail ??
       (state === 'failed' ? 'The source operation did not reach a terminal state.' : null),
   };
 }
@@ -492,6 +552,7 @@ async function claimResearchRun(
                run.query_session_id AS "querySessionId", run.result_set_id AS "resultSetId",
                session.query_text AS "publicQuery", session.deleted_at IS NULL AS "sessionAvailable",
                run.mode,
+               run.skill_version AS "skillVersion", run.protocol_version AS "protocolVersion",
                run.allowed_source_keys AS "allowedSourceKeys", run.budget,
                run.model_config_hash AS "modelConfigHash",
                run.model_identifier AS "expectedModelIdentifier",
@@ -506,6 +567,26 @@ async function claimResearchRun(
     [payload.researchRunId, payload.workspaceId, leaseToken, RESEARCH_LEASE_SECONDS],
   );
   return claimed.rows[0] ?? null;
+}
+
+async function closeActiveResearchOperations(
+  client: PoolClient,
+  row: Pick<ClaimedResearchRun, 'id' | 'workspaceId'>,
+  errorCode: string,
+): Promise<void> {
+  await client.query(
+    `SELECT id FROM ops.research_runs WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
+    [row.id, row.workspaceId],
+  );
+  await client.query(
+    `UPDATE ops.discovery_operations
+     SET state = 'failed', error_code = $3,
+         safe_detail = 'The parent research run closed before this source operation completed.',
+         finished_at = now(), updated_at = now()
+     WHERE research_run_id = $1 AND workspace_id = $2
+       AND state IN ('planned', 'queued', 'running', 'cancel_requested')`,
+    [row.id, row.workspaceId, errorCode],
+  );
 }
 
 async function renewResearchLease(pool: Pool, row: ClaimedResearchRun): Promise<void> {
@@ -543,6 +624,28 @@ export async function processResearchRun(
     lastCall: { request: ResearchModelRequest; response: ResearchModelResponse } | null;
   } = { lastCall: null };
   let lastAcceptedOutputHash: string | null = null;
+  if (
+    row.skillVersion !== RESEARCH_SKILL_VERSION ||
+    row.protocolVersion !== RESEARCH_PROTOCOL_VERSION
+  ) {
+    await writeRunEvent(pool, row, 0, 'run_failed', {
+      errorCode: 'protocol_version_unsupported',
+      storedSkillVersion: row.skillVersion,
+      storedProtocolVersion: row.protocolVersion,
+    });
+    await inTransaction(pool, async (client) => {
+      await closeActiveResearchOperations(client, row, 'protocol_version_unsupported');
+      await client.query(
+        `UPDATE ops.research_runs
+         SET state = 'failed', error_code = 'protocol_version_unsupported',
+             safe_detail = 'This queued run uses a historical research protocol and was closed without model or source calls.',
+             lease_token = NULL, lease_until = NULL, finished_at = now(), updated_at = now()
+         WHERE id = $1 AND workspace_id = $2 AND lease_token = $3 AND state = 'running'`,
+        [row.id, row.workspaceId, row.leaseToken],
+      );
+    });
+    return;
+  }
   const currentFingerprint = currentModelFingerprint(row);
   if (
     !row.sessionAvailable ||
@@ -553,16 +656,19 @@ export async function processResearchRun(
   ) {
     const errorCode = row.sessionAvailable ? 'model_config_changed' : 'session_unavailable';
     await writeRunEvent(pool, row, 0, 'run_failed', { errorCode });
-    await pool.query(
-      `UPDATE ops.research_runs
-       SET state = 'failed', error_code = $4,
-           safe_detail = CASE WHEN $4 = 'session_unavailable'
-             THEN 'The query session was redacted before execution; no model call was made.'
-             ELSE 'The configured local model changed before execution; no model call was made.' END,
-           lease_token = NULL, lease_until = NULL, finished_at = now(), updated_at = now()
-       WHERE id = $1 AND workspace_id = $2 AND lease_token = $3 AND state = 'running'`,
-      [row.id, row.workspaceId, row.leaseToken, errorCode],
-    );
+    await inTransaction(pool, async (client) => {
+      await closeActiveResearchOperations(client, row, errorCode);
+      await client.query(
+        `UPDATE ops.research_runs
+         SET state = 'failed', error_code = $4,
+             safe_detail = CASE WHEN $4 = 'session_unavailable'
+               THEN 'The query session was redacted before execution; no model call was made.'
+               ELSE 'The configured local model changed before execution; no model call was made.' END,
+             lease_token = NULL, lease_until = NULL, finished_at = now(), updated_at = now()
+         WHERE id = $1 AND workspace_id = $2 AND lease_token = $3 AND state = 'running'`,
+        [row.id, row.workspaceId, row.leaseToken, errorCode],
+      );
+    });
     return;
   }
   const activeModel =
@@ -575,10 +681,10 @@ export async function processResearchRun(
     });
   const model = {
     async propose(request: ResearchModelRequest): Promise<ResearchModelResponse> {
-      if (Buffer.byteLength(JSON.stringify(request.payload), 'utf8') > row.currentMaxInputTokens) {
+      if (localResearchRequestByteLength(request) > row.currentMaxInputTokens) {
         throw new ResearchProtocolError(
           'budget_exceeded',
-          'Serialized model input exceeded the configured conservative byte boundary.',
+          'The complete serialized model input exceeded the configured conservative byte boundary.',
         );
       }
       await renewResearchLease(pool, row);
@@ -649,7 +755,8 @@ export async function processResearchRun(
           allowedSourcesEnforcedByHost: true,
           evidenceIdsValidatedByHost: event.proposalType !== 'plan',
           inputBoundedBeforeDispatch: true,
-          inputBoundaryUnit: 'utf8_bytes_conservative_against_configured_input_tokens',
+          inputBoundaryUnit:
+            'utf8_bytes_full_prompt_and_schema_conservative_against_configured_input_tokens',
           privateProjectContextIncluded: false,
           arbitraryToolAuthority: false,
         }),
@@ -687,6 +794,17 @@ export async function processResearchRun(
       },
     );
     await inTransaction(pool, async (client) => {
+      await client.query(
+        `SELECT id FROM ops.research_runs WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
+        [row.id, row.workspaceId],
+      );
+      const activeChildren = await client.query<{ count: number }>(
+        `SELECT count(*)::int AS count FROM ops.discovery_operations
+         WHERE research_run_id = $1 AND workspace_id = $2
+           AND state IN ('planned', 'queued', 'running', 'cancel_requested')`,
+        [row.id, row.workspaceId],
+      );
+      if (activeChildren.rows[0]!.count > 0) throw new Error('research_source_not_terminal');
       const completed = await client.query(
         `UPDATE ops.research_runs
          SET state = 'complete', consumed_model_calls = $4, stop_reason = $5,
@@ -729,6 +847,7 @@ export async function processResearchRun(
     }
     await writeRunEvent(pool, row, currentStep, 'run_failed', { errorCode: protocolCode });
     await inTransaction(pool, async (client) => {
+      await closeActiveResearchOperations(client, row, protocolCode);
       const failed = await client.query(
         `UPDATE ops.research_runs
          SET state = 'failed', consumed_model_calls = $4, error_code = $5,
@@ -892,6 +1011,7 @@ export async function recoverStaleResearchRuns(pool: Pool): Promise<number> {
          VALUES ($1, $2, $3, 0, 'run_recovered', $4, $5)`,
         [newOpaqueId(), row.id, row.workspaceId, hashCanonical(receipt), json(receipt)],
       );
+      await closeActiveResearchOperations(client, row, 'worker_lease_expired');
       await client.query(
         `UPDATE ops.research_runs
          SET state = 'failed', error_code = 'worker_lease_expired',

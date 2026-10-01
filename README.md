@@ -47,7 +47,9 @@ loopback `local_semantic` model and public source adapters are enabled, Search r
 `research-skill-v1` with `research-protocol-v2`; only public query/evidence fields cross those
 boundaries. A sufficient synthesis must carry exact summary and item citations; an insufficient
 run abstains explicitly. Otherwise Search uses the preserved deterministic path, which can also be
-started explicitly after a model-run failure. Copy
+started explicitly after a model-run failure. Immutable v1 synthesis history remains replayable;
+queued v1 work is terminally rejected without a new model or source call instead of being mixed
+with v2 proposals. Copy
 `.env.example` to `.env` only when changing a documented port. `MAESTRO_ALLOW_NETWORK_FETCH=false`
 also keeps the original Consider/refresh metadata path offline. Unknown public hosts enter manual
 review; local, private, credential-bearing, non-HTTPS, and nonstandard-port public URLs are rejected

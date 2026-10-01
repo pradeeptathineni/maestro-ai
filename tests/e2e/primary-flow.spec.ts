@@ -688,6 +688,80 @@ test('model-led research renders sufficiency, exact citations, and source outcom
   assertRuntime();
 });
 
+test('historical v1 research synthesis remains replayable without rewriting it', async ({
+  page,
+}) => {
+  const assertRuntime = observeRuntime(page);
+  const runId = '34343434-3434-4434-8434-343434343434';
+  const candidateId = '45454545-4545-4454-8454-454545454545';
+  const researchSummary = {
+    id: runId,
+    mode: 'search',
+    strategy: 'model',
+    state: 'complete',
+    safeDetail: 'Historical model-led search completed with cited evidence.',
+  };
+  await patchSearchResponses(page, { researchRun: researchSummary });
+  await page.route(`**/api/v1/research/runs/${runId}`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ...researchSummary,
+        modelIdentifier: 'historical-local-model',
+        stopReason: 'evidence_sufficient',
+        fallbackAvailable: false,
+        candidates: [
+          {
+            id: candidateId,
+            sourceKey: 'github',
+            title: 'example/historical-evidence',
+            summary: 'Immutable evidence captured by the v1 research protocol.',
+            canonicalUri: 'https://github.com/example/historical-evidence',
+            observedAt: '2026-09-01T12:00:00.000Z',
+          },
+        ],
+        operations: [],
+        proposals: [
+          {
+            proposalType: 'synthesis',
+            output: {
+              protocolVersion: 'research-protocol-v1',
+              summary: 'Historical synthesis preserved under its original protocol.',
+              groups: [
+                {
+                  label: 'Historical evidence',
+                  description: 'Evidence selected by the original run.',
+                  candidateIds: [candidateId],
+                },
+              ],
+              items: [
+                {
+                  candidateId,
+                  reason: 'The original run selected this evidence.',
+                  uncertainty: 'This record predates the v2 sufficiency contract.',
+                  citationCandidateIds: [candidateId],
+                },
+              ],
+              limitations: ['Replayed without upgrading the immutable proposal.'],
+            },
+          },
+        ],
+      }),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByLabel('Capability question').fill('historical research replay');
+  await page.getByRole('button', { name: 'Search', exact: true }).click();
+  await expect(page.getByText('Research synthesis · Legacy context')).toBeVisible();
+  await expect(
+    page.getByText('Historical v1 synthesis replayed with its original evidence citations.'),
+  ).toBeVisible();
+  await expect(page.getByRole('link', { name: /example\/historical-evidence/ })).toHaveCount(2);
+  assertRuntime();
+});
+
 test('budget-denied model path keeps deterministic leads visible', async ({ page }) => {
   const assertRuntime = observeRuntime(page);
   const runId = '77777777-7777-4777-8777-777777777777';

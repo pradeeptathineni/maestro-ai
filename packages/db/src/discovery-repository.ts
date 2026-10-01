@@ -1,4 +1,4 @@
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 import type {
   AdapterConfigBody,
   DiscoveryAdmissionBody,
@@ -585,6 +585,24 @@ interface DiscoveryTaskPayload {
   workspaceId: string;
 }
 
+async function lockActiveResearchParentForOperation(
+  client: PoolClient,
+  payload: DiscoveryTaskPayload,
+): Promise<boolean> {
+  const association = await client.query<{ researchRunId: string | null }>(
+    `SELECT research_run_id AS "researchRunId"
+     FROM ops.discovery_operations WHERE id = $1 AND workspace_id = $2`,
+    [payload.operationId, payload.workspaceId],
+  );
+  if (!association.rows[0]?.researchRunId) return true;
+  const parent = await client.query<{ finishedAt: Date | null }>(
+    `SELECT finished_at AS "finishedAt" FROM ops.research_runs
+     WHERE id = $1 AND workspace_id = $2 FOR SHARE`,
+    [association.rows[0].researchRunId, payload.workspaceId],
+  );
+  return Boolean(parent.rowCount && !parent.rows[0]!.finishedAt);
+}
+
 function adapterFor(config: {
   adapterKey: string;
   baseUrl: string | null;
@@ -606,7 +624,7 @@ export async function processDiscoveryOperation(
   payload: DiscoveryTaskPayload,
   adapterOverride?: DiscoveryAdapter,
 ): Promise<void> {
-  const claimed = await pool.query<{
+  interface ClaimedOperation {
     adapterKey: string;
     baseUrl: string | null;
     timeoutMs: number;
@@ -615,22 +633,26 @@ export async function processDiscoveryOperation(
     query: string;
     attempt: number;
     startedAt: Date;
-  }>(
-    `UPDATE ops.discovery_operations operation
-     SET state = 'running', started_at = COALESCE(started_at, now()), updated_at = now()
-     FROM ops.source_adapter_configs config
-     WHERE operation.id = $1 AND operation.workspace_id = $2 AND operation.state = 'queued'
-       AND config.adapter_key = operation.adapter_key AND config.enabled
-     RETURNING operation.adapter_key AS "adapterKey", config.base_url AS "baseUrl",
-               config.timeout_ms AS "timeoutMs", config.response_byte_limit AS "responseByteLimit",
-               operation.outbound_query AS query, operation.result_limit AS "resultLimit",
-               operation.started_at AS "startedAt",
-               COALESCE((SELECT max(attempt) + 1 FROM ops.discovery_attempts
-                         WHERE operation_id = operation.id), 1)::int AS attempt`,
-    [payload.operationId, payload.workspaceId],
-  );
-  if (!claimed.rowCount) return;
-  const row = claimed.rows[0]!;
+  }
+  const row = await inTransaction(pool, async (client): Promise<ClaimedOperation | null> => {
+    if (!(await lockActiveResearchParentForOperation(client, payload))) return null;
+    const claimed = await client.query<ClaimedOperation>(
+      `UPDATE ops.discovery_operations operation
+       SET state = 'running', started_at = COALESCE(started_at, now()), updated_at = now()
+       FROM ops.source_adapter_configs config
+       WHERE operation.id = $1 AND operation.workspace_id = $2 AND operation.state = 'queued'
+         AND config.adapter_key = operation.adapter_key AND (config.enabled OR $3::boolean)
+       RETURNING operation.adapter_key AS "adapterKey", config.base_url AS "baseUrl",
+                 config.timeout_ms AS "timeoutMs", config.response_byte_limit AS "responseByteLimit",
+                 operation.outbound_query AS query, operation.result_limit AS "resultLimit",
+                 operation.started_at AS "startedAt",
+                 COALESCE((SELECT max(attempt) + 1 FROM ops.discovery_attempts
+                           WHERE operation_id = operation.id), 1)::int AS attempt`,
+      [payload.operationId, payload.workspaceId, Boolean(adapterOverride)],
+    );
+    return claimed.rows[0] ?? null;
+  });
+  if (!row) return;
   let result;
   try {
     const adapter = adapterOverride ?? adapterFor(row);
@@ -647,10 +669,12 @@ export async function processDiscoveryOperation(
     };
   }
   await inTransaction(pool, async (client) => {
+    if (!(await lockActiveResearchParentForOperation(client, payload))) return;
     const latest = await client.query<{ state: string }>(
       `SELECT state FROM ops.discovery_operations WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
       [payload.operationId, payload.workspaceId],
     );
+    if (!['running', 'cancel_requested'].includes(latest.rows[0]?.state ?? '')) return;
     const cancelled = latest.rows[0]?.state === 'cancel_requested';
     for (const lead of result.leads) {
       const candidateId = newOpaqueId();
