@@ -434,16 +434,17 @@ test('G6 map stays bounded and interactive at declared synthetic sizes', async (
   assertRuntime();
 });
 
-test('corpus separates saved leads from indexed knowledge and scores an explicit search', async ({
+test('corpus excludes live leads from admitted knowledge and scores an explicit search', async ({
   page,
 }) => {
   const assertRuntime = observeRuntime(page);
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.goto('/corpus');
   await expect(
-    page.getByRole('heading', { name: 'Browse saved technology research' }),
+    page.getByRole('heading', { name: 'Browse the durable research corpus' }),
   ).toBeVisible();
-  await expect(page.getByText(/saved lead is not reviewed knowledge/i)).toBeVisible();
+  await expect(page.getByText(/Corpus contains admitted indexed knowledge/i)).toBeVisible();
+  await expect(page.getByLabel('Layer').locator('option[value="source_lead"]')).toHaveCount(0);
   await page.getByLabel('Search the corpus').fill('context reduction for coding agents');
   await page.getByRole('button', { name: 'Search corpus' }).click();
   expect(page.url()).not.toContain('context');
@@ -499,7 +500,7 @@ test('generic browser authoring creates an attributed Corpus record without exec
   await expect(row).toBeVisible();
   await expect(row.getByText('Proposed', { exact: true })).toBeVisible();
   await expect(row.getByText(/Human Supplied Documentation/)).toBeVisible();
-  await expect(page.getByText(/saved lead is not reviewed knowledge/i)).toBeVisible();
+  await expect(page.getByText(/Corpus contains admitted indexed knowledge/i)).toBeVisible();
   assertRuntime();
 });
 
