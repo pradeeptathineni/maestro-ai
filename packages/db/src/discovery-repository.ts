@@ -278,6 +278,10 @@ export async function requestDiscovery(
     routingReason: string;
     sourcePlanState: DiscoveryRouteState;
     outboundQuery: string | null;
+    researchRunId?: string;
+    researchStep?: number;
+    researchActionKey?: string;
+    dispatch?: 'outbox' | 'inline';
   },
 ): Promise<unknown> {
   return inTransaction(pool, async (client) => {
@@ -363,10 +367,10 @@ export async function requestDiscovery(
          (id, workspace_id, query_session_id, result_set_id, adapter_key, idempotency_key,
           intent, outbound_query, outbound_query_hash, disclosure, state, reserved_calls,
           safe_detail, finished_at, plan_route_id, variant_index, routing_reason,
-          source_plan_state)
+          source_plan_state, research_run_id, research_step, research_action_key)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
                CASE WHEN $11 IN ('not_configured', 'budget_denied', 'skipped', 'unsupported')
-                    THEN now() ELSE NULL END, $14, $15, $16, $17)`,
+                    THEN now() ELSE NULL END, $14, $15, $16, $17, $18, $19, $20)`,
       [
         operationId,
         workspaceId,
@@ -374,7 +378,7 @@ export async function requestDiscovery(
         session.rows[0]!.resultSetId,
         input.adapterKey,
         input.idempotencyKey,
-        intent,
+        route?.researchRunId ? 'research_action' : intent,
         route?.outboundQuery ?? input.approvedPublicQuery,
         hashCanonical(route?.outboundQuery ?? input.approvedPublicQuery),
         json({
@@ -395,9 +399,12 @@ export async function requestDiscovery(
         route?.variantIndex ?? 1,
         route?.routingReason ?? null,
         route?.sourcePlanState ?? 'planned',
+        route?.researchRunId ?? null,
+        route?.researchStep ?? null,
+        route?.researchActionKey ?? null,
       ],
     );
-    if (state === 'queued') {
+    if (state === 'queued' && route?.dispatch !== 'inline') {
       await client.query(
         `INSERT INTO ops.outbox
            (id, operation_key, task_name, payload, state)
@@ -495,12 +502,16 @@ export async function getDiscoveryOperation(
       [operationId, workspaceId],
     ),
     pool.query<JsonRow>(
-      `SELECT id, adapter_key AS "adapterKey", external_id AS "externalId",
-              canonical_uri AS "canonicalUri", title, summary, kind_hint AS "kindHint",
-              source_payload AS "sourcePayload",
-              provenance, review_state AS "reviewState", created_at AS "createdAt"
-       FROM ops.discovery_candidates WHERE operation_id = $1 AND workspace_id = $2
-       ORDER BY title, id`,
+      `SELECT candidate.id, candidate.adapter_key AS "adapterKey",
+              candidate.external_id AS "externalId",
+              candidate.canonical_uri AS "canonicalUri", candidate.title,
+              candidate.summary, candidate.kind_hint AS "kindHint",
+              candidate.source_payload AS "sourcePayload", candidate.provenance,
+              candidate.review_state AS "reviewState", candidate.created_at AS "createdAt"
+       FROM ops.discovery_operation_candidates link
+       JOIN ops.discovery_candidates candidate ON candidate.id = link.discovery_candidate_id
+       WHERE link.operation_id = $1 AND link.workspace_id = $2
+       ORDER BY candidate.title, candidate.id`,
       [operationId, workspaceId],
     ),
     pool.query<JsonRow>(
@@ -631,6 +642,7 @@ export async function processDiscoveryOperation(
     );
     const cancelled = latest.rows[0]?.state === 'cancel_requested';
     for (const lead of result.leads) {
+      const candidateId = newOpaqueId();
       await client.query(
         `INSERT INTO ops.discovery_candidates
            (id, operation_id, workspace_id, adapter_key, external_id, canonical_uri,
@@ -638,7 +650,7 @@ export async function processDiscoveryOperation(
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'lead')
          ON CONFLICT (adapter_key, external_id, source_payload_hash) DO NOTHING`,
         [
-          newOpaqueId(),
+          candidateId,
           payload.operationId,
           payload.workspaceId,
           row.adapterKey,
@@ -652,6 +664,20 @@ export async function processDiscoveryOperation(
           json(lead.provenance),
         ],
       );
+      const stored = await client.query<{ id: string }>(
+        `SELECT id FROM ops.discovery_candidates
+         WHERE workspace_id = $1 AND adapter_key = $2 AND external_id = $3
+           AND source_payload_hash = $4`,
+        [payload.workspaceId, row.adapterKey, lead.externalId, hashCanonical(lead.payload)],
+      );
+      if (stored.rowCount) {
+        await client.query(
+          `INSERT INTO ops.discovery_operation_candidates
+             (operation_id, discovery_candidate_id, workspace_id)
+           VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+          [payload.operationId, stored.rows[0]!.id, payload.workspaceId],
+        );
+      }
     }
     const finalState = cancelled
       ? 'cancelled'

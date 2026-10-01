@@ -58,6 +58,7 @@ describe('reviewed PostgreSQL contract', () => {
       '0013_query_value_projection_cache.sql',
       '0014_semantic_adapter_configuration.sql',
       '0015_discovery_intelligence.sql',
+      '0016_research_skill_v1.sql',
     ]);
     expect(migrations.rows.every((row) => /^[a-f0-9]{64}$/.test(row.sha256))).toBe(true);
   });
@@ -168,7 +169,7 @@ describe('reviewed PostgreSQL contract', () => {
   });
 
   it('keeps reviewed SQL and Drizzle table/column declarations aligned', async () => {
-    expect(await checkSchemaDefinitions(pool)).toEqual({ checkedTables: 77, errors: [] });
+    expect(await checkSchemaDefinitions(pool)).toEqual({ checkedTables: 80, errors: [] });
   });
 
   it('keeps first-class knowledge documents and their query results immutable', async () => {
