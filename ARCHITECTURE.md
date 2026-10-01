@@ -40,7 +40,9 @@ rulebook that impersonates open-world understanding.
 
 1. **Plan** — interpretation, research questions, allowed-source queries, and stop tests.
 2. **Refinement** — evidence-bound gap assessment and either another bounded action or a stop.
-3. **Synthesis** — ordered/grouped candidate IDs, reasons, uncertainty, and exact citations.
+3. **Synthesis** — an explicit sufficient/insufficient context judgment. Sufficient results require
+   ordered/grouped candidate IDs, reasons, uncertainty, and exact item plus summary citations;
+   insufficient results abstain without findings and state why.
 
 In `search` mode, allowed actions address only explicitly enabled public adapters. In `corpus` mode,
 the only source is admitted indexed knowledge and no network call is possible. A provider-neutral
@@ -90,8 +92,9 @@ revision rather than mutating an immutable receipt.
 
 - **Local/agent use:** the repository API and `.agents/skills/maestro-research` let a user's own
   model-enabled agent apply the method while Maestro supplies evidence and guardrails.
-- **Search UI:** live research progress, source coverage, organized findings, citations,
-  uncertainty, and admission actions are primary. Cached Corpus matches are a visible cross-check.
+- **Search UI:** live research progress, source outcomes, organized findings, exact citations,
+  uncertainty, and the explicit admission boundary are primary. The typed API admission workflow
+  remains the current write path; cached Corpus matches are a visible cross-check.
 - **Corpus UI:** browse and query durable admitted knowledge, evidence state, revisions, and refresh
   status. Raw Search leads are not a Corpus layer.
 - **Hosted direction:** an operator can continuously curate and refresh a larger public Corpus so

@@ -11,7 +11,9 @@ Both modes use `research-skill-v1` and three structured proposal types:
 
 1. `plan`: interpretation, research questions, allowed-source actions, and stop tests.
 2. `refinement`: evidence-bound assessment, material gaps, and either a bounded next action or a stop reason.
-3. `synthesis`: ordered and grouped candidate IDs, relevance reasons, uncertainty, and citations to exact candidate IDs.
+3. `synthesis`: a sufficient/insufficient context judgment. Sufficient output has ordered and
+   grouped candidate IDs, relevance reasons, uncertainty, and exact item plus summary citations;
+   insufficient output abstains without findings and records limitations.
 
 The host, not the model, validates schemas and IDs, clamps budgets, executes adapters, enforces privacy, stores hashes and receipts, and controls explicit Search-to-Corpus admission. Model output is always an attributable proposal. A historical receipt can be verified and rendered again; a fresh model call is not claimed to be deterministic.
 
@@ -22,7 +24,12 @@ The authoritative schemas and validators are in `packages/domain/src/research.ts
 1. Create a query session with `POST /api/v1/explorer/sessions`.
 2. Start an explicit run with `POST /api/v1/explorer/sessions/:id/research-runs` and `{ "mode": "search" | "corpus", "idempotencyKey": "..." }`. A Search session created with `searchConnectedSources: true` also attempts this path automatically.
 3. Poll `GET /api/v1/research/runs/:id` until terminal.
-4. Inspect proposal validation receipts, source operations/events, final receipt, limitations, and exact cited IDs. A `complete` state proves protocol completion, not human usefulness.
+4. Inspect proposal validation receipts, distinct source outcomes, final receipt, context
+   assessment, limitations, and exact cited IDs. A `complete` state proves protocol completion, not
+   human usefulness.
+5. If a Search run fails, `POST /api/v1/research/runs/:id/fallback` starts the idempotent
+   deterministic source plan against the run's frozen result set. This does not convert acquired
+   leads into model conclusions or Corpus knowledge.
 
 The configured `local_semantic` adapter is an explicit loopback OpenAI-compatible structured-output endpoint. There is no cloud fallback, automatic model download, model router, or general tool authority. When it is unavailable or budget-denied, the existing deterministic Search or Corpus path remains the declared fallback.
 

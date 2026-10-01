@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Pool } from 'pg';
+import type { DiscoveryAdapter } from '../../adapters/src/index.js';
 import {
   RESEARCH_PROTOCOL_VERSION,
   type ResearchModel,
@@ -9,8 +10,13 @@ import {
 import { localWorkspaceId, referenceProjectContextId } from '../../seed/src/import.js';
 import { testDatabaseUrl } from '../../test-fixtures/src/database.js';
 import { createPool } from './client.js';
-import { configureAdapter } from './discovery-repository.js';
-import { createExplorerSession } from './explorer-repository.js';
+import {
+  configureAdapter,
+  getDiscoveryOperation,
+  processDiscoveryOperation,
+  requestDiscovery,
+} from './discovery-repository.js';
+import { createExplorerSession, redactExplorerSession } from './explorer-repository.js';
 import {
   getResearchRun,
   processResearchRun,
@@ -96,7 +102,10 @@ function fixtureModel(
         usage: { inputTokens: 30, outputTokens: 30 },
         output: {
           protocolVersion: RESEARCH_PROTOCOL_VERSION,
+          contextAssessment: 'sufficient',
+          abstentionReason: null,
           summary: 'The run found directly relevant, attributable evidence.',
+          summaryCitationCandidateIds: [candidateId],
           groups: [
             {
               label: 'Direct evidence',
@@ -136,14 +145,16 @@ describe('bounded model-led research persistence', () => {
       enabled: true,
       baseUrl: 'http://127.0.0.1:18080/v1',
       modelIdentifier: 'fixture-research-model',
-      maxInputTokens: 4096,
+      maxInputTokens: 32768,
       maxOutputTokens: 1024,
     });
     await configureAdapter(pool, 'github', { enabled: true });
+    await configureAdapter(pool, 'mcp_registry', { enabled: true });
   });
 
   afterAll(async () => {
     await configureAdapter(pool, 'github', { enabled: false });
+    await configureAdapter(pool, 'mcp_registry', { enabled: false });
     await configureAdapter(pool, 'local_semantic', { enabled: false });
     await pool.end();
   });
@@ -166,15 +177,18 @@ describe('bounded model-led research persistence', () => {
         sources: {
           async search(action) {
             expect(action.sourceKey).toBe('github');
-            return [
-              {
-                id: candidateId,
-                sourceKey: action.sourceKey,
-                title: 'Unseen-domain implementation',
-                summary: 'A fixture standing in for attributed public source evidence.',
-                canonicalUri: 'https://example.test/photonic-compiler',
-              },
-            ];
+            return {
+              state: 'complete',
+              candidates: [
+                {
+                  id: candidateId,
+                  sourceKey: action.sourceKey,
+                  title: 'Unseen-domain implementation',
+                  summary: 'A fixture standing in for attributed public source evidence.',
+                  canonicalUri: 'https://example.test/photonic-compiler',
+                },
+              ],
+            };
           },
         },
       },
@@ -243,15 +257,18 @@ describe('bounded model-led research persistence', () => {
         model: fixtureModel([], { invalidRefinementCitation: true }),
         sources: {
           async search(action) {
-            return [
-              {
-                id: randomUUID(),
-                sourceKey: action.sourceKey,
-                title: 'Stored evidence',
-                summary: 'Evidence whose identifier must be cited exactly.',
-                canonicalUri: 'https://example.test/stored-evidence',
-              },
-            ];
+            return {
+              state: 'complete',
+              candidates: [
+                {
+                  id: randomUUID(),
+                  sourceKey: action.sourceKey,
+                  title: 'Stored evidence',
+                  summary: 'Evidence whose identifier must be cited exactly.',
+                  canonicalUri: 'https://example.test/stored-evidence',
+                },
+              ],
+            };
           },
         },
       },
@@ -284,5 +301,186 @@ describe('bounded model-led research persistence', () => {
     expect(run.state).toBe('failed');
     expect(run.events.map((event) => event.eventType)).toContain('run_recovered');
     expect(run.consumedModelCalls).toBe(0);
+  });
+
+  it('fails without a model call when configuration changes before claim', async () => {
+    const sessionId = await createSession(pool, 'configuration drift evidence');
+    const requested = (await requestResearchRun(pool, localWorkspaceId, sessionId, {
+      mode: 'search',
+      idempotencyKey: `integration-config-drift-${randomUUID()}`,
+    })) as { id: string };
+    await configureAdapter(pool, 'local_semantic', {
+      enabled: false,
+      baseUrl: 'http://127.0.0.1:18080/v1',
+      modelIdentifier: 'fixture-research-model',
+      maxInputTokens: 32768,
+      maxOutputTokens: 1024,
+    });
+    const calls: ResearchModelRequest[] = [];
+    await processResearchRun(
+      pool,
+      { researchRunId: requested.id, workspaceId: localWorkspaceId },
+      { model: fixtureModel(calls) },
+    );
+    const run = (await getResearchRun(pool, localWorkspaceId, requested.id)) as RunView & {
+      errorCode: string;
+    };
+    expect(run).toMatchObject({ state: 'failed', errorCode: 'model_config_changed' });
+    expect(calls).toEqual([]);
+    await expect(
+      pool.query(`DELETE FROM ops.research_runs WHERE id = $1`, [requested.id]),
+    ).rejects.toThrow(/cannot be deleted|terminal research runs are immutable/);
+    await expect(
+      pool.query(
+        `INSERT INTO ops.research_run_events
+           (id, research_run_id, workspace_id, step_index, event_type, payload_hash, payload)
+         VALUES ($1, $2, $3, 0, 'run_failed', $4, '{}'::jsonb)`,
+        [randomUUID(), requested.id, localWorkspaceId, '0'.repeat(64)],
+      ),
+    ).rejects.toThrow(/terminal research runs cannot accept new child records/);
+    await configureAdapter(pool, 'local_semantic', {
+      enabled: true,
+      baseUrl: 'http://127.0.0.1:18080/v1',
+      modelIdentifier: 'fixture-research-model',
+      maxInputTokens: 32768,
+      maxOutputTokens: 1024,
+    });
+  });
+
+  it('enforces the declared result limit before persistence', async () => {
+    const sessionId = await createSession(pool, 'bounded acquisition evidence');
+    await pool.query(`DELETE FROM ops.adapter_daily_budgets WHERE adapter_key = 'mcp_registry'`);
+    const operation = (await requestDiscovery(
+      pool,
+      localWorkspaceId,
+      sessionId,
+      {
+        adapterKey: 'mcp_registry',
+        approvedPublicQuery: 'bounded acquisition evidence',
+        idempotencyKey: `integration-result-limit-${randomUUID()}`,
+        intent: 'explore',
+      },
+      {
+        planRouteId: 'bounded-fixture',
+        variantIndex: 1,
+        routingReason: 'Verify host-enforced acquisition limits.',
+        sourcePlanState: 'planned',
+        outboundQuery: 'bounded acquisition evidence',
+        resultLimit: 1,
+        dispatch: 'inline',
+      },
+    )) as { id: string };
+    const observedLimits: number[] = [];
+    const adapter: DiscoveryAdapter = {
+      key: 'mcp_registry',
+      version: 'fixture-v1',
+      async search(_query, limit) {
+        observedLimits.push(limit ?? -1);
+        return {
+          state: 'complete',
+          leads: Array.from({ length: 5 }, (_, index) => ({
+            externalId: `bounded-${operation.id}-${index}`,
+            canonicalUri: `https://example.test/bounded/${index}`,
+            title: `Bounded result ${index}`,
+            summary: 'Fixture evidence.',
+            kindHint: 'tool',
+            payload: { index },
+            provenance: {
+              adapter: 'mcp_registry',
+              adapterVersion: 'fixture-v1',
+              source: 'fixture',
+              observedAt: new Date(0).toISOString(),
+              reviewState: 'lead',
+            },
+          })),
+          responseBytes: 500,
+          httpStatus: 200,
+          rateLimit: { remaining: null, resetAt: null, retryAfter: null },
+        };
+      },
+    };
+    await processDiscoveryOperation(
+      pool,
+      { operationId: operation.id, workspaceId: localWorkspaceId },
+      adapter,
+    );
+    const view = (await getDiscoveryOperation(pool, localWorkspaceId, operation.id)) as {
+      resultLimit: number;
+      resultCount: number;
+      candidates: unknown[];
+    };
+    expect(observedLimits).toEqual([1]);
+    expect(view).toMatchObject({ resultLimit: 1, resultCount: 1 });
+    expect(view.candidates).toHaveLength(1);
+  });
+
+  it('terminally closes a queued run when its private query is redacted before claim', async () => {
+    const sessionId = await createSession(pool, 'redact before model execution');
+    const requested = (await requestResearchRun(pool, localWorkspaceId, sessionId, {
+      mode: 'search',
+      idempotencyKey: `integration-redacted-${randomUUID()}`,
+    })) as { id: string };
+    await redactExplorerSession(pool, localWorkspaceId, sessionId);
+    const calls: ResearchModelRequest[] = [];
+    await processResearchRun(
+      pool,
+      { researchRunId: requested.id, workspaceId: localWorkspaceId },
+      { model: fixtureModel(calls) },
+    );
+    const run = (await getResearchRun(pool, localWorkspaceId, requested.id)) as RunView & {
+      errorCode: string;
+      fallbackAvailable: boolean;
+    };
+    expect(run).toMatchObject({
+      state: 'failed',
+      errorCode: 'session_unavailable',
+      fallbackAvailable: false,
+    });
+    expect(calls).toEqual([]);
+  });
+
+  it('does not append proposals or evidence after recovery terminalizes an active run', async () => {
+    await pool.query(`DELETE FROM ops.adapter_daily_budgets WHERE adapter_key = 'local_semantic'`);
+    const sessionId = await createSession(pool, 'active lease recovery evidence');
+    const requested = (await requestResearchRun(pool, localWorkspaceId, sessionId, {
+      mode: 'search',
+      idempotencyKey: `integration-active-recovery-${randomUUID()}`,
+    })) as { id: string };
+    let enteredResolve!: () => void;
+    let releaseResolve!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      enteredResolve = resolve;
+    });
+    const release = new Promise<void>((resolve) => {
+      releaseResolve = resolve;
+    });
+    const fixture = fixtureModel([]);
+    const processing = processResearchRun(
+      pool,
+      { researchRunId: requested.id, workspaceId: localWorkspaceId },
+      {
+        model: {
+          async propose(request) {
+            enteredResolve();
+            await release;
+            return fixture.propose(request);
+          },
+        },
+      },
+    );
+    await entered;
+    await pool.query(
+      `UPDATE ops.research_runs SET lease_until = now() - interval '1 second'
+       WHERE id = $1 AND workspace_id = $2 AND state = 'running'`,
+      [requested.id, localWorkspaceId],
+    );
+    expect(await recoverStaleResearchRuns(pool)).toBe(1);
+    releaseResolve();
+    await processing;
+
+    const run = (await getResearchRun(pool, localWorkspaceId, requested.id)) as RunView;
+    expect(run.state).toBe('failed');
+    expect(run.proposals).toEqual([]);
+    expect(run.events.map((event) => event.eventType)).toEqual(['run_recovered']);
   });
 });

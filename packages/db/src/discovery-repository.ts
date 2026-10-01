@@ -281,6 +281,8 @@ export async function requestDiscovery(
     researchRunId?: string;
     researchStep?: number;
     researchActionKey?: string;
+    resultSetId?: string;
+    resultLimit?: number;
     dispatch?: 'outbox' | 'inline';
   },
 ): Promise<unknown> {
@@ -297,10 +299,12 @@ export async function requestDiscovery(
        FROM workspace.query_sessions qs
        JOIN LATERAL (
          SELECT id FROM workspace.query_result_sets current
-         WHERE current.query_session_id = qs.id ORDER BY revision DESC LIMIT 1
+         WHERE current.query_session_id = qs.id
+           AND ($3::uuid IS NULL OR current.id = $3::uuid)
+         ORDER BY revision DESC LIMIT 1
        ) qrs ON true
        WHERE qs.id = $1 AND qs.workspace_id = $2 AND qs.deleted_at IS NULL`,
-      [querySessionId, workspaceId],
+      [querySessionId, workspaceId, route?.resultSetId ?? null],
     );
     if (!session.rowCount) throw new NotFoundError('Query session not found.');
     const config = await client.query<{
@@ -366,11 +370,11 @@ export async function requestDiscovery(
       `INSERT INTO ops.discovery_operations
          (id, workspace_id, query_session_id, result_set_id, adapter_key, idempotency_key,
           intent, outbound_query, outbound_query_hash, disclosure, state, reserved_calls,
-          safe_detail, finished_at, plan_route_id, variant_index, routing_reason,
+          result_limit, safe_detail, finished_at, plan_route_id, variant_index, routing_reason,
           source_plan_state, research_run_id, research_step, research_action_key)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-               CASE WHEN $11 IN ('not_configured', 'budget_denied', 'skipped', 'unsupported')
-                    THEN now() ELSE NULL END, $14, $15, $16, $17, $18, $19, $20)`,
+               $14, CASE WHEN $11 IN ('not_configured', 'budget_denied', 'skipped', 'unsupported')
+                    THEN now() ELSE NULL END, $15, $16, $17, $18, $19, $20, $21)`,
       [
         operationId,
         workspaceId,
@@ -388,6 +392,7 @@ export async function requestDiscovery(
         }),
         state,
         reservedCalls,
+        route?.resultLimit ?? 20,
         state === 'skipped' || state === 'unsupported'
           ? route!.routingReason
           : state === 'not_configured'
@@ -404,7 +409,7 @@ export async function requestDiscovery(
         route?.researchActionKey ?? null,
       ],
     );
-    if (state === 'queued' && route?.dispatch !== 'inline') {
+    if (state === 'queued') {
       await client.query(
         `INSERT INTO ops.outbox
            (id, operation_key, task_name, payload, state)
@@ -423,6 +428,7 @@ export async function requestDiscovery(
       planRouteId: route?.planRouteId ?? null,
       routingReason: route?.routingReason ?? null,
       sourcePlanState: route?.sourcePlanState ?? 'planned',
+      resultLimit: route?.resultLimit ?? 20,
     };
   });
 }
@@ -432,6 +438,7 @@ export async function requestEnabledDiscovery(
   workspaceId: string,
   querySessionId: string,
   approvedPublicQuery: string,
+  resultSetId?: string,
 ): Promise<unknown[]> {
   const session = await pool.query<{
     interpretation: QueryInterpretation;
@@ -467,6 +474,7 @@ export async function requestEnabledDiscovery(
           routingReason: route.reason,
           sourcePlanState: route.state,
           outboundQuery: route.variant,
+          resultSetId,
         },
       ),
     );
@@ -485,7 +493,8 @@ export async function getDiscoveryOperation(
             plan_route_id AS "planRouteId", variant_index AS "variantIndex",
             routing_reason AS "routingReason", source_plan_state AS "sourcePlanState",
             reserved_calls AS "reservedCalls", consumed_calls AS "consumedCalls",
-            result_count AS "resultCount", error_code AS "errorCode",
+            result_count AS "resultCount", result_limit AS "resultLimit",
+            error_code AS "errorCode",
             safe_detail AS "safeDetail", started_at AS "startedAt",
             finished_at AS "finishedAt", created_at AS "createdAt", updated_at AS "updatedAt"
      FROM ops.discovery_operations WHERE id = $1 AND workspace_id = $2`,
@@ -602,6 +611,7 @@ export async function processDiscoveryOperation(
     baseUrl: string | null;
     timeoutMs: number;
     responseByteLimit: number;
+    resultLimit: number;
     query: string;
     attempt: number;
     startedAt: Date;
@@ -613,7 +623,7 @@ export async function processDiscoveryOperation(
        AND config.adapter_key = operation.adapter_key AND config.enabled
      RETURNING operation.adapter_key AS "adapterKey", config.base_url AS "baseUrl",
                config.timeout_ms AS "timeoutMs", config.response_byte_limit AS "responseByteLimit",
-               operation.outbound_query AS query,
+               operation.outbound_query AS query, operation.result_limit AS "resultLimit",
                operation.started_at AS "startedAt",
                COALESCE((SELECT max(attempt) + 1 FROM ops.discovery_attempts
                          WHERE operation_id = operation.id), 1)::int AS attempt`,
@@ -625,7 +635,8 @@ export async function processDiscoveryOperation(
   try {
     const adapter = adapterOverride ?? adapterFor(row);
     if (adapter.key !== row.adapterKey) throw new Error('adapter_key_mismatch');
-    result = await adapter.search(row.query, 20);
+    result = await adapter.search(row.query, row.resultLimit);
+    result = { ...result, leads: result.leads.slice(0, row.resultLimit) };
   } catch {
     result = {
       state: 'failed' as const,

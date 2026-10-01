@@ -1,4 +1,4 @@
-import { label } from './api.js';
+import { formatDate, label } from './api.js';
 import { Badge } from './ui.js';
 
 export interface ResearchEvidenceCandidate {
@@ -8,12 +8,54 @@ export interface ResearchEvidenceCandidate {
   summary: string;
   canonicalUri: string;
   observedAt?: string | null;
+  sourceClass?: string | null;
+  sourceTypes?: string[];
+  reviewState?: string | null;
+  kindHint?: string | null;
 }
 
 export interface ResearchEvidenceItem {
   candidateId: string;
   reason: string;
   uncertainty: string | null;
+  citationCandidateIds: string[];
+}
+
+export interface ResearchEvidenceSynthesis {
+  contextAssessment: 'sufficient' | 'insufficient';
+  abstentionReason: string | null;
+  summary: string;
+  summaryCitationCandidateIds: string[];
+  groups: Array<{ label: string; description: string; candidateIds: string[] }>;
+  items: ResearchEvidenceItem[];
+  limitations: string[];
+}
+
+export function ResearchCitationList({
+  candidates,
+  citationCandidateIds,
+  labelText = 'Evidence cited',
+}: {
+  candidates: ReadonlyMap<string, ResearchEvidenceCandidate>;
+  citationCandidateIds: string[];
+  labelText?: string;
+}) {
+  const citations = citationCandidateIds.flatMap((id) => {
+    const candidate = candidates.get(id);
+    return candidate ? [candidate] : [];
+  });
+  if (!citations.length) return null;
+  return (
+    <div className="query-signal">
+      <strong>{labelText}</strong>
+      {citations.map((citation) => (
+        <a href={citation.canonicalUri} key={citation.id} rel="noreferrer" target="_blank">
+          {citation.title} · {label(citation.sourceKey)}
+          {citation.observedAt ? ` · observed ${formatDate(citation.observedAt)}` : ''}
+        </a>
+      ))}
+    </div>
+  );
 }
 
 export function ResearchEvidenceList({
@@ -35,6 +77,8 @@ export function ResearchEvidenceList({
             <div className="result-identity">
               <div className="card-topline">
                 <Badge>{label(candidate.sourceKey)}</Badge>
+                {candidate.kindHint ? <Badge>{label(candidate.kindHint)}</Badge> : null}
+                {candidate.reviewState ? <Badge>{label(candidate.reviewState)}</Badge> : null}
                 {selectionLabel ? <Badge>{selectionLabel}</Badge> : null}
               </div>
               <h3>{candidate.title}</h3>
@@ -45,6 +89,10 @@ export function ResearchEvidenceList({
               <span>{item.reason}</span>
               {item.uncertainty ? <small>{item.uncertainty}</small> : null}
             </div>
+            <ResearchCitationList
+              candidates={candidates}
+              citationCandidateIds={item.citationCandidateIds}
+            />
             <a
               className="button secondary compact"
               href={candidate.canonicalUri}

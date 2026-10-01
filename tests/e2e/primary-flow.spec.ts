@@ -58,6 +58,24 @@ function observeRuntime(page: Page): () => void {
   };
 }
 
+async function patchSearchResponses(
+  page: Page,
+  sessionPatch: Record<string, unknown>,
+  resultPatch: Record<string, unknown> = sessionPatch,
+): Promise<void> {
+  await page.route('**/api/v1/explorer/sessions', async (route) => {
+    if (route.request().method() !== 'POST') return route.continue();
+    const response = await route.fetch();
+    const body = (await response.json()) as Record<string, unknown>;
+    await route.fulfill({ response, json: { ...body, ...sessionPatch } });
+  });
+  await page.route(/\/api\/v1\/explorer\/result-sets\/[^/?]+\?/, async (route) => {
+    const response = await route.fetch();
+    const body = (await response.json()) as Record<string, unknown>;
+    await route.fulfill({ response, json: { ...body, ...resultPatch } });
+  });
+}
+
 function syntheticGraphFixture(totalNodes: number, totalEdges: number) {
   const groupCount = 10;
   const providerCount = totalNodes - groupCount;
@@ -229,11 +247,11 @@ test('query-first explorer keeps list, map, detail, comparison, and save on one 
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.goto('/');
   await expect(
-    page.getByRole('heading', { level: 1, name: 'Find existing tools for what you need' }),
+    page.getByRole('heading', { level: 1, name: 'Find what exists for what you need' }),
   ).toBeVisible();
   await captureIfRequested(page, 'explorer-1440-start.png');
   await page.getByLabel('Capability question').fill(privateQuery);
-  await page.getByRole('button', { name: 'Search' }).click();
+  await page.getByRole('button', { name: 'Search', exact: true }).click();
   const queryDetails = page.getByText('Search interpretation and query details');
   await expect(queryDetails).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Results', exact: true })).toBeVisible();
@@ -354,7 +372,7 @@ test('G6 map stays bounded and interactive at declared synthetic sizes', async (
     fixture = syntheticGraphFixture(shape.nodes, shape.edges);
     await page.goto('/');
     await page.getByLabel('Capability question').fill('ai context reduction');
-    await page.getByRole('button', { name: 'Search' }).click();
+    await page.getByRole('button', { name: 'Search', exact: true }).click();
     await page.evaluate(() => {
       const measuredWindow = window as typeof window & { __maestroLongTasks?: number[] };
       measuredWindow.__maestroLongTasks = [];
@@ -449,8 +467,8 @@ test('corpus excludes live leads from admitted knowledge and scores an explicit 
   await page.getByRole('button', { name: 'Search corpus' }).click();
   expect(page.url()).not.toContain('context');
   await expect(page.getByText('Query-scored records')).toBeVisible();
-  await expect(page.getByText(/^Signal \d+$/).first()).toBeVisible();
-  await expect(page.getByText(/Every displayed match has a numeric estimate/i)).toBeVisible();
+  await expect(page.getByText(/^Legacy query estimate \d+$/).first()).toBeVisible();
+  await expect(page.getByText(/preserved Phase 07 query-ranking estimate/i)).toBeVisible();
   await expectNoSeriousAccessibilityViolations(page);
   await captureIfRequested(page, 'corpus-1440-search.png');
 
@@ -515,33 +533,14 @@ test('connected source results remain visibly preliminary and source-linked', as
     );
     await route.fulfill({ response, json: body });
   });
-  await page.route('**/api/v1/explorer/sessions', async (route) => {
-    if (route.request().method() !== 'POST') {
-      await route.continue();
-      return;
-    }
-    const response = await route.fetch();
-    const body = (await response.json()) as Record<string, unknown>;
-    await route.fulfill({
-      response,
-      json: {
-        ...body,
-        externalDiscovery: { attempted: true, state: 'queued' },
-        discoveryOperations: [{ id: operationId, adapterKey: 'github', state: 'queued' }],
-      },
-    });
-  });
-  await page.route(/\/api\/v1\/explorer\/result-sets\/[^/?]+\?/, async (route) => {
-    const response = await route.fetch();
-    const body = (await response.json()) as Record<string, unknown>;
-    await route.fulfill({
-      response,
-      json: {
-        ...body,
-        discoveryOperations: [{ id: operationId, adapterKey: 'github', state: 'queued' }],
-      },
-    });
-  });
+  await patchSearchResponses(
+    page,
+    {
+      externalDiscovery: { attempted: true, state: 'queued' },
+      discoveryOperations: [{ id: operationId, adapterKey: 'github', state: 'queued' }],
+    },
+    { discoveryOperations: [{ id: operationId, adapterKey: 'github', state: 'queued' }] },
+  );
   await page.route('**/api/v1/discovery/operations/*', async (route) => {
     const requestedOperationId = new URL(route.request().url()).pathname.split('/').at(-1)!;
     await route.fulfill({
@@ -575,12 +574,12 @@ test('connected source results remain visibly preliminary and source-linked', as
 
   await page.goto('/');
   await page.getByLabel('Capability question').fill('context tool');
-  await page.getByRole('button', { name: 'Search' }).click();
+  await page.getByRole('button', { name: 'Search', exact: true }).click();
   const sourceResults = page.locator('details.source-results');
   await expect(sourceResults.getByText('Source plan and live leads')).toBeVisible();
   await sourceResults.locator('summary').click();
   await expect(page.getByText('example/context-tool')).toBeVisible();
-  await expect(page.getByText('Signal 34', { exact: true })).toBeVisible();
+  await expect(page.getByText('Legacy query estimate 34', { exact: true })).toBeVisible();
   await expect(page.getByText('Preliminary', { exact: true }).last()).toBeVisible();
   await expect(page.getByRole('link', { name: 'Open source' })).toHaveAttribute(
     'href',
@@ -588,6 +587,181 @@ test('connected source results remain visibly preliminary and source-linked', as
   );
   await expectNoSeriousAccessibilityViolations(page);
   await captureIfRequested(page, 'explorer-1440-controlled-source.png');
+  assertRuntime();
+});
+
+test('model-led research renders sufficiency, exact citations, and source outcomes', async ({
+  page,
+}) => {
+  const assertRuntime = observeRuntime(page);
+  const runId = '33333333-3333-4333-8333-333333333333';
+  const candidateId = '44444444-4444-4444-8444-444444444444';
+  const researchSummary = {
+    id: runId,
+    mode: 'search',
+    strategy: 'model',
+    state: 'complete',
+    safeDetail: 'Model-led search completed with one cited evidence candidate.',
+  };
+  await patchSearchResponses(page, { researchRun: researchSummary });
+  await page.route(`**/api/v1/research/runs/${runId}`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ...researchSummary,
+        modelIdentifier: 'controlled-local-model',
+        stopReason: 'evidence_sufficient',
+        fallbackAvailable: false,
+        candidates: [
+          {
+            id: candidateId,
+            sourceKey: 'github',
+            title: 'example/evidence-bound-research',
+            summary: 'Controlled public evidence used by the model synthesis.',
+            canonicalUri: 'https://github.com/example/evidence-bound-research',
+            observedAt: '2026-09-30T12:00:00.000Z',
+            reviewState: 'lead',
+            kindHint: 'oss_project',
+          },
+        ],
+        operations: [
+          {
+            id: '55555555-5555-4555-8555-555555555555',
+            sourceKey: 'github',
+            state: 'complete',
+            resultCount: 1,
+            safeDetail: 'One bounded source result.',
+          },
+          {
+            id: '66666666-6666-4666-8666-666666666666',
+            sourceKey: 'mcp_registry',
+            state: 'empty',
+            resultCount: 0,
+            safeDetail: 'No matching registry results.',
+          },
+        ],
+        proposals: [
+          {
+            proposalType: 'synthesis',
+            output: {
+              protocolVersion: 'research-protocol-v2',
+              contextAssessment: 'sufficient',
+              abstentionReason: null,
+              summary: 'The evidence directly supports one bounded option.',
+              summaryCitationCandidateIds: [candidateId],
+              groups: [
+                {
+                  label: 'Direct evidence',
+                  description: 'Evidence directly tied to the need.',
+                  candidateIds: [candidateId],
+                },
+              ],
+              items: [
+                {
+                  candidateId,
+                  reason: 'The source directly addresses the research need.',
+                  uncertainty: 'Only one public source was available.',
+                  citationCandidateIds: [candidateId],
+                },
+              ],
+              limitations: ['Human usefulness is not proven by this controlled browser fixture.'],
+            },
+          },
+        ],
+      }),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByLabel('Capability question').fill('evidence bound research');
+  await page.getByRole('button', { name: 'Search', exact: true }).click();
+  await expect(page.getByText('Research synthesis · Sufficient context')).toBeVisible();
+  await expect(page.getByText('Summary evidence')).toBeVisible();
+  await expect(page.getByText('Evidence cited')).toBeVisible();
+  await expect(
+    page.getByLabel('Model-led source outcomes').getByText('Mcp Registry'),
+  ).toBeVisible();
+  await expect(page.getByRole('link', { name: /example\/evidence-bound-research/ })).toHaveCount(2);
+  await expectNoSeriousAccessibilityViolations(page);
+  await captureIfRequested(page, 'explorer-1440-model-led-citations.png');
+  assertRuntime();
+});
+
+test('budget-denied model path keeps deterministic leads visible', async ({ page }) => {
+  const assertRuntime = observeRuntime(page);
+  const runId = '77777777-7777-4777-8777-777777777777';
+  const operationId = '88888888-8888-4888-8888-888888888888';
+  const researchSummary = {
+    id: runId,
+    mode: 'search',
+    strategy: 'model',
+    state: 'budget_denied',
+    safeDetail: 'The configured model-call budget denied this research run.',
+  };
+  await patchSearchResponses(
+    page,
+    {
+      researchRun: researchSummary,
+      discoveryOperations: [{ id: operationId, adapterKey: 'github', state: 'queued' }],
+    },
+    {
+      researchRun: researchSummary,
+      discoveryOperations: [{ id: operationId, adapterKey: 'github', state: 'complete' }],
+    },
+  );
+  await page.route(`**/api/v1/research/runs/${runId}`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ...researchSummary,
+        modelIdentifier: 'controlled-local-model',
+        stopReason: null,
+        fallbackAvailable: true,
+        candidates: [],
+        proposals: [],
+        operations: [],
+      }),
+    });
+  });
+  await page.route(`**/api/v1/discovery/operations/${operationId}`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        id: operationId,
+        adapterKey: 'github',
+        state: 'complete',
+        safeDetail: 'Deterministic fallback completed.',
+        candidates: [
+          {
+            id: '99999999-9999-4999-8999-999999999999',
+            adapterKey: 'github',
+            canonicalUri: 'https://github.com/example/deterministic-fallback',
+            title: 'example/deterministic-fallback',
+            summary: 'A deterministic lead preserved when the model budget was denied.',
+            kindHint: 'oss_project',
+            reviewState: 'lead',
+            matchedTerms: ['deterministic'],
+            relevanceOrdinal: 'direct',
+            signalDisplay: 31,
+            evidenceCoverage: 0.1,
+            displayState: 'provisional',
+          },
+        ],
+      }),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByLabel('Capability question').fill('deterministic fallback');
+  await page.getByRole('button', { name: 'Search', exact: true }).click();
+  await expect(page.getByText('example/deterministic-fallback')).toBeVisible();
+  await expect(page.getByText('Legacy query estimate 31')).toBeVisible();
+  await expect(page.getByText(/model-call budget denied/i)).toBeVisible();
+  await expectNoSeriousAccessibilityViolations(page);
+  await captureIfRequested(page, 'explorer-1440-budget-fallback.png');
   assertRuntime();
 });
 
@@ -615,7 +789,7 @@ test('source search is explicit and local semantic assistance stays separate', a
 
   await page.getByRole('link', { name: 'Search', exact: true }).click();
   await page.getByLabel('Capability question').fill('context compression');
-  await page.getByRole('button', { name: 'Search' }).click();
+  await page.getByRole('button', { name: 'Search', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Results', exact: true })).toBeVisible();
   await expect(page.getByText(/no connected source request was queued/i)).toBeVisible();
   await captureIfRequested(page, 'explorer-1440-optional-integrations.png');

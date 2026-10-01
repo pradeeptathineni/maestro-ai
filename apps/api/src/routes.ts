@@ -99,6 +99,7 @@ import {
   replayStoredScores,
   requestDiscovery,
   requestEnabledDiscovery,
+  requestResearchFallback,
   requestResearchRun,
   requestSemanticInterpretation,
   retryIntake,
@@ -189,6 +190,15 @@ export function registerRoutes(app: FastifyInstance, pool: Pool): void {
       if (!provider) throw new NotFoundError('Provider not found.');
       return provider;
     },
+  );
+
+  routes.post<{ Params: IdParams }>(
+    '/api/v1/research/runs/:id/fallback',
+    { schema: { tags: ['research'], params: IdParamsSchema, body: {} } },
+    async (request, reply) =>
+      reply
+        .code(202)
+        .send(await requestResearchFallback(pool, localWorkspaceId, request.params.id)),
   );
 
   routes.get('/api/v1/verification', { schema: { tags: ['evidence'] } }, async () => ({

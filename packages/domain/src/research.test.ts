@@ -56,7 +56,10 @@ function stopRefinement(candidateId = 'candidate-1'): unknown {
 function synthesis(candidateId = 'candidate-1'): unknown {
   return {
     protocolVersion: RESEARCH_PROTOCOL_VERSION,
+    contextAssessment: 'sufficient',
+    abstentionReason: null,
     summary: 'One directly relevant implementation was found.',
+    summaryCitationCandidateIds: [candidateId],
     groups: [
       {
         label: 'Direct implementations',
@@ -126,6 +129,48 @@ describe('research protocol', () => {
     );
   });
 
+  it('requires sufficient syntheses to carry self-cited findings and accepts explicit abstention', () => {
+    const evidenceFree = {
+      protocolVersion: RESEARCH_PROTOCOL_VERSION,
+      contextAssessment: 'sufficient',
+      abstentionReason: null,
+      summary: 'Unsupported conclusion.',
+      summaryCitationCandidateIds: [],
+      groups: [],
+      items: [],
+      limitations: [],
+    };
+    expect(() => validateResearchSynthesisProposal(evidenceFree, new Set())).toThrowError(
+      expect.objectContaining<Partial<ResearchProtocolError>>({ code: 'invalid_proposal' }),
+    );
+
+    const crossCited = synthesis('candidate-1') as {
+      items: Array<{ citationCandidateIds: string[] }>;
+    };
+    crossCited.items[0]!.citationCandidateIds = ['candidate-2'];
+    expect(() =>
+      validateResearchSynthesisProposal(crossCited, new Set(['candidate-1', 'candidate-2'])),
+    ).toThrowError(
+      expect.objectContaining<Partial<ResearchProtocolError>>({ code: 'invalid_proposal' }),
+    );
+
+    expect(
+      validateResearchSynthesisProposal(
+        {
+          protocolVersion: RESEARCH_PROTOCOL_VERSION,
+          contextAssessment: 'insufficient',
+          abstentionReason: 'No directly relevant evidence was retrieved.',
+          summary: 'The bounded run cannot support a recommendation.',
+          summaryCitationCandidateIds: [],
+          groups: [],
+          items: [],
+          limitations: ['All configured sources returned empty or failed outcomes.'],
+        },
+        new Set(),
+      ),
+    ).toMatchObject({ contextAssessment: 'insufficient' });
+  });
+
   it('runs plan, bounded acquisition, evidence-bound refinement, and synthesis', async () => {
     const requests: ResearchModelRequest[] = [];
     const model: ResearchModel = {
@@ -147,15 +192,18 @@ describe('research protocol', () => {
         model,
         sources: {
           async search(action) {
-            return [
-              {
-                id: 'candidate-1',
-                sourceKey: action.sourceKey,
-                title: 'Relevant primary source',
-                summary: 'Evidence tied to the previously unseen request.',
-                canonicalUri: 'https://example.test/evidence',
-              },
-            ];
+            return {
+              state: 'complete',
+              candidates: [
+                {
+                  id: 'candidate-1',
+                  sourceKey: action.sourceKey,
+                  title: 'Relevant primary source',
+                  summary: 'Evidence tied to the previously unseen request.',
+                  canonicalUri: 'https://example.test/evidence',
+                },
+              ],
+            };
           },
         },
         async journal(event) {
@@ -175,6 +223,7 @@ describe('research protocol', () => {
       skillVersion: 'research-skill-v1',
       candidateIds: ['candidate-1'],
       executedActionKeys: ['initial-web'],
+      sourceReceipts: [expect.objectContaining({ actionKey: 'initial-web', state: 'complete' })],
     });
     expect(
       requests.every((request) =>
@@ -186,6 +235,7 @@ describe('research protocol', () => {
         (request) => !JSON.stringify(request.payload).includes('secret-project-context'),
       ),
     ).toBe(true);
+    expect(requests.every((request) => request.task.includes('untrusted'))).toBe(true);
   });
 
   it('uses the same protocol for Corpus without invoking a live source', async () => {
@@ -225,15 +275,18 @@ describe('research protocol', () => {
         sources: {
           async search(action) {
             calledSources.push(action.sourceKey);
-            return [
-              {
-                id: 'candidate-1',
-                sourceKey: 'corpus',
-                title: 'Admitted record',
-                summary: 'Locally indexed evidence.',
-                canonicalUri: 'https://example.test/corpus-record',
-              },
-            ];
+            return {
+              state: 'complete',
+              candidates: [
+                {
+                  id: 'candidate-1',
+                  sourceKey: 'corpus',
+                  title: 'Admitted record',
+                  summary: 'Locally indexed evidence.',
+                  canonicalUri: 'https://example.test/corpus-record',
+                },
+              ],
+            };
           },
         },
       },

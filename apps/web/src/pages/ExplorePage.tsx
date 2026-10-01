@@ -12,7 +12,12 @@ import type {
 } from '../types.js';
 import { Badge, Empty, ErrorPanel, Loading, StateBadge } from '../ui.js';
 import { useWorkspaceProjects } from '../workspace-queries.js';
-import { ResearchEvidenceList, type ResearchEvidenceCandidate } from '../ResearchEvidenceList.js';
+import {
+  ResearchCitationList,
+  ResearchEvidenceList,
+  type ResearchEvidenceCandidate,
+  type ResearchEvidenceSynthesis,
+} from '../ResearchEvidenceList.js';
 
 const ExplorerMap = lazy(async () => ({
   default: (await import('../ExplorerMap.js')).ExplorerMap,
@@ -73,18 +78,6 @@ interface DiscoveryOperation {
   candidates: DiscoveryCandidate[];
 }
 
-interface ResearchSynthesis {
-  summary: string;
-  groups: Array<{ label: string; description: string; candidateIds: string[] }>;
-  items: Array<{
-    candidateId: string;
-    reason: string;
-    uncertainty: string | null;
-    citationCandidateIds: string[];
-  }>;
-  limitations: string[];
-}
-
 interface ResearchRun {
   id: string;
   mode: 'search' | 'corpus';
@@ -93,9 +86,16 @@ interface ResearchRun {
   modelIdentifier: string | null;
   stopReason: string | null;
   safeDetail: string;
+  fallbackAvailable: boolean;
   candidates: ResearchEvidenceCandidate[];
   proposals: Array<{ proposalType: string; output: unknown }>;
-  operations: Array<{ id: string; sourceKey: string; state: string }>;
+  operations: Array<{
+    id: string;
+    sourceKey: string;
+    state: string;
+    resultCount: number;
+    safeDetail: string;
+  }>;
 }
 
 interface SearchSession extends ExplorerSession {
@@ -193,6 +193,19 @@ export function ExplorePage() {
     queryFn: () => api<ResearchRun>(`/api/v1/research/runs/${researchRunId}`),
     refetchInterval: (query: { state: { data?: ResearchRun } }) =>
       ['queued', 'running'].includes(query.state.data?.state ?? '') ? 1_000 : false,
+  });
+  const runFallback = useMutation({
+    mutationFn: () => {
+      if (!researchRunId) throw new Error('No research run is available for fallback.');
+      return api<{ operations: Array<{ id: string }> }>(
+        `/api/v1/research/runs/${researchRunId}/fallback`,
+        { method: 'POST', body: JSON.stringify({}) },
+      );
+    },
+    onSuccess: ({ operations }) => {
+      setDiscoveryOperationIds(operations.map((operation) => operation.id));
+      setNotice('Deterministic connected-source fallback started against the frozen result set.');
+    },
   });
 
   const resultQuery = useMemo(() => {
@@ -412,6 +425,7 @@ export function ExplorePage() {
     redact.error,
     ...discoveryOperations.map((operation) => operation.error),
     researchRun.error,
+    runFallback.error,
     watch.error,
     loadMore.error,
   ].filter(Boolean);
@@ -441,7 +455,7 @@ export function ExplorePage() {
   );
   const researchSynthesis = researchRun.data?.proposals.find(
     (proposal) => proposal.proposalType === 'synthesis',
-  )?.output as ResearchSynthesis | undefined;
+  )?.output as ResearchEvidenceSynthesis | undefined;
   const researchCandidates = new Map(
     (researchRun.data?.candidates ?? []).map((candidate) => [candidate.id, candidate]),
   );
@@ -463,11 +477,11 @@ export function ExplorePage() {
         className={`explorer-hero${results.data ? ' populated' : ''}`}
         aria-labelledby="explorer-heading"
       >
-        <p className="eyebrow">Technology search</p>
-        <h1 id="explorer-heading">Find existing tools for what you need</h1>
+        <p className="eyebrow">Evidence-backed research</p>
+        <h1 id="explorer-heading">Find what exists for what you need</h1>
         <p>
-          Describe what you need. Maestro searches its local index and every source you have
-          enabled, then shows a query-specific signal, confidence, and evidence for each result.
+          Describe what you need. Maestro searches admitted knowledge and enabled public sources,
+          preserves source outcomes, and keeps evidence quality separate from project fit.
         </p>
         <form
           className="explorer-query"
@@ -500,7 +514,7 @@ export function ExplorePage() {
         </form>
         <div className="privacy-line">
           <span>Local index available offline</span>
-          <span>Every result gets a 0–100 signal estimate</span>
+          <span>Evidence state, query ranking, and project fit stay separate</span>
           <span>
             {enabledDiscoveryCount
               ? `${enabledDiscoveryCount} connected source${enabledDiscoveryCount === 1 ? '' : 's'} enabled`
@@ -698,11 +712,24 @@ export function ExplorePage() {
               </summary>
               <div className="source-results-body">
                 <p className="hint">{researchRun.data.safeDetail}</p>
+                {researchRun.data.operations.length ? (
+                  <div className="source-status-row" aria-label="Model-led source outcomes">
+                    {researchRun.data.operations.map((operation) => (
+                      <span key={operation.id} title={operation.safeDetail}>
+                        <strong>{label(operation.sourceKey)}</strong>
+                        <StateBadge state={operation.state} />
+                        <small>{operation.resultCount} stored</small>
+                      </span>
+                    ))}
+                  </div>
+                ) : null}
                 {researchSynthesis ? (
                   <>
                     <div className="section-heading">
                       <div>
-                        <h2>Research synthesis</h2>
+                        <h2>
+                          Research synthesis · {label(researchSynthesis.contextAssessment)} context
+                        </h2>
                         <p>{researchSynthesis.summary}</p>
                       </div>
                       <p className="hint">
@@ -711,6 +738,16 @@ export function ExplorePage() {
                           : 'Model output was constrained and validated by the host.'}
                       </p>
                     </div>
+                    <ResearchCitationList
+                      candidates={researchCandidates}
+                      citationCandidateIds={researchSynthesis.summaryCitationCandidateIds}
+                      labelText="Summary evidence"
+                    />
+                    {researchSynthesis.abstentionReason ? (
+                      <p className="authority-note">
+                        Abstained: {researchSynthesis.abstentionReason}
+                      </p>
+                    ) : null}
                     <div className="chip-row" aria-label="Research groups">
                       {researchSynthesis.groups.map((group) => (
                         <span
@@ -734,17 +771,52 @@ export function ExplorePage() {
                 ) : ['queued', 'running'].includes(researchRun.data.state) ? (
                   <Loading message="Researching enabled sources and checking evidence gaps…" />
                 ) : (
-                  <p className="source-empty">
-                    No validated synthesis was produced. Any acquired evidence remains in the run
-                    record, and the deterministic source path remains available.
-                  </p>
+                  <>
+                    <p className="source-empty">
+                      No validated synthesis was produced. Acquired leads below are unselected
+                      evidence, not model conclusions.
+                    </p>
+                    {researchRun.data.candidates.length ? (
+                      <div className="source-result-list">
+                        {researchRun.data.candidates.map((candidate) => (
+                          <article className="source-result-row" key={candidate.id}>
+                            <div className="result-identity">
+                              <Badge>{label(candidate.sourceKey)}</Badge>
+                              <h3>{candidate.title}</h3>
+                              <p>{candidate.summary}</p>
+                            </div>
+                            <a
+                              className="button secondary compact"
+                              href={candidate.canonicalUri}
+                              rel="noreferrer"
+                              target="_blank"
+                            >
+                              Open acquired lead
+                            </a>
+                          </article>
+                        ))}
+                      </div>
+                    ) : null}
+                    {researchRun.data.fallbackAvailable ? (
+                      <button
+                        className="button secondary compact"
+                        disabled={runFallback.isPending}
+                        onClick={() => runFallback.mutate()}
+                        type="button"
+                      >
+                        {runFallback.isPending
+                          ? 'Starting deterministic fallback…'
+                          : 'Run deterministic fallback'}
+                      </button>
+                    ) : null}
+                  </>
                 )}
               </div>
             </details>
           ) : null}
 
-          {researchRun.data?.strategy !== 'model' ? (
-            <details className="source-results">
+          {researchRun.data?.strategy !== 'model' || discoveryOperationIds.length > 0 ? (
+            <details className="source-results" open={researchRun.data?.state === 'budget_denied'}>
               <summary>
                 <div>
                   <p className="eyebrow">Connected sources</p>
@@ -757,8 +829,8 @@ export function ExplorePage() {
                   <p className="authority-note">{researchRun.data.safeDetail}</p>
                 ) : null}
                 <p className="hint">
-                  Source results are scored immediately from query relevance and available metadata.
-                  Low confidence remains visible until stronger evidence is attached.
+                  These leads use the preserved Phase 07 query-ranking estimate; evidence quality
+                  and Corpus admission remain separate.
                 </p>
                 {discoveryOperationIds.length ? (
                   <>
@@ -785,7 +857,7 @@ export function ExplorePage() {
                               <p>{candidate.summary}</p>
                             </div>
                             <div className="query-signal">
-                              <strong>Signal {candidate.signalDisplay}</strong>
+                              <strong>Legacy query estimate {candidate.signalDisplay}</strong>
                               <span>
                                 {label(candidate.relevanceOrdinal)} relevance ·{' '}
                                 {signalStateLabel(candidate.displayState)}

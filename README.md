@@ -44,8 +44,10 @@ migrations are hash-checked and the seed is idempotent.
 The default configuration is safe and local: every source/model adapter starts disabled, and
 indexed search needs no model, key, network, or automatic model download. When an explicit
 loopback `local_semantic` model and public source adapters are enabled, Search runs
-`research-skill-v1`; only public query/evidence fields cross those boundaries. Otherwise it uses
-the preserved deterministic path. Copy
+`research-skill-v1` with `research-protocol-v2`; only public query/evidence fields cross those
+boundaries. A sufficient synthesis must carry exact summary and item citations; an insufficient
+run abstains explicitly. Otherwise Search uses the preserved deterministic path, which can also be
+started explicitly after a model-run failure. Copy
 `.env.example` to `.env` only when changing a documented port. `MAESTRO_ALLOW_NETWORK_FETCH=false`
 also keeps the original Consider/refresh metadata path offline. Unknown public hosts enter manual
 review; local, private, credential-bearing, non-HTTPS, and nonstandard-port public URLs are rejected

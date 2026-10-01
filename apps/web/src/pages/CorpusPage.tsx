@@ -2,7 +2,12 @@ import { useMutation, useQuery } from '@tanstack/react-query';
 import { type FormEvent, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { api, formatDate, formatFractionPercent, label } from '../api.js';
-import { ResearchEvidenceList, type ResearchEvidenceCandidate } from '../ResearchEvidenceList.js';
+import {
+  ResearchCitationList,
+  ResearchEvidenceList,
+  type ResearchEvidenceCandidate,
+  type ResearchEvidenceSynthesis,
+} from '../ResearchEvidenceList.js';
 import { Badge, Empty, ErrorPanel, Loading, PageHeader } from '../ui.js';
 
 interface CorpusItem {
@@ -53,17 +58,6 @@ interface CorpusResearchRun {
     proposalType: string;
     output: unknown;
   }>;
-}
-
-interface CorpusSynthesis {
-  summary: string;
-  groups: Array<{ label: string; description: string; candidateIds: string[] }>;
-  items: Array<{
-    candidateId: string;
-    reason: string;
-    uncertainty: string | null;
-  }>;
-  limitations: string[];
 }
 
 function evidenceLabel(state: string | null): string {
@@ -157,7 +151,7 @@ export function CorpusPage() {
 
   const synthesis = researchRun.data?.proposals.find(
     (proposal) => proposal.proposalType === 'synthesis',
-  )?.output as CorpusSynthesis | undefined;
+  )?.output as ResearchEvidenceSynthesis | undefined;
   const researchCandidates = new Map(
     (researchRun.data?.candidates ?? []).map((candidate) => [candidate.id, candidate]),
   );
@@ -314,7 +308,18 @@ export function CorpusPage() {
                   <Loading message="Reviewing corpus evidence and checking coverage gaps…" />
                 ) : synthesis ? (
                   <>
-                    <p>{synthesis.summary}</p>
+                    <p>
+                      <Badge>{label(synthesis.contextAssessment)} context</Badge>{' '}
+                      {synthesis.summary}
+                    </p>
+                    <ResearchCitationList
+                      candidates={researchCandidates}
+                      citationCandidateIds={synthesis.summaryCitationCandidateIds}
+                      labelText="Summary evidence"
+                    />
+                    {synthesis.abstentionReason ? (
+                      <p className="authority-note">Abstained: {synthesis.abstentionReason}</p>
+                    ) : null}
                     <div className="chip-row" aria-label="Corpus research groups">
                       {synthesis.groups.map((group) => (
                         <span
@@ -348,8 +353,8 @@ export function CorpusPage() {
               </div>
               <p className="hint">
                 {corpus.data.scoringApplied
-                  ? 'Every displayed match has a numeric estimate. Confidence and review state remain separate.'
-                  : 'Browse mode does not invent a universal score. Search for a need to calculate query-specific signals.'}
+                  ? 'Displayed matches use the preserved Phase 07 query-ranking estimate. Confidence and review state remain separate.'
+                  : 'Browse mode does not invent a universal score. Search for a need to calculate a query-specific ranking estimate.'}
               </p>
             </div>
             {corpus.data.items.length ? (
@@ -382,7 +387,7 @@ export function CorpusPage() {
                     </div>
                     {corpus.data.scoringApplied ? (
                       <div className="query-signal">
-                        <strong>Signal {item.signalDisplay}</strong>
+                        <strong>Legacy query estimate {item.signalDisplay}</strong>
                         <span>
                           {item.relevanceOrdinal
                             ? `${label(item.relevanceOrdinal)} relevance · `
@@ -418,8 +423,8 @@ export function CorpusPage() {
               </div>
             ) : (
               <Empty title="No corpus records match">
-                Change the query or clear one of the filters. A live Search saves attributed source
-                leads here automatically.
+                Change the query or clear one of the filters. Live Search leads remain in research
+                history until a human explicitly admits them to the Corpus.
               </Empty>
             )}
             <div className="corpus-pagination">

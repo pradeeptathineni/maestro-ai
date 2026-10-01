@@ -1069,6 +1069,7 @@ export const discoveryOperations = ops.table('discovery_operations', {
   reservedCalls: integer('reserved_calls').notNull(),
   consumedCalls: integer('consumed_calls').notNull().default(0),
   resultCount: integer('result_count').notNull().default(0),
+  resultLimit: integer('result_limit').notNull().default(20),
   errorCode: text('error_code'),
   safeDetail: text('safe_detail'),
   planRouteId: text('plan_route_id'),

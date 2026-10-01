@@ -16,9 +16,14 @@ import {
   type ResearchModelResponse,
   type ResearchPolicy,
   type ResearchSourceExecutor,
+  type ResearchSourceResult,
 } from '../../domain/src/index.js';
-import { processDiscoveryOperation, requestDiscovery } from './discovery-repository.js';
-import { NotFoundError } from './errors.js';
+import {
+  processDiscoveryOperation,
+  requestDiscovery,
+  requestEnabledDiscovery,
+} from './discovery-repository.js';
+import { ConflictError, NotFoundError } from './errors.js';
 import { inTransaction } from './transaction.js';
 
 const DEFAULT_RESEARCH_BUDGET = {
@@ -29,7 +34,7 @@ const DEFAULT_RESEARCH_BUDGET = {
   maxQueryLength: 300,
 } as const;
 const MODEL_CALL_RESERVATION = DEFAULT_RESEARCH_BUDGET.maxSteps + 1;
-const RESEARCH_LEASE_SECONDS = 120;
+const RESEARCH_LEASE_SECONDS = 180;
 
 interface ResearchTaskPayload {
   researchRunId: string;
@@ -42,16 +47,19 @@ interface ClaimedResearchRun {
   querySessionId: string;
   resultSetId: string;
   publicQuery: string;
+  sessionAvailable: boolean;
   mode: 'search' | 'corpus';
   allowedSourceKeys: string[];
   budget: typeof DEFAULT_RESEARCH_BUDGET;
   modelConfigHash: string;
-  adapterVersion: string;
-  baseUrl: string;
-  modelIdentifier: string;
-  timeoutMs: number;
-  maxInputTokens: number;
-  maxOutputTokens: number;
+  expectedModelIdentifier: string;
+  modelEnabled: boolean;
+  currentAdapterVersion: string;
+  currentBaseUrl: string | null;
+  currentModelIdentifier: string | null;
+  currentTimeoutMs: number;
+  currentMaxInputTokens: number;
+  currentMaxOutputTokens: number;
   leaseToken: string;
 }
 
@@ -144,29 +152,38 @@ async function retrieveCorpusEvidence(
     canonicalUri: string | null;
     observedAt: Date;
     searchText: string;
+    sourceTypes: string[];
+    reviewState: string;
+    kindHint: string;
   }>(
     `SELECT projection.id::text AS id, projection.preferred_label AS title,
             projection.summary,
             source_data.canonical_uri AS "canonicalUri",
             COALESCE(source_data.observed_at, projection.indexed_at) AS "observedAt",
-            projection.search_text AS "searchText"
+            projection.search_text AS "searchText", projection.kind_profile AS "kindHint",
+            projection.publication_state AS "reviewState",
+            COALESCE(source_data.source_types, ARRAY['local_catalog']::text[]) AS "sourceTypes"
      FROM catalog.knowledge_projections projection
      LEFT JOIN LATERAL (
-       SELECT source.canonical_uri, observation.observed_at
+       SELECT (array_agg(source.canonical_uri ORDER BY observation.observed_at DESC, source.id))[1]
+                AS canonical_uri,
+              max(observation.observed_at) AS observed_at,
+              array_agg(DISTINCT source.source_type ORDER BY source.source_type) AS source_types
        FROM catalog.knowledge_projection_sources binding
        JOIN catalog.source_observations observation
          ON observation.id = binding.source_observation_id
        JOIN catalog.sources source ON source.id = observation.source_id
        WHERE binding.projection_id = projection.id
-       ORDER BY observation.observed_at DESC, source.id
-       LIMIT 1
      ) source_data ON true
      WHERE projection.publication_state <> 'withdrawn'
        AND (projection.expires_at IS NULL OR projection.expires_at > now())
      UNION ALL
      SELECT document.id::text, document.title, document.summary,
-            document.canonical_uri, document.observed_at, document.search_text
+            document.canonical_uri, document.observed_at, document.search_text,
+            document.document_kind, document.publication_state, ARRAY[source.source_type]::text[]
      FROM catalog.knowledge_documents document
+     JOIN catalog.source_observations observation ON observation.id = document.source_observation_id
+     JOIN catalog.sources source ON source.id = observation.source_id
      WHERE document.publication_state <> 'withdrawn'`,
   );
   const terms = genericTerms(query);
@@ -192,6 +209,10 @@ async function retrieveCorpusEvidence(
       summary: row.summary,
       canonicalUri: row.canonicalUri ?? `urn:maestro:corpus:${row.id}`,
       observedAt: row.observedAt.toISOString(),
+      sourceClass: 'local_corpus',
+      sourceTypes: row.sourceTypes,
+      reviewState: row.reviewState,
+      kindHint: row.kindHint,
     }));
 }
 
@@ -200,7 +221,7 @@ async function executeLiveAction(
   row: ClaimedResearchRun,
   action: ResearchAction,
   step: number,
-): Promise<ResearchCandidate[]> {
+): Promise<ResearchSourceResult> {
   const requested = (await requestDiscovery(
     pool,
     row.workspaceId,
@@ -220,6 +241,8 @@ async function executeLiveAction(
       researchRunId: row.id,
       researchStep: step,
       researchActionKey: action.actionKey,
+      resultSetId: row.resultSetId,
+      resultLimit: action.maxResults,
       dispatch: 'inline',
     },
   )) as { id: string; state: string };
@@ -229,18 +252,51 @@ async function executeLiveAction(
       workspaceId: row.workspaceId,
     });
   }
-  const candidates = await pool.query<ResearchCandidate>(
-    `SELECT candidate.id, candidate.adapter_key AS "sourceKey", candidate.title,
+  const [operation, candidates] = await Promise.all([
+    pool.query<{ state: string; safeDetail: string | null }>(
+      `SELECT state, safe_detail AS "safeDetail"
+       FROM ops.discovery_operations WHERE id = $1 AND workspace_id = $2`,
+      [requested.id, row.workspaceId],
+    ),
+    pool.query<ResearchCandidate>(
+      `SELECT candidate.id, candidate.adapter_key AS "sourceKey", candidate.title,
             candidate.summary, candidate.canonical_uri AS "canonicalUri",
-            candidate.created_at::text AS "observedAt"
+            candidate.created_at::text AS "observedAt",
+            config.source_class AS "sourceClass", candidate.review_state AS "reviewState",
+            candidate.kind_hint AS "kindHint", ARRAY[candidate.adapter_key]::text[] AS "sourceTypes"
      FROM ops.discovery_operation_candidates link
      JOIN ops.discovery_candidates candidate ON candidate.id = link.discovery_candidate_id
+     JOIN ops.source_adapter_configs config ON config.adapter_key = candidate.adapter_key
      WHERE link.operation_id = $1 AND link.workspace_id = $2
      ORDER BY candidate.title, candidate.id
      LIMIT $3`,
-    [requested.id, row.workspaceId, action.maxResults],
-  );
-  return candidates.rows;
+      [requested.id, row.workspaceId, action.maxResults],
+    ),
+  ]);
+  const operationState = operation.rows[0]?.state ?? 'failed';
+  const state =
+    operationState === 'complete' && candidates.rowCount === 0
+      ? 'empty'
+      : [
+            'complete',
+            'partial',
+            'failed',
+            'not_configured',
+            'budget_denied',
+            'skipped',
+            'unsupported',
+            'cancelled',
+          ].includes(operationState)
+        ? (operationState as ResearchSourceResult['state'])
+        : 'failed';
+  return {
+    state,
+    candidates: candidates.rows,
+    operationId: requested.id,
+    safeDetail:
+      operation.rows[0]?.safeDetail ??
+      (state === 'failed' ? 'The source operation did not reach a terminal state.' : null),
+  };
 }
 
 export async function requestResearchRun(
@@ -431,20 +487,48 @@ async function claimResearchRun(
      FROM workspace.query_sessions session, ops.source_adapter_configs config
      WHERE run.id = $1 AND run.workspace_id = $2 AND run.state = 'queued'
        AND session.id = run.query_session_id AND session.workspace_id = run.workspace_id
-       AND session.deleted_at IS NULL AND config.adapter_key = 'local_semantic'
-       AND config.enabled AND config.base_url IS NOT NULL AND config.model_identifier IS NOT NULL
+       AND config.adapter_key = 'local_semantic'
      RETURNING run.id, run.workspace_id AS "workspaceId",
                run.query_session_id AS "querySessionId", run.result_set_id AS "resultSetId",
-               session.query_text AS "publicQuery", run.mode,
+               session.query_text AS "publicQuery", session.deleted_at IS NULL AS "sessionAvailable",
+               run.mode,
                run.allowed_source_keys AS "allowedSourceKeys", run.budget,
                run.model_config_hash AS "modelConfigHash",
-               config.adapter_version AS "adapterVersion", config.base_url AS "baseUrl",
-               config.model_identifier AS "modelIdentifier", config.timeout_ms AS "timeoutMs",
-               config.max_input_tokens AS "maxInputTokens",
-               config.max_output_tokens AS "maxOutputTokens", run.lease_token AS "leaseToken"`,
+               run.model_identifier AS "expectedModelIdentifier",
+               config.enabled AS "modelEnabled",
+               config.adapter_version AS "currentAdapterVersion",
+               config.base_url AS "currentBaseUrl",
+               config.model_identifier AS "currentModelIdentifier",
+               config.timeout_ms AS "currentTimeoutMs",
+               config.max_input_tokens AS "currentMaxInputTokens",
+               config.max_output_tokens AS "currentMaxOutputTokens",
+               run.lease_token AS "leaseToken"`,
     [payload.researchRunId, payload.workspaceId, leaseToken, RESEARCH_LEASE_SECONDS],
   );
   return claimed.rows[0] ?? null;
+}
+
+async function renewResearchLease(pool: Pool, row: ClaimedResearchRun): Promise<void> {
+  const renewed = await pool.query(
+    `UPDATE ops.research_runs
+     SET lease_until = now() + make_interval(secs => $4), updated_at = now()
+     WHERE id = $1 AND workspace_id = $2 AND lease_token = $3 AND state = 'running'
+     RETURNING id`,
+    [row.id, row.workspaceId, row.leaseToken, RESEARCH_LEASE_SECONDS],
+  );
+  if (!renewed.rowCount) throw new Error('research_lease_lost');
+}
+
+function currentModelFingerprint(row: ClaimedResearchRun): string | null {
+  if (!row.currentBaseUrl || !row.currentModelIdentifier) return null;
+  return hashCanonical({
+    adapterVersion: row.currentAdapterVersion,
+    baseUrl: row.currentBaseUrl,
+    modelIdentifier: row.currentModelIdentifier,
+    timeoutMs: row.currentTimeoutMs,
+    maxInputTokens: row.currentMaxInputTokens,
+    maxOutputTokens: row.currentMaxOutputTokens,
+  });
 }
 
 export async function processResearchRun(
@@ -459,24 +543,54 @@ export async function processResearchRun(
     lastCall: { request: ResearchModelRequest; response: ResearchModelResponse } | null;
   } = { lastCall: null };
   let lastAcceptedOutputHash: string | null = null;
+  const currentFingerprint = currentModelFingerprint(row);
+  if (
+    !row.sessionAvailable ||
+    !row.modelEnabled ||
+    currentFingerprint === null ||
+    currentFingerprint !== row.modelConfigHash ||
+    row.currentModelIdentifier !== row.expectedModelIdentifier
+  ) {
+    const errorCode = row.sessionAvailable ? 'model_config_changed' : 'session_unavailable';
+    await writeRunEvent(pool, row, 0, 'run_failed', { errorCode });
+    await pool.query(
+      `UPDATE ops.research_runs
+       SET state = 'failed', error_code = $4,
+           safe_detail = CASE WHEN $4 = 'session_unavailable'
+             THEN 'The query session was redacted before execution; no model call was made.'
+             ELSE 'The configured local model changed before execution; no model call was made.' END,
+           lease_token = NULL, lease_until = NULL, finished_at = now(), updated_at = now()
+       WHERE id = $1 AND workspace_id = $2 AND lease_token = $3 AND state = 'running'`,
+      [row.id, row.workspaceId, row.leaseToken, errorCode],
+    );
+    return;
+  }
   const activeModel =
     overrides?.model ??
     createLocalResearchModel({
-      baseUrl: row.baseUrl,
-      model: row.modelIdentifier,
-      timeoutMs: row.timeoutMs,
-      maxOutputTokens: row.maxOutputTokens,
+      baseUrl: row.currentBaseUrl!,
+      model: row.currentModelIdentifier,
+      timeoutMs: row.currentTimeoutMs,
+      maxOutputTokens: row.currentMaxOutputTokens,
     });
   const model = {
     async propose(request: ResearchModelRequest): Promise<ResearchModelResponse> {
+      if (Buffer.byteLength(JSON.stringify(request.payload), 'utf8') > row.currentMaxInputTokens) {
+        throw new ResearchProtocolError(
+          'budget_exceeded',
+          'Serialized model input exceeded the configured conservative byte boundary.',
+        );
+      }
+      await renewResearchLease(pool, row);
       modelCalls += 1;
       const response = await activeModel.propose(request);
+      await renewResearchLease(pool, row);
       modelTrace.lastCall = { request, response };
       const inputTokens = reportedTokens(response.usage, 'inputTokens');
       const outputTokens = reportedTokens(response.usage, 'outputTokens');
       if (
-        (inputTokens !== null && inputTokens > row.maxInputTokens) ||
-        (outputTokens !== null && outputTokens > row.maxOutputTokens)
+        (inputTokens !== null && inputTokens > row.currentMaxInputTokens) ||
+        (outputTokens !== null && outputTokens > row.currentMaxOutputTokens)
       ) {
         throw new ResearchProtocolError(
           'budget_exceeded',
@@ -493,6 +607,9 @@ export async function processResearchRun(
       await writeRunEvent(pool, row, event.step, 'source_result', {
         actionKey: event.action.actionKey,
         sourceKey: event.action.sourceKey,
+        sourceState: event.sourceState,
+        operationId: event.operationId,
+        safeDetail: event.safeDetail,
         queryHash: hashCanonical(event.action.query),
         candidateIds: event.candidateIds,
         candidates: event.candidates,
@@ -518,7 +635,7 @@ export async function processResearchRun(
         proposalTaskKey(event.proposalType),
         event.proposalType,
         event.step,
-        row.adapterVersion,
+        row.currentAdapterVersion,
         event.modelIdentifier,
         row.modelConfigHash,
         RESEARCH_PROTOCOL_VERSION,
@@ -531,6 +648,8 @@ export async function processResearchRun(
           structuredOutput: true,
           allowedSourcesEnforcedByHost: true,
           evidenceIdsValidatedByHost: event.proposalType !== 'plan',
+          inputBoundedBeforeDispatch: true,
+          inputBoundaryUnit: 'utf8_bytes_conservative_against_configured_input_tokens',
           privateProjectContextIncluded: false,
           arbitraryToolAuthority: false,
         }),
@@ -546,17 +665,29 @@ export async function processResearchRun(
         model,
         sources: {
           async search(action) {
-            if (overrides?.sources) return overrides.sources.search(action);
-            return row.mode === 'corpus'
-              ? retrieveCorpusEvidence(pool, action.query, action.maxResults)
-              : executeLiveAction(pool, row, action, Math.max(0, modelCalls - 1));
+            await renewResearchLease(pool, row);
+            const sourceResult = overrides?.sources
+              ? await overrides.sources.search(action)
+              : row.mode === 'corpus'
+                ? await retrieveCorpusEvidence(pool, action.query, action.maxResults).then(
+                    (candidates): ResearchSourceResult => ({
+                      state: candidates.length ? 'complete' : 'empty',
+                      candidates,
+                      safeDetail: candidates.length
+                        ? `Retrieved ${candidates.length} admitted Corpus record(s).`
+                        : 'No admitted Corpus evidence matched this bounded query.',
+                    }),
+                  )
+                : await executeLiveAction(pool, row, action, Math.max(0, modelCalls - 1));
+            await renewResearchLease(pool, row);
+            return sourceResult;
           },
         },
         journal,
       },
     );
     await inTransaction(pool, async (client) => {
-      await client.query(
+      const completed = await client.query(
         `UPDATE ops.research_runs
          SET state = 'complete', consumed_model_calls = $4, stop_reason = $5,
              receipt = $6, safe_detail = $7, lease_token = NULL, lease_until = NULL,
@@ -572,6 +703,7 @@ export async function processResearchRun(
           `Model-led ${row.mode} completed with ${result.candidates.length} evidence candidate(s).`,
         ],
       );
+      if (!completed.rowCount) throw new Error('research_lease_lost');
       await client.query(
         `UPDATE ops.adapter_daily_budgets
          SET consumed_calls = consumed_calls + $1, updated_at = now()
@@ -580,6 +712,7 @@ export async function processResearchRun(
       );
     });
   } catch (error) {
+    if (error instanceof Error && error.message === 'research_lease_lost') return;
     const protocolCode = error instanceof ResearchProtocolError ? error.code : 'upstream';
     if (
       modelTrace.lastCall &&
@@ -596,7 +729,7 @@ export async function processResearchRun(
     }
     await writeRunEvent(pool, row, currentStep, 'run_failed', { errorCode: protocolCode });
     await inTransaction(pool, async (client) => {
-      await client.query(
+      const failed = await client.query(
         `UPDATE ops.research_runs
          SET state = 'failed', consumed_model_calls = $4, error_code = $5,
              safe_detail = 'The bounded research run failed; stored evidence and fallback paths remain available.',
@@ -604,6 +737,7 @@ export async function processResearchRun(
          WHERE id = $1 AND workspace_id = $2 AND lease_token = $3 AND state = 'running'`,
         [row.id, row.workspaceId, row.leaseToken, modelCalls, protocolCode],
       );
+      if (!failed.rowCount) throw new Error('research_lease_lost');
       await client.query(
         `UPDATE ops.adapter_daily_budgets
          SET consumed_calls = consumed_calls + $1, updated_at = now()
@@ -619,7 +753,7 @@ export async function getResearchRun(
   workspaceId: string,
   researchRunId: string,
 ): Promise<unknown> {
-  const run = await pool.query(
+  const run = await pool.query<{ mode: string; errorCode: string | null; state: string }>(
     `SELECT id, query_session_id AS "querySessionId", result_set_id AS "resultSetId",
             mode, strategy, state, skill_version AS "skillVersion",
             protocol_version AS "protocolVersion", model_identifier AS "modelIdentifier",
@@ -692,11 +826,53 @@ export async function getResearchRun(
   }
   return {
     ...run.rows[0],
+    fallbackAvailable:
+      run.rows[0]?.mode === 'search' &&
+      run.rows[0]?.errorCode !== 'session_unavailable' &&
+      ['failed', 'not_configured', 'budget_denied'].includes(String(run.rows[0]?.state)),
     proposals: proposals.rows,
     events: events.rows,
     operations: operations.rows,
     candidates: [...candidates.values()],
   };
+}
+
+export async function requestResearchFallback(
+  pool: Pool,
+  workspaceId: string,
+  researchRunId: string,
+): Promise<unknown> {
+  const run = await pool.query<{
+    querySessionId: string;
+    resultSetId: string;
+    publicQuery: string;
+    mode: string;
+    state: string;
+  }>(
+    `SELECT run.query_session_id AS "querySessionId", run.result_set_id AS "resultSetId",
+            session.query_text AS "publicQuery", run.mode, run.state
+     FROM ops.research_runs run
+     JOIN workspace.query_sessions session
+       ON session.id = run.query_session_id AND session.workspace_id = run.workspace_id
+     WHERE run.id = $1 AND run.workspace_id = $2 AND session.deleted_at IS NULL`,
+    [researchRunId, workspaceId],
+  );
+  if (!run.rowCount) throw new NotFoundError('Research run not found.');
+  const record = run.rows[0]!;
+  if (
+    record.mode !== 'search' ||
+    !['failed', 'not_configured', 'budget_denied'].includes(record.state)
+  ) {
+    throw new ConflictError('Deterministic fallback is not available for this research run.');
+  }
+  const operations = await requestEnabledDiscovery(
+    pool,
+    workspaceId,
+    record.querySessionId,
+    record.publicQuery,
+    record.resultSetId,
+  );
+  return { researchRunId, operations };
 }
 
 export async function recoverStaleResearchRuns(pool: Pool): Promise<number> {

@@ -26,7 +26,10 @@ is better suited to exact authority, privacy, provenance, validation, and replay
    routing or multiple models only when evaluation shows a material gain.
 3. Let the model propose only searches through source keys supplied by the host. The host validates
    every action, clamps budgets, performs calls, and passes back compact attributed candidates.
-4. Require refinement and synthesis to cite exact stored candidate IDs. Unknown IDs, unsupported
+4. Require refinement and synthesis to cite exact stored candidate IDs. Synthesis must state
+   whether context is sufficient: sufficient output requires self-cited findings, organized groups,
+   and summary citations; insufficient output must abstain without findings and explain the gap.
+   Unknown IDs, unsupported
    sources, arbitrary action fields, duplicate references, and over-budget actions fail closed and
    receive durable rejection evidence.
 5. Keep Search and Corpus acquisition distinct. Search uses enabled current sources; Corpus uses
@@ -37,7 +40,7 @@ is better suited to exact authority, privacy, provenance, validation, and replay
    intelligence.
 7. Preserve `catalog`/`workspace`/`ops` separation. Project context is not sent to the model or
    public sources in this phase. Live leads require explicit admission before becoming Corpus.
-8. Store model/config/input/output hashes, exact structured output, usage, safety checks, validator
+8. Store model/config/input/output hashes, exact structured output, source outcomes, usage, safety checks, validator
    receipts, source operations, acquisition-time candidate snapshots and links, stop reason, and
    terminal run receipt. Re-rendered replay is deterministic; new model generation is not.
 9. Package the method as a repository skill so a user's own agent can apply the same research
@@ -54,9 +57,9 @@ Model output can be coherent and still wrong. Exact citation validation proves o
 records exist; human or independent evaluation must still assess whether claims are supported,
 coverage is sufficient, and organization is useful.
 
-Candidate-level citations are the Phase 08 floor, not the final evidence model. Usefulness testing
-must determine whether claim-level support and an explicit context-sufficiency/abstention judgment
-are necessary before Corpus admission or hosted operation.
+Candidate-level citations plus summary citations and an explicit context-sufficiency/abstention
+judgment are the Phase 08 floor, not the final evidence model. Usefulness testing must determine
+whether finer claim-level support is necessary before Corpus admission or hosted operation.
 
 The discarded Phase 08 spike remains on its pushed branch and PR as an auditable experiment. It is
 not rewritten into migration history or force-pushed away.
