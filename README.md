@@ -1,11 +1,16 @@
 # Maestro AI
 
-Maestro v0 is a local-first technology search and evidence-to-decision workspace. Search starts
-with a useful offline index, fans out to every source the operator has enabled, and gives every
-returned item a query-specific signal estimate with confidence, missing information, and source
-state shown separately. List, map, detail, compare, and export share one immutable local snapshot;
-live source results remain visibly preliminary and are saved into a separate research corpus. A
-reviewed admission—not collection alone—moves a lead into the indexed knowledge layer.
+Maestro is a local-first research system for finding high-signal existing knowledge that can help a
+project. **Search** investigates enabled public sources for a live need. **Corpus** searches durable,
+admitted, refreshable knowledge. Both use one evidence-bound research protocol for interpretation,
+refinement, filtering, and organization while keeping their evidence universes and user experience
+distinct.
+
+The strongest path is model-led: one explicitly configured structured-output model proposes
+bounded source searches, assesses evidence gaps, and organizes cited findings. Deterministic code
+controls privacy, tools, budgets, identity, provenance, admission, and replay. The preserved Phase
+06/07 deterministic search remains a transparent no-model fallback and evaluation comparator, not
+an expanding word-list substitute for open-world understanding.
 
 It does **not** install, authorize, invoke, or orchestrate cataloged software. No
 model key is required. The narrow v0 establishes the policy, evidence, project-context, adapter,
@@ -18,7 +23,8 @@ ontology the core domain.
 - Docker Desktop or another local Docker runtime with Compose
 - ports `4310`, `5173`, and `54329` available on loopback
 
-No hosted database, external account, API key, or live seed fetch is needed.
+No hosted database, external account, API key, model, or live seed fetch is needed for the fallback
+and local Corpus.
 
 ## Local setup
 
@@ -35,10 +41,11 @@ items have reviewed baseline evidence; the other 49 retain their proposed source
 still receive conservative numeric signal estimates. Initialization is safe to run again:
 migrations are hash-checked and the seed is idempotent.
 
-The default configuration is safe and local: every Phase 06 source/model adapter starts disabled,
-and indexed search needs no model, key, network, or automatic model download. When a source adapter
-is enabled, pressing Search sends only the public search text to that source and shows its scored
-leads separately from the immutable local result set. Copy
+The default configuration is safe and local: every source/model adapter starts disabled, and
+indexed search needs no model, key, network, or automatic model download. When an explicit
+loopback `local_semantic` model and public source adapters are enabled, Search runs
+`research-skill-v1`; only public query/evidence fields cross those boundaries. Otherwise it uses
+the preserved deterministic path. Copy
 `.env.example` to `.env` only when changing a documented port. `MAESTRO_ALLOW_NETWORK_FETCH=false`
 also keeps the original Consider/refresh metadata path offline. Unknown public hosts enter manual
 review; local, private, credential-bearing, non-HTTPS, and nonstandard-port public URLs are rejected
@@ -46,14 +53,16 @@ as safe failure receipts. Both the API bind and browser origin remain loopback-o
 
 ## Primary demonstration
 
-1. Open **Search**, ask for `ai context reduction github`, and inspect the result count, signal,
-   confidence, caveat, and `query-signal-v1` explanation.
+1. Open **Search**, ask a real project question, and inspect why each result is relevant, which
+   evidence it cites, what remains uncertain, and whether the answer came from live research or the
+   deterministic fallback.
 2. Switch between list and the bounded capability map, open a detail, compare two items, and save a
    shortlist to the seeded local project. The query stays out of the URL.
-3. Open **Corpus** to browse saved indexed records and source leads, or enter a need to score every
-   matching record under the same query policy used by Search.
-4. Open **Workspace** to create or revise a project context and configure source adapters. Enabled
-   source adapters run when the operator presses Search; local semantic assistance remains separate.
+3. Open **Corpus** to browse admitted indexed records or research them through the same model
+   proposal/synthesis contract without making network calls. Raw live leads remain outside Corpus
+   until explicit admission.
+4. Open **Workspace** to create or revise private project context and configure source adapters.
+   Project context is not disclosed to the model or public sources in this phase.
 5. Open **Decide**, compare provider/composition/status-quo/build/defer options, and inspect hard
    gates before preference fit.
 6. Record a `trial` or `no decision` outcome and reopen its immutable, hash-verified receipt.
@@ -99,11 +108,14 @@ origin. OpenAPI is available one layer down at `/api/documentation`.
 
 ## Architecture and boundaries
 
+Start with [ARCHITECTURE.md](ARCHITECTURE.md) for current intent, boundaries, the model/deterministic
+split, and reused prior art.
+
 - `apps/web`: React Explorer plus decision, intake, evidence, and workspace surfaces
 - `apps/api`: loopback Fastify API with JSON validation, Host/Origin checks, mutation header, CSP,
   rate limits, safe problem details, structured redaction, and OTel-compatible spans
 - `apps/worker`: Graphile Worker intake adapter and transactional-outbox dispatcher
-- `packages/domain`: pure identity, URL, query/bundle, gate, and decision-receipt contracts
+- `packages/domain`: pure identity, research protocol, URL, query/bundle, gate, and receipt contracts
 - `packages/scoring`: pure versioned consideration, query-signal, project-fit, and verification policies
 - `packages/db`: Drizzle declarations, checked migrations, and explicit repositories
 - `packages/seed`: offline reviewed manifest, audit, and idempotent importer
@@ -113,15 +125,15 @@ PostgreSQL schemas enforce the trust boundary: `catalog` contains shareable revi
 migration records. The public catalog repository never joins to `workspace`; an integration canary
 test proves the separation.
 
-The following remain intentionally absent: arbitrary crawling, vector/embedding retrieval, cloud or
-gateway model fallback, agent/tool execution, candidate install/permission endpoints, sandboxing,
-CI/CD or deployment control, multi-user hosting, and broader SDLC/portfolio surfaces. A configured
-loopback model can create an attributed review-only interpretation proposal; it cannot alter a
-snapshot, score, policy, or authority. The local index is a cache and evidence substrate, not a
-claim to contain all technology knowledge.
+The following remain intentionally absent: arbitrary crawling, cloud or gateway model fallback,
+general agent/tool execution, candidate install/permission endpoints, sandboxing, CI/CD or
+deployment control, multi-user hosting, and broader SDLC/portfolio surfaces. A configured loopback
+model can propose bounded research actions and evidence organization; it cannot change policy,
+authority, admission, or private context. The local index is an evidence substrate, not a claim to
+contain all useful knowledge.
 
 See [ADR-001](docs/architecture/ADR-001-v0-foundation.md),
-[ADR-002](docs/architecture/ADR-002-phase-06-intelligence-explorer.md), the
+[ADR-004](docs/architecture/ADR-004-model-led-research.md), the
 [schema contract](docs/architecture/schema.md), and the adjacent authoritative planning workspace
 for the complete product decisions.
 
