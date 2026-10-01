@@ -12,6 +12,7 @@ import type {
 } from '../types.js';
 import { Badge, Empty, ErrorPanel, Loading, StateBadge } from '../ui.js';
 import { useWorkspaceProjects } from '../workspace-queries.js';
+import { ResearchEvidenceList, type ResearchEvidenceCandidate } from '../ResearchEvidenceList.js';
 
 const ExplorerMap = lazy(async () => ({
   default: (await import('../ExplorerMap.js')).ExplorerMap,
@@ -72,15 +73,6 @@ interface DiscoveryOperation {
   candidates: DiscoveryCandidate[];
 }
 
-interface ResearchCandidate {
-  id: string;
-  sourceKey: string;
-  title: string;
-  summary: string;
-  canonicalUri: string;
-  observedAt?: string | null;
-}
-
 interface ResearchSynthesis {
   summary: string;
   groups: Array<{ label: string; description: string; candidateIds: string[] }>;
@@ -101,7 +93,7 @@ interface ResearchRun {
   modelIdentifier: string | null;
   stopReason: string | null;
   safeDetail: string;
-  candidates: ResearchCandidate[];
+  candidates: ResearchEvidenceCandidate[];
   proposals: Array<{ proposalType: string; output: unknown }>;
   operations: Array<{ id: string; sourceKey: string; state: string }>;
 }
@@ -730,37 +722,11 @@ export function ExplorePage() {
                         </span>
                       ))}
                     </div>
-                    <div className="source-result-list">
-                      {researchSynthesis.items.map((item) => {
-                        const candidate = researchCandidates.get(item.candidateId);
-                        if (!candidate) return null;
-                        return (
-                          <article className="source-result-row" key={candidate.id}>
-                            <div className="result-identity">
-                              <div className="card-topline">
-                                <Badge>{label(candidate.sourceKey)}</Badge>
-                                <Badge>Model selected</Badge>
-                              </div>
-                              <h3>{candidate.title}</h3>
-                              <p>{candidate.summary}</p>
-                            </div>
-                            <div className="query-signal">
-                              <strong>Why it surfaced</strong>
-                              <span>{item.reason}</span>
-                              {item.uncertainty ? <small>{item.uncertainty}</small> : null}
-                            </div>
-                            <a
-                              className="button secondary compact"
-                              href={candidate.canonicalUri}
-                              rel="noreferrer"
-                              target="_blank"
-                            >
-                              Open evidence
-                            </a>
-                          </article>
-                        );
-                      })}
-                    </div>
+                    <ResearchEvidenceList
+                      candidates={researchCandidates}
+                      items={researchSynthesis.items}
+                      selectionLabel="Model selected"
+                    />
                     {researchSynthesis.limitations.length ? (
                       <p className="hint">Limits: {researchSynthesis.limitations.join(' ')}</p>
                     ) : null}

@@ -2,6 +2,7 @@ import { useMutation, useQuery } from '@tanstack/react-query';
 import { type FormEvent, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { api, formatDate, formatFractionPercent, label } from '../api.js';
+import { ResearchEvidenceList, type ResearchEvidenceCandidate } from '../ResearchEvidenceList.js';
 import { Badge, Empty, ErrorPanel, Loading, PageHeader } from '../ui.js';
 
 interface CorpusItem {
@@ -47,13 +48,7 @@ interface CorpusResearchRun {
   state: string;
   modelIdentifier: string | null;
   safeDetail: string;
-  candidates: Array<{
-    id: string;
-    sourceKey: string;
-    title: string;
-    summary: string;
-    canonicalUri: string;
-  }>;
+  candidates: ResearchEvidenceCandidate[];
   proposals: Array<{
     proposalType: string;
     output: unknown;
@@ -331,34 +326,7 @@ export function CorpusPage() {
                         </span>
                       ))}
                     </div>
-                    <div className="source-result-list">
-                      {synthesis.items.map((item) => {
-                        const candidate = researchCandidates.get(item.candidateId);
-                        if (!candidate) return null;
-                        return (
-                          <article className="source-result-row" key={candidate.id}>
-                            <div className="result-identity">
-                              <Badge>{label(candidate.sourceKey)}</Badge>
-                              <h3>{candidate.title}</h3>
-                              <p>{candidate.summary}</p>
-                            </div>
-                            <div className="query-signal">
-                              <strong>Why it surfaced</strong>
-                              <span>{item.reason}</span>
-                              {item.uncertainty ? <small>{item.uncertainty}</small> : null}
-                            </div>
-                            <a
-                              className="button secondary compact"
-                              href={candidate.canonicalUri}
-                              rel="noreferrer"
-                              target="_blank"
-                            >
-                              Open evidence
-                            </a>
-                          </article>
-                        );
-                      })}
-                    </div>
+                    <ResearchEvidenceList candidates={researchCandidates} items={synthesis.items} />
                     {synthesis.limitations.length ? (
                       <p className="hint">Limits: {synthesis.limitations.join(' ')}</p>
                     ) : null}
