@@ -80,9 +80,9 @@ npm run verify
 ```
 
 The gate checks formatting, lint, strict types, unit/property tests, a fresh-schema real-PostgreSQL
-integration suite, the production build, deterministic provenance, dependency advisories, and
-Playwright/axe browser tests. Integration tests create and rebuild only the dedicated
-`maestro_test` database; they do not reset the development `maestro` database.
+integration suite, the production build, deterministic provenance, the documented strict
+dependency-advisory policy, and Playwright/axe browser tests. Integration tests create and rebuild
+only the dedicated `maestro_test` database; they do not reset the development `maestro` database.
 
 Useful individual commands:
 
