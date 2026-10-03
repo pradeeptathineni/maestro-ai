@@ -28,8 +28,8 @@ assert.match(hookCommand, /CCA_CONFIG_PATH/, 'hook must isolate state inside the
 assert.doesNotMatch(hookCommand, /\/Users\//, 'hook must not contain a developer-specific path');
 assert.equal(
   manifest.scripts?.['context:pack'],
-  'repomix --config repomix.config.json',
-  'context packing must use only the reviewed repository-owned configuration',
+  'node scripts/run-context-pack.mjs',
+  'context packing must reject caller arguments through the reviewed wrapper',
 );
 assert.equal(
   packConfig.security?.enableSecurityCheck,

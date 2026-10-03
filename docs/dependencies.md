@@ -34,11 +34,16 @@ On 2026-10-02 GitHub reviewed `GHSA-vfj7-8cjw-p6xm`, a high-severity stack-exhau
 against every published `braces` version through the current `3.0.3`; upstream has no patched
 release as of 2026-10-03. Maestro reaches it only through the exact development path
 `repomix@1.18.1 -> globby@16.2.4 -> micromatch@4.0.8 -> braces@3.0.3`. The shipped application does
-not include Repomix, and `context:pack` supplies only the reviewed repository-owned configuration,
-not caller-provided patterns. `security:audit` therefore accepts that one exact audit payload and
-installed path while no fix exists. It rejects any new high/critical advisory, runtime reachability,
-version/path change, invocation change, or changed fix metadata so a patched release must be
-reviewed and adopted rather than silently remaining excepted.
+not include Repomix. `context:pack` uses a wrapper that rejects caller arguments, disables Git,
+dot-ignore, and package-default pattern sources, refuses implicit `.repomixignore` files, prohibits
+brace expansion and oversized patterns (including the output path) in the reviewed repository
+configuration, and invokes Repomix with a fixed argument array. `security:audit` therefore requires
+that one exact audit payload and
+installed path while no fix exists; even an unexpectedly clean report fails while the vulnerable
+path remains. It rejects malformed or inconsistent audit metadata, nested high/critical advisories,
+any additional high/critical advisory, runtime reachability, version/path change, invocation change,
+or changed fix metadata so a patched release must be reviewed and adopted rather than silently
+remaining excepted.
 
 The verification gate checks that all direct packages remain at their exact reviewed versions and
 use the reviewed MIT, Apache-2.0, ISC, or MPL-2.0 licenses. The 2026-09-29 installed-tree audit
