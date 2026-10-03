@@ -22,7 +22,7 @@ export function Shell(): ReactNode {
           </span>
           <span>
             <strong>Maestro</strong>
-            <small>Technology search</small>
+            <small>Evidence research</small>
           </span>
         </NavLink>
         <nav aria-label="Primary navigation">
@@ -38,8 +38,8 @@ export function Shell(): ReactNode {
         <Outlet />
       </main>
       <footer>
-        Maestro searches for existing technology, explains its signals, and records decisions. It
-        does not install or execute results.
+        Maestro researches existing options, distinguishes evidence from project fit, and records
+        decisions. It does not install or execute results.
       </footer>
     </>
   );

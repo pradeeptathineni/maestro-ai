@@ -29,8 +29,17 @@ executable contract; this summary must not be used to infer a table that is not 
 
 The Phase 06 contract is split across migrations `0009`–`0014`: integrity/authoring, explorer
 snapshots, bounded discovery, query privacy controls, query-value projection cache, and optional
-semantic-adapter configuration. The readiness gate requires all fourteen repository migrations;
-catalog cardinality is diagnostic data, not readiness.
+semantic-adapter configuration. Phase 07 migration `0015` adds query-first source planning and
+durable discovery continuity. Phase 08 migration `0016` adds bounded research runs, attributable
+model proposals, source-action links, leases, and terminal receipts. Migration `0017` binds every
+research acquisition to its declared result limit and hardens research-run history and state
+transitions. Migration `0018` prevents late proposals, source operations, source links, or events
+from extending a terminal research history. Migration `0019` requires every research source
+operation to match the active run's exact workspace, query session, and immutable result-set
+snapshot. Migration `0020` serializes research child inserts and source-operation updates with
+parent finalization, so recovery cannot be crossed by a late evidence or attempt commit. The
+readiness gate requires all twenty repository migrations; catalog cardinality is diagnostic data,
+not readiness.
 
 Drizzle declarations mirror queryable concepts but do not replace reviewed SQL. Startup never uses
 schema push. Corrections to immutable evidence, score, context, and decision records require a new

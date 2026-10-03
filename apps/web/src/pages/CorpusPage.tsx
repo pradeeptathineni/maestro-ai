@@ -1,7 +1,13 @@
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery } from '@tanstack/react-query';
 import { type FormEvent, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { api, formatDate, formatFractionPercent, label } from '../api.js';
+import {
+  ResearchCitationList,
+  ResearchEvidenceList,
+  normalizeResearchEvidenceSynthesis,
+  type ResearchEvidenceCandidate,
+} from '../ResearchEvidenceList.js';
 import { Badge, Empty, ErrorPanel, Loading, PageHeader } from '../ui.js';
 
 interface CorpusItem {
@@ -41,6 +47,19 @@ interface CorpusResponse {
   nextCursor: string | null;
 }
 
+interface CorpusResearchRun {
+  id: string;
+  strategy: 'model' | 'deterministic_fallback';
+  state: string;
+  modelIdentifier: string | null;
+  safeDetail: string;
+  candidates: ResearchEvidenceCandidate[];
+  proposals: Array<{
+    proposalType: string;
+    output: unknown;
+  }>;
+}
+
 function evidenceLabel(state: string | null): string {
   if (state === 'available') return 'Source-backed';
   if (state === 'provisional') return 'Preliminary';
@@ -52,6 +71,7 @@ export function CorpusPage() {
   const [parameters, setParameters] = useSearchParams();
   const [appliedQuery, setAppliedQuery] = useState('');
   const [draftQuery, setDraftQuery] = useState('');
+  const [researchRunId, setResearchRunId] = useState<string | null>(null);
   const [previousCursors, setPreviousCursors] = useState<string[]>([]);
   const queryString = useMemo(() => {
     const query = new URLSearchParams();
@@ -73,6 +93,32 @@ export function CorpusPage() {
       });
     },
   });
+  const startResearch = useMutation({
+    mutationFn: async (query: string) => {
+      const session = await api<{ id: string }>('/api/v1/explorer/sessions', {
+        method: 'POST',
+        body: JSON.stringify({ query, searchConnectedSources: false }),
+      });
+      return api<{ id: string; state: string; strategy: string }>(
+        `/api/v1/explorer/sessions/${session.id}/research-runs`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            mode: 'corpus',
+            idempotencyKey: `corpus:${session.id}:research-skill-v1`,
+          }),
+        },
+      );
+    },
+    onSuccess: (run) => setResearchRunId(run.id),
+  });
+  const researchRun = useQuery({
+    queryKey: ['corpus-research-run', researchRunId],
+    enabled: Boolean(researchRunId),
+    queryFn: () => api<CorpusResearchRun>(`/api/v1/research/runs/${researchRunId}`),
+    refetchInterval: (query: { state: { data?: CorpusResearchRun } }) =>
+      ['queued', 'running'].includes(query.state.data?.state ?? '') ? 1_000 : false,
+  });
 
   function replaceParameter(key: string, value: string): void {
     const next = new URLSearchParams(parameters);
@@ -89,15 +135,26 @@ export function CorpusPage() {
     next.delete('cursor');
     setPreviousCursors([]);
     setParameters(next);
-    setAppliedQuery(draftQuery.trim());
+    const normalized = draftQuery.trim();
+    setAppliedQuery(normalized);
+    setResearchRunId(null);
+    if (normalized) startResearch.mutate(normalized);
   }
 
   function clearFilters(): void {
     setDraftQuery('');
     setAppliedQuery('');
+    setResearchRunId(null);
     setPreviousCursors([]);
     setParameters({});
   }
+
+  const synthesis = normalizeResearchEvidenceSynthesis(
+    researchRun.data?.proposals.find((proposal) => proposal.proposalType === 'synthesis')?.output,
+  );
+  const researchCandidates = new Map(
+    (researchRun.data?.candidates ?? []).map((candidate) => [candidate.id, candidate]),
+  );
 
   function nextPage(): void {
     if (!corpus.data?.nextCursor) return;
@@ -120,9 +177,9 @@ export function CorpusPage() {
   return (
     <div className="page-shell corpus-page">
       <PageHeader
-        eyebrow="Saved research"
-        title="Browse saved technology research"
-        description="The corpus combines reviewed or proposed index records with attributed leads saved from live searches. The two layers remain visibly separate."
+        eyebrow="Admitted knowledge"
+        title="Browse the durable research corpus"
+        description="The corpus contains reviewed or explicitly proposed knowledge. Live Search findings stay in research history until they pass an admission decision."
         action={
           <Link className="button primary" to="/explore">
             Start a search
@@ -164,7 +221,6 @@ export function CorpusPage() {
               <option value="">All layers</option>
               <option value="indexed_knowledge">Indexed knowledge</option>
               <option value="knowledge_document">Knowledge documents</option>
-              <option value="source_lead">Source leads</option>
             </select>
           </label>
           <label>
@@ -217,6 +273,8 @@ export function CorpusPage() {
 
       {corpus.isPending ? <Loading message="Loading the local research corpus…" /> : null}
       {corpus.error ? <ErrorPanel error={corpus.error} /> : null}
+      {startResearch.error ? <ErrorPanel error={startResearch.error} /> : null}
+      {researchRun.error ? <ErrorPanel error={researchRun.error} /> : null}
       {corpus.data ? (
         <>
           <section className="corpus-summary" aria-label="Corpus scope">
@@ -235,6 +293,61 @@ export function CorpusPage() {
             <p>{corpus.data.scope.statement}</p>
           </section>
 
+          {appliedQuery && (startResearch.isPending || researchRun.data) ? (
+            <section className="source-results" aria-labelledby="corpus-synthesis-heading">
+              <div className="source-results-body">
+                <div className="section-heading">
+                  <div>
+                    <p className="eyebrow">Corpus research</p>
+                    <h2 id="corpus-synthesis-heading">Organized from admitted evidence</h2>
+                  </div>
+                  {researchRun.data ? <Badge>{label(researchRun.data.state)}</Badge> : null}
+                </div>
+                {startResearch.isPending ||
+                ['queued', 'running'].includes(researchRun.data?.state ?? '') ? (
+                  <Loading message="Reviewing corpus evidence and checking coverage gaps…" />
+                ) : synthesis ? (
+                  <>
+                    <p>
+                      <Badge>{label(synthesis.contextAssessment)} context</Badge>{' '}
+                      {synthesis.summary}
+                    </p>
+                    <ResearchCitationList
+                      candidates={researchCandidates}
+                      citationCandidateIds={synthesis.summaryCitationCandidateIds}
+                      labelText="Summary evidence"
+                    />
+                    {synthesis.protocolVersion === 'research-protocol-v1' ? (
+                      <p className="hint">
+                        Historical v1 synthesis replayed with its original evidence citations.
+                      </p>
+                    ) : null}
+                    {synthesis.abstentionReason ? (
+                      <p className="authority-note">Abstained: {synthesis.abstentionReason}</p>
+                    ) : null}
+                    <div className="chip-row" aria-label="Corpus research groups">
+                      {synthesis.groups.map((group) => (
+                        <span
+                          className="facet-chip explicit"
+                          key={group.label}
+                          title={group.description}
+                        >
+                          {group.label} ({group.candidateIds.length})
+                        </span>
+                      ))}
+                    </div>
+                    <ResearchEvidenceList candidates={researchCandidates} items={synthesis.items} />
+                    {synthesis.limitations.length ? (
+                      <p className="hint">Limits: {synthesis.limitations.join(' ')}</p>
+                    ) : null}
+                  </>
+                ) : researchRun.data ? (
+                  <p className="authority-note">{researchRun.data.safeDetail}</p>
+                ) : null}
+              </div>
+            </section>
+          ) : null}
+
           <section aria-labelledby="corpus-results-heading">
             <div className="section-heading">
               <div>
@@ -245,8 +358,8 @@ export function CorpusPage() {
               </div>
               <p className="hint">
                 {corpus.data.scoringApplied
-                  ? 'Every displayed match has a numeric estimate. Confidence and review state remain separate.'
-                  : 'Browse mode does not invent a universal score. Search for a need to calculate query-specific signals.'}
+                  ? 'Displayed matches use the preserved Phase 07 query-ranking estimate. Confidence and review state remain separate.'
+                  : 'Browse mode does not invent a universal score. Search for a need to calculate a query-specific ranking estimate.'}
               </p>
             </div>
             {corpus.data.items.length ? (
@@ -260,7 +373,7 @@ export function CorpusPage() {
                             ? 'Implementation'
                             : item.layer === 'knowledge_document'
                               ? 'Knowledge document'
-                              : 'Source lead'}
+                              : 'Legacy source lead'}
                         </Badge>
                         <Badge>{label(item.state)}</Badge>
                         <Badge>{label(item.kind)}</Badge>
@@ -279,7 +392,7 @@ export function CorpusPage() {
                     </div>
                     {corpus.data.scoringApplied ? (
                       <div className="query-signal">
-                        <strong>Signal {item.signalDisplay}</strong>
+                        <strong>Legacy query estimate {item.signalDisplay}</strong>
                         <span>
                           {item.relevanceOrdinal
                             ? `${label(item.relevanceOrdinal)} relevance · `
@@ -315,8 +428,8 @@ export function CorpusPage() {
               </div>
             ) : (
               <Empty title="No corpus records match">
-                Change the query or clear one of the filters. A live Search saves attributed source
-                leads here automatically.
+                Change the query or clear one of the filters. Live Search leads remain in research
+                history until a human explicitly admits them to the Corpus.
               </Empty>
             )}
             <div className="corpus-pagination">

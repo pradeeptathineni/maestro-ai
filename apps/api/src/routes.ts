@@ -25,6 +25,7 @@ import {
   ProjectContextRevisionBodySchema,
   ResultItemParamsSchema,
   ResultPageQuerySchema,
+  ResearchRunBodySchema,
   ReviseNeedBodySchema,
   SemanticProposalRequestBodySchema,
   ShortlistBodySchema,
@@ -49,6 +50,7 @@ import {
   type ProjectBody,
   type ProjectContextRevisionBody,
   type ResultPageQuery,
+  type ResearchRunBody,
   type ReviseNeedBody,
   type SemanticProposalRequestBody,
   type ShortlistBody,
@@ -78,6 +80,7 @@ import {
   getNeedComparison,
   getKnowledgeCoverageReport,
   getProviderDetail,
+  getResearchRun,
   furnishKnowledgeOption,
   listAdapterStatus,
   listResearchCorpus,
@@ -96,6 +99,8 @@ import {
   replayStoredScores,
   requestDiscovery,
   requestEnabledDiscovery,
+  requestResearchFallback,
+  requestResearchRun,
   requestSemanticInterpretation,
   retryIntake,
   reviseProjectContext,
@@ -187,6 +192,15 @@ export function registerRoutes(app: FastifyInstance, pool: Pool): void {
     },
   );
 
+  routes.post<{ Params: IdParams }>(
+    '/api/v1/research/runs/:id/fallback',
+    { schema: { tags: ['research'], params: IdParamsSchema, body: {} } },
+    async (request, reply) =>
+      reply
+        .code(202)
+        .send(await requestResearchFallback(pool, localWorkspaceId, request.params.id)),
+  );
+
   routes.get('/api/v1/verification', { schema: { tags: ['evidence'] } }, async () => ({
     items: await listVerificationQueue(pool),
   }));
@@ -271,14 +285,21 @@ export function registerRoutes(app: FastifyInstance, pool: Pool): void {
         string,
         unknown
       > & { id: string };
-      const discoveryOperations = request.body.searchConnectedSources
-        ? await requestEnabledDiscovery(
-            pool,
-            localWorkspaceId,
-            session.id,
-            request.body.query.trim(),
-          )
-        : [];
+      const researchRun = request.body.searchConnectedSources
+        ? ((await requestResearchRun(pool, localWorkspaceId, session.id, {
+            mode: 'search',
+            idempotencyKey: `search:${session.id}:research-skill-v1`,
+          })) as { state: string })
+        : null;
+      const discoveryOperations =
+        request.body.searchConnectedSources && researchRun?.state !== 'queued'
+          ? await requestEnabledDiscovery(
+              pool,
+              localWorkspaceId,
+              session.id,
+              request.body.query.trim(),
+            )
+          : [];
       const queuedDiscovery = discoveryOperations.filter(
         (operation) =>
           typeof operation === 'object' &&
@@ -297,6 +318,7 @@ export function registerRoutes(app: FastifyInstance, pool: Pool): void {
                 : 'not_configured',
         },
         discoveryOperations,
+        researchRun,
       });
     },
   );
@@ -394,6 +416,27 @@ export function registerRoutes(app: FastifyInstance, pool: Pool): void {
             request.body,
           ),
         ),
+  );
+
+  routes.post<{ Params: IdParams; Body: ResearchRunBody }>(
+    '/api/v1/explorer/sessions/:id/research-runs',
+    {
+      schema: {
+        tags: ['research'],
+        params: IdParamsSchema,
+        body: ResearchRunBodySchema,
+      },
+    },
+    async (request, reply) =>
+      reply
+        .code(202)
+        .send(await requestResearchRun(pool, localWorkspaceId, request.params.id, request.body)),
+  );
+
+  routes.get<{ Params: IdParams }>(
+    '/api/v1/research/runs/:id',
+    { schema: { tags: ['research'], params: IdParamsSchema } },
+    async (request) => getResearchRun(pool, localWorkspaceId, request.params.id),
   );
 
   routes.get<{ Params: IdParams }>(

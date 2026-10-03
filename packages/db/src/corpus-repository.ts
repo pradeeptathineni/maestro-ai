@@ -341,7 +341,12 @@ export async function listResearchCorpus(
   const viewHash = hashCanonical(view);
   const offset = decodeCursor(query.cursor, viewHash);
   const limit = Math.min(Math.max(query.limit ?? 20, 1), 50);
-  const corpus = await loadCorpus(pool, workspaceId);
+  // Phase 07 exposed operational leads through the Corpus endpoint. Preserve
+  // that explicit legacy filter for replay, but keep the default Corpus
+  // universe limited to admitted knowledge.
+  const corpus = (await loadCorpus(pool, workspaceId)).filter((row) =>
+    query.layer === 'source_lead' ? row.layer === 'source_lead' : row.layer !== 'source_lead',
+  );
   const interpretation = normalizedQuery ? interpretQuery(normalizedQuery) : null;
   const assessRelevance = interpretation ? compileLexicalRelevance(interpretation) : null;
   const matched = corpus
@@ -357,10 +362,14 @@ export async function listResearchCorpus(
         value: 'knowledge_document',
         count: matched.filter((row) => row.layer === 'knowledge_document').length,
       },
-      {
-        value: 'source_lead',
-        count: matched.filter((row) => row.layer === 'source_lead').length,
-      },
+      ...(query.layer === 'source_lead'
+        ? [
+            {
+              value: 'source_lead',
+              count: matched.filter((row) => row.layer === 'source_lead').length,
+            },
+          ]
+        : []),
     ],
     states: countFacets(matched, 'state'),
     sources: sourceFacets(matched),
@@ -399,7 +408,7 @@ export async function listResearchCorpus(
     scope: {
       label: 'Local research corpus',
       statement:
-        'Indexed knowledge and attributed source leads are separate layers. A saved lead is not reviewed knowledge.',
+        'Corpus contains admitted indexed knowledge and knowledge documents. Live leads remain in Search research history until explicit review and admission.',
     },
     query: normalizedQuery,
     scoringApplied: normalizedQuery !== null,

@@ -1,4 +1,4 @@
-import type { Pool } from 'pg';
+import type { Pool, PoolClient } from 'pg';
 import type {
   AdapterConfigBody,
   DiscoveryAdmissionBody,
@@ -278,6 +278,12 @@ export async function requestDiscovery(
     routingReason: string;
     sourcePlanState: DiscoveryRouteState;
     outboundQuery: string | null;
+    researchRunId?: string;
+    researchStep?: number;
+    researchActionKey?: string;
+    resultSetId?: string;
+    resultLimit?: number;
+    dispatch?: 'outbox' | 'inline';
   },
 ): Promise<unknown> {
   return inTransaction(pool, async (client) => {
@@ -293,10 +299,12 @@ export async function requestDiscovery(
        FROM workspace.query_sessions qs
        JOIN LATERAL (
          SELECT id FROM workspace.query_result_sets current
-         WHERE current.query_session_id = qs.id ORDER BY revision DESC LIMIT 1
+         WHERE current.query_session_id = qs.id
+           AND ($3::uuid IS NULL OR current.id = $3::uuid)
+         ORDER BY revision DESC LIMIT 1
        ) qrs ON true
        WHERE qs.id = $1 AND qs.workspace_id = $2 AND qs.deleted_at IS NULL`,
-      [querySessionId, workspaceId],
+      [querySessionId, workspaceId, route?.resultSetId ?? null],
     );
     if (!session.rowCount) throw new NotFoundError('Query session not found.');
     const config = await client.query<{
@@ -362,11 +370,11 @@ export async function requestDiscovery(
       `INSERT INTO ops.discovery_operations
          (id, workspace_id, query_session_id, result_set_id, adapter_key, idempotency_key,
           intent, outbound_query, outbound_query_hash, disclosure, state, reserved_calls,
-          safe_detail, finished_at, plan_route_id, variant_index, routing_reason,
-          source_plan_state)
+          result_limit, safe_detail, finished_at, plan_route_id, variant_index, routing_reason,
+          source_plan_state, research_run_id, research_step, research_action_key)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-               CASE WHEN $11 IN ('not_configured', 'budget_denied', 'skipped', 'unsupported')
-                    THEN now() ELSE NULL END, $14, $15, $16, $17)`,
+               $14, CASE WHEN $11 IN ('not_configured', 'budget_denied', 'skipped', 'unsupported')
+                    THEN now() ELSE NULL END, $15, $16, $17, $18, $19, $20, $21)`,
       [
         operationId,
         workspaceId,
@@ -374,7 +382,7 @@ export async function requestDiscovery(
         session.rows[0]!.resultSetId,
         input.adapterKey,
         input.idempotencyKey,
-        intent,
+        route?.researchRunId ? 'research_action' : intent,
         route?.outboundQuery ?? input.approvedPublicQuery,
         hashCanonical(route?.outboundQuery ?? input.approvedPublicQuery),
         json({
@@ -384,6 +392,7 @@ export async function requestDiscovery(
         }),
         state,
         reservedCalls,
+        route?.resultLimit ?? 20,
         state === 'skipped' || state === 'unsupported'
           ? route!.routingReason
           : state === 'not_configured'
@@ -395,6 +404,9 @@ export async function requestDiscovery(
         route?.variantIndex ?? 1,
         route?.routingReason ?? null,
         route?.sourcePlanState ?? 'planned',
+        route?.researchRunId ?? null,
+        route?.researchStep ?? null,
+        route?.researchActionKey ?? null,
       ],
     );
     if (state === 'queued') {
@@ -416,6 +428,7 @@ export async function requestDiscovery(
       planRouteId: route?.planRouteId ?? null,
       routingReason: route?.routingReason ?? null,
       sourcePlanState: route?.sourcePlanState ?? 'planned',
+      resultLimit: route?.resultLimit ?? 20,
     };
   });
 }
@@ -425,6 +438,7 @@ export async function requestEnabledDiscovery(
   workspaceId: string,
   querySessionId: string,
   approvedPublicQuery: string,
+  resultSetId?: string,
 ): Promise<unknown[]> {
   const session = await pool.query<{
     interpretation: QueryInterpretation;
@@ -460,6 +474,7 @@ export async function requestEnabledDiscovery(
           routingReason: route.reason,
           sourcePlanState: route.state,
           outboundQuery: route.variant,
+          resultSetId,
         },
       ),
     );
@@ -478,7 +493,8 @@ export async function getDiscoveryOperation(
             plan_route_id AS "planRouteId", variant_index AS "variantIndex",
             routing_reason AS "routingReason", source_plan_state AS "sourcePlanState",
             reserved_calls AS "reservedCalls", consumed_calls AS "consumedCalls",
-            result_count AS "resultCount", error_code AS "errorCode",
+            result_count AS "resultCount", result_limit AS "resultLimit",
+            error_code AS "errorCode",
             safe_detail AS "safeDetail", started_at AS "startedAt",
             finished_at AS "finishedAt", created_at AS "createdAt", updated_at AS "updatedAt"
      FROM ops.discovery_operations WHERE id = $1 AND workspace_id = $2`,
@@ -495,12 +511,16 @@ export async function getDiscoveryOperation(
       [operationId, workspaceId],
     ),
     pool.query<JsonRow>(
-      `SELECT id, adapter_key AS "adapterKey", external_id AS "externalId",
-              canonical_uri AS "canonicalUri", title, summary, kind_hint AS "kindHint",
-              source_payload AS "sourcePayload",
-              provenance, review_state AS "reviewState", created_at AS "createdAt"
-       FROM ops.discovery_candidates WHERE operation_id = $1 AND workspace_id = $2
-       ORDER BY title, id`,
+      `SELECT candidate.id, candidate.adapter_key AS "adapterKey",
+              candidate.external_id AS "externalId",
+              candidate.canonical_uri AS "canonicalUri", candidate.title,
+              candidate.summary, candidate.kind_hint AS "kindHint",
+              candidate.source_payload AS "sourcePayload", candidate.provenance,
+              candidate.review_state AS "reviewState", candidate.created_at AS "createdAt"
+       FROM ops.discovery_operation_candidates link
+       JOIN ops.discovery_candidates candidate ON candidate.id = link.discovery_candidate_id
+       WHERE link.operation_id = $1 AND link.workspace_id = $2
+       ORDER BY candidate.title, candidate.id`,
       [operationId, workspaceId],
     ),
     pool.query<JsonRow>(
@@ -565,6 +585,24 @@ interface DiscoveryTaskPayload {
   workspaceId: string;
 }
 
+async function lockActiveResearchParentForOperation(
+  client: PoolClient,
+  payload: DiscoveryTaskPayload,
+): Promise<boolean> {
+  const association = await client.query<{ researchRunId: string | null }>(
+    `SELECT research_run_id AS "researchRunId"
+     FROM ops.discovery_operations WHERE id = $1 AND workspace_id = $2`,
+    [payload.operationId, payload.workspaceId],
+  );
+  if (!association.rows[0]?.researchRunId) return true;
+  const parent = await client.query<{ finishedAt: Date | null }>(
+    `SELECT finished_at AS "finishedAt" FROM ops.research_runs
+     WHERE id = $1 AND workspace_id = $2 FOR SHARE`,
+    [association.rows[0].researchRunId, payload.workspaceId],
+  );
+  return Boolean(parent.rowCount && !parent.rows[0]!.finishedAt);
+}
+
 function adapterFor(config: {
   adapterKey: string;
   baseUrl: string | null;
@@ -586,35 +624,41 @@ export async function processDiscoveryOperation(
   payload: DiscoveryTaskPayload,
   adapterOverride?: DiscoveryAdapter,
 ): Promise<void> {
-  const claimed = await pool.query<{
+  interface ClaimedOperation {
     adapterKey: string;
     baseUrl: string | null;
     timeoutMs: number;
     responseByteLimit: number;
+    resultLimit: number;
     query: string;
     attempt: number;
     startedAt: Date;
-  }>(
-    `UPDATE ops.discovery_operations operation
-     SET state = 'running', started_at = COALESCE(started_at, now()), updated_at = now()
-     FROM ops.source_adapter_configs config
-     WHERE operation.id = $1 AND operation.workspace_id = $2 AND operation.state = 'queued'
-       AND config.adapter_key = operation.adapter_key AND config.enabled
-     RETURNING operation.adapter_key AS "adapterKey", config.base_url AS "baseUrl",
-               config.timeout_ms AS "timeoutMs", config.response_byte_limit AS "responseByteLimit",
-               operation.outbound_query AS query,
-               operation.started_at AS "startedAt",
-               COALESCE((SELECT max(attempt) + 1 FROM ops.discovery_attempts
-                         WHERE operation_id = operation.id), 1)::int AS attempt`,
-    [payload.operationId, payload.workspaceId],
-  );
-  if (!claimed.rowCount) return;
-  const row = claimed.rows[0]!;
+  }
+  const row = await inTransaction(pool, async (client): Promise<ClaimedOperation | null> => {
+    if (!(await lockActiveResearchParentForOperation(client, payload))) return null;
+    const claimed = await client.query<ClaimedOperation>(
+      `UPDATE ops.discovery_operations operation
+       SET state = 'running', started_at = COALESCE(started_at, now()), updated_at = now()
+       FROM ops.source_adapter_configs config
+       WHERE operation.id = $1 AND operation.workspace_id = $2 AND operation.state = 'queued'
+         AND config.adapter_key = operation.adapter_key AND (config.enabled OR $3::boolean)
+       RETURNING operation.adapter_key AS "adapterKey", config.base_url AS "baseUrl",
+                 config.timeout_ms AS "timeoutMs", config.response_byte_limit AS "responseByteLimit",
+                 operation.outbound_query AS query, operation.result_limit AS "resultLimit",
+                 operation.started_at AS "startedAt",
+                 COALESCE((SELECT max(attempt) + 1 FROM ops.discovery_attempts
+                           WHERE operation_id = operation.id), 1)::int AS attempt`,
+      [payload.operationId, payload.workspaceId, Boolean(adapterOverride)],
+    );
+    return claimed.rows[0] ?? null;
+  });
+  if (!row) return;
   let result;
   try {
     const adapter = adapterOverride ?? adapterFor(row);
     if (adapter.key !== row.adapterKey) throw new Error('adapter_key_mismatch');
-    result = await adapter.search(row.query, 20);
+    result = await adapter.search(row.query, row.resultLimit);
+    result = { ...result, leads: result.leads.slice(0, row.resultLimit) };
   } catch {
     result = {
       state: 'failed' as const,
@@ -625,12 +669,15 @@ export async function processDiscoveryOperation(
     };
   }
   await inTransaction(pool, async (client) => {
+    if (!(await lockActiveResearchParentForOperation(client, payload))) return;
     const latest = await client.query<{ state: string }>(
       `SELECT state FROM ops.discovery_operations WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
       [payload.operationId, payload.workspaceId],
     );
+    if (!['running', 'cancel_requested'].includes(latest.rows[0]?.state ?? '')) return;
     const cancelled = latest.rows[0]?.state === 'cancel_requested';
     for (const lead of result.leads) {
+      const candidateId = newOpaqueId();
       await client.query(
         `INSERT INTO ops.discovery_candidates
            (id, operation_id, workspace_id, adapter_key, external_id, canonical_uri,
@@ -638,7 +685,7 @@ export async function processDiscoveryOperation(
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'lead')
          ON CONFLICT (adapter_key, external_id, source_payload_hash) DO NOTHING`,
         [
-          newOpaqueId(),
+          candidateId,
           payload.operationId,
           payload.workspaceId,
           row.adapterKey,
@@ -652,6 +699,20 @@ export async function processDiscoveryOperation(
           json(lead.provenance),
         ],
       );
+      const stored = await client.query<{ id: string }>(
+        `SELECT id FROM ops.discovery_candidates
+         WHERE workspace_id = $1 AND adapter_key = $2 AND external_id = $3
+           AND source_payload_hash = $4`,
+        [payload.workspaceId, row.adapterKey, lead.externalId, hashCanonical(lead.payload)],
+      );
+      if (stored.rowCount) {
+        await client.query(
+          `INSERT INTO ops.discovery_operation_candidates
+             (operation_id, discovery_candidate_id, workspace_id)
+           VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+          [payload.operationId, stored.rows[0]!.id, payload.workspaceId],
+        );
+      }
     }
     const finalState = cancelled
       ? 'cancelled'

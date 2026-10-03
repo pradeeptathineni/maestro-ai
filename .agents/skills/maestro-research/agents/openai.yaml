@@ -1,0 +1,4 @@
+interface:
+  display_name: 'Maestro Research'
+  short_description: 'Find and organize evidence-bound project signals'
+  default_prompt: 'Research this need using live public evidence or the local Corpus, then return organized options with exact citations, uncertainty, and coverage gaps.'
