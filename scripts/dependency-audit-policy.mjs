@@ -115,27 +115,39 @@ export function assessDependencyAudit(report, manifest, lockfile) {
   }
 
   const vulnerabilities = report.vulnerabilities;
-  const blocking = Object.fromEntries(
-    Object.entries(vulnerabilities).filter(([, entry]) =>
-      ['high', 'critical'].includes(entry?.severity),
-    ),
-  );
-
-  if (Object.keys(blocking).length === 0) {
-    return { accepted: true, waived: false, errors };
-  }
-
-  if (!equalJson(Object.keys(blocking).sort(), EXPECTED_PACKAGES)) {
-    errors.push(
-      `high/critical package set changed: ${Object.keys(blocking).sort().join(', ') || '(none)'}`,
-    );
-  }
-
-  for (const name of EXPECTED_PACKAGES) {
-    if (!equalJson(blocking[name], expectedAuditEntries[name])) {
-      errors.push(`${name}: audit evidence drifted from the reviewed advisory chain`);
+  const counts = report?.metadata?.vulnerabilities;
+  const validSeverities = ['info', 'low', 'moderate', 'high', 'critical'];
+  if (
+    !counts ||
+    !validSeverities.every((severity) => Number.isInteger(counts[severity])) ||
+    !Number.isInteger(counts.total)
+  ) {
+    errors.push('npm audit vulnerability counts are missing or malformed');
+  } else {
+    for (const severity of validSeverities) {
+      const actual = Object.values(vulnerabilities).filter(
+        (entry) => entry?.severity === severity,
+      ).length;
+      if (counts[severity] !== actual) {
+        errors.push(`npm audit ${severity} count does not match the vulnerability entries`);
+      }
+    }
+    if (counts.total !== Object.keys(vulnerabilities).length) {
+      errors.push('npm audit total count does not match the vulnerability entries');
     }
   }
+
+  const blocking = Object.fromEntries(
+    Object.entries(vulnerabilities).filter(([, entry]) => {
+      if (['high', 'critical'].includes(entry?.severity)) return true;
+      return Array.isArray(entry?.via)
+        ? entry.via.some(
+            (cause) =>
+              cause && typeof cause === 'object' && ['high', 'critical'].includes(cause.severity),
+          )
+        : false;
+    }),
+  );
 
   if (manifest?.dependencies?.repomix !== undefined) {
     errors.push('repomix must not be a runtime dependency');
@@ -143,16 +155,32 @@ export function assessDependencyAudit(report, manifest, lockfile) {
   if (manifest?.devDependencies?.repomix !== '1.18.1') {
     errors.push('repomix must remain exact-pinned at the reviewed development-only version 1.18.1');
   }
-  if (manifest?.scripts?.['context:pack'] !== 'repomix --config repomix.config.json') {
-    errors.push(
-      'context:pack must accept patterns only from the reviewed repository configuration',
-    );
+  if (manifest?.scripts?.['context:pack'] !== 'node scripts/run-context-pack.mjs') {
+    errors.push('context:pack must use the reviewed no-arguments wrapper');
   }
 
   for (const [path, expected] of Object.entries(expectedLockPath)) {
     const installed = lockfile?.packages?.[path];
     if (installed?.version !== expected.version || installed?.dev !== expected.dev) {
       errors.push(`${path}: expected development-only ${expected.version}`);
+    }
+  }
+
+  if (Object.keys(blocking).length === 0) {
+    errors.push(
+      'the known vulnerable development path requires the exact reviewed advisory report',
+    );
+  } else {
+    if (!equalJson(Object.keys(blocking).sort(), EXPECTED_PACKAGES)) {
+      errors.push(
+        `high/critical package set changed: ${Object.keys(blocking).sort().join(', ') || '(none)'}`,
+      );
+    }
+
+    for (const name of EXPECTED_PACKAGES) {
+      if (!equalJson(blocking[name], expectedAuditEntries[name])) {
+        errors.push(`${name}: audit evidence drifted from the reviewed advisory chain`);
+      }
     }
   }
 

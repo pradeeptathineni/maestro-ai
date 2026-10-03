@@ -69,11 +69,14 @@ const report = {
       fixAvailable,
     },
   },
+  metadata: {
+    vulnerabilities: { info: 0, low: 0, moderate: 0, high: 5, critical: 0, total: 5 },
+  },
 };
 const manifest = {
   dependencies: {},
   devDependencies: { repomix: '1.18.1' },
-  scripts: { 'context:pack': 'repomix --config repomix.config.json' },
+  scripts: { 'context:pack': 'node scripts/run-context-pack.mjs' },
 };
 const lockfile = {
   packages: {
@@ -95,12 +98,15 @@ test('accepts only the exact reviewed development-only advisory path', () => {
   });
 });
 
-test('passes a clean audit without consulting the exception', () => {
-  assert.deepEqual(assessDependencyAudit({ auditReportVersion: 2, vulnerabilities: {} }, {}, {}), {
-    accepted: true,
-    waived: false,
-    errors: [],
-  });
+test('rejects a clean report while the known vulnerable path remains installed', () => {
+  const clean = {
+    auditReportVersion: 2,
+    vulnerabilities: {},
+    metadata: {
+      vulnerabilities: { info: 0, low: 0, moderate: 0, high: 0, critical: 0, total: 0 },
+    },
+  };
+  assert.equal(assessDependencyAudit(clean, manifest, lockfile).accepted, false);
 });
 
 test('fails closed on malformed audit output', () => {
@@ -116,6 +122,8 @@ test('rejects an additional high advisory', () => {
     effects: [],
     nodes: ['node_modules/unexpected'],
   };
+  changed.metadata.vulnerabilities.high = 6;
+  changed.metadata.vulnerabilities.total = 6;
   assert.equal(assessDependencyAudit(changed, manifest, lockfile).accepted, false);
 });
 
@@ -133,4 +141,51 @@ test('rejects changed fix metadata so a future patch requires review', () => {
   const changed = clone(report);
   changed.vulnerabilities.braces.fixAvailable = true;
   assert.equal(assessDependencyAudit(changed, manifest, lockfile).accepted, false);
+});
+
+test('rejects metadata that reports a high advisory missing from the entries', () => {
+  const malformed = {
+    auditReportVersion: 2,
+    vulnerabilities: {
+      unknown: { name: 'unknown', via: [], effects: [], nodes: ['node_modules/unknown'] },
+    },
+    metadata: {
+      vulnerabilities: { info: 0, low: 0, moderate: 0, high: 1, critical: 0, total: 1 },
+    },
+  };
+  assert.equal(assessDependencyAudit(malformed, manifest, lockfile).accepted, false);
+});
+
+test('rejects a lower-severity wrapper around a high-severity advisory', () => {
+  const nested = clone(report);
+  nested.vulnerabilities.wrapper = {
+    name: 'wrapper',
+    severity: 'moderate',
+    isDirect: false,
+    via: [advisory],
+    effects: [],
+    range: '*',
+    nodes: ['node_modules/wrapper'],
+    fixAvailable: false,
+  };
+  nested.metadata.vulnerabilities.moderate = 1;
+  nested.metadata.vulnerabilities.total = 6;
+  assert.equal(assessDependencyAudit(nested, manifest, lockfile).accepted, false);
+});
+
+test('rejects runtime and invocation drift even when the report is empty', () => {
+  const clean = {
+    auditReportVersion: 2,
+    vulnerabilities: {},
+    metadata: {
+      vulnerabilities: { info: 0, low: 0, moderate: 0, high: 0, critical: 0, total: 0 },
+    },
+  };
+  const changedManifest = clone(manifest);
+  changedManifest.dependencies.repomix = '1.18.1';
+  changedManifest.scripts['context:pack'] = 'repomix --config alternate.json';
+  const assessment = assessDependencyAudit(clean, changedManifest, lockfile);
+  assert.equal(assessment.accepted, false);
+  assert.match(assessment.errors.join('\n'), /runtime dependency/u);
+  assert.match(assessment.errors.join('\n'), /no-arguments wrapper/u);
 });
