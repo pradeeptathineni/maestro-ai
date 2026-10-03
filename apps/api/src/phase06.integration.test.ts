@@ -2,13 +2,18 @@ import { createHash, randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { Pool } from 'pg';
-import { verifyVerificationBundle } from '../../../packages/domain/src/index.js';
+import {
+  structuredRerankPolicyVersion,
+  verifyVerificationBundle,
+} from '../../../packages/domain/src/index.js';
 import type {
   DiscoveryAdapter,
   GitHubMetadataAdapter,
 } from '../../../packages/adapters/src/index.js';
 import {
   createPool,
+  explorerDefaultFusionPolicy,
+  explorerRetrievalPolicyVersion,
   processDiscoveryOperation,
   processSemanticInterpretation,
   processWatchRefresh,
@@ -84,11 +89,20 @@ describe('Phase 06 explorer and authoring contracts', () => {
     const firstPage = first.json<{
       items: Array<{ id: string; signalDisplay: number | null; displayState: string }>;
       nextCursor: string;
-      resultSet: { id: string; signalPolicyVersion: string };
+      resultSet: {
+        id: string;
+        signalPolicyVersion: string;
+        retrievalPolicyVersion: string;
+        fusionPolicyVersion: string;
+        rerankPolicyVersion: string;
+      };
     }>();
     expect(firstPage.resultSet).toMatchObject({
       id: session.resultSetId,
       signalPolicyVersion: 'intrinsic-signal-v3',
+      retrievalPolicyVersion: explorerRetrievalPolicyVersion,
+      fusionPolicyVersion: explorerDefaultFusionPolicy,
+      rerankPolicyVersion: structuredRerankPolicyVersion,
     });
     expect(firstPage.items).toHaveLength(5);
     const second = await app.inject({
@@ -907,9 +921,9 @@ describe('Phase 06 explorer and authoring contracts', () => {
         }>;
       }>()
       .discoveryOperations.filter((operation) => operation.adapterKey === 'github');
-    expect(githubOperations).toEqual(
-      [expect.objectContaining({ variantIndex: 1, sourcePlanState: 'planned' })],
-    );
+    expect(githubOperations).toEqual([
+      expect.objectContaining({ variantIndex: 1, sourcePlanState: 'planned' }),
+    ]);
     const operationId = requested
       .json<{ discoveryOperations: Array<{ id: string; adapterKey: string }> }>()
       .discoveryOperations.find((candidate) => candidate.adapterKey === 'github')!.id;
@@ -954,33 +968,6 @@ describe('Phase 06 explorer and authoring contracts', () => {
       { operationId, workspaceId: localWorkspaceId },
       controlledAdapter,
     );
-    const stagedOperations = await pool.query<{
-      id: string;
-      outboundQuery: string;
-      variantIndex: number;
-      passIndex: number;
-    }>(
-      `SELECT id, outbound_query AS "outboundQuery",
-              variant_index AS "variantIndex", pass_index AS "passIndex"
-       FROM ops.discovery_operations
-       WHERE query_session_id = $1 AND adapter_key = 'github'
-       ORDER BY pass_index, variant_index`,
-      [sessionId],
-    );
-    expect(stagedOperations.rows.map(({ variantIndex, passIndex }) => ({ variantIndex, passIndex }))).toEqual(
-      expect.arrayContaining([
-        { variantIndex: 1, passIndex: 1 },
-        { variantIndex: 2, passIndex: 2 },
-      ]),
-    );
-    const secondPassOperation = stagedOperations.rows.find((row) => row.passIndex === 2)!;
-    expect(secondPassOperation.outboundQuery).toContain('sonolith');
-    expect(secondPassOperation.outboundQuery).toContain('ceramic');
-    await processDiscoveryOperation(
-      pool,
-      { operationId: secondPassOperation.id, workspaceId: localWorkspaceId },
-      controlledAdapter,
-    );
     const operation = await app.inject({
       method: 'GET',
       url: `/api/v1/discovery/operations/${operationId}`,
@@ -989,26 +976,6 @@ describe('Phase 06 explorer and authoring contracts', () => {
     expect(operation.json()).toMatchObject({
       state: 'complete',
       resultCount: 1,
-      researchRun: {
-        state: expect.stringMatching(/^(complete|stopped)$/),
-        completedPassCount: 2,
-        retrievalReceipt: {
-          policyVersion: 'live-research-receipt-v1',
-          originalQuery: 'ceramic glaze acoustic resonance analysis toolkit',
-          completedPassCount: 2,
-          candidateLineage: [
-            expect.objectContaining({
-              contributingCandidateIds: expect.any(Array),
-              operationIds: expect.arrayContaining([operationId, secondPassOperation.id]),
-            }),
-          ],
-        },
-      },
-      retrievalMethod: {
-        receiptPolicyVersion: 'live-research-receipt-v1',
-        receiptHash: expect.stringMatching(/^[a-f0-9]{64}$/),
-        passes: 2,
-      },
       candidates: [
         expect.objectContaining({
           title: 'maestro-fixture/sonolith',
@@ -1024,11 +991,11 @@ describe('Phase 06 explorer and authoring contracts', () => {
          (SELECT count(*)::int FROM ops.discovery_candidates
           WHERE workspace_id = $1 AND external_id = $2) AS candidates,
          (SELECT count(*)::int FROM ops.discovery_operation_candidates link
-          JOIN ops.discovery_candidates candidate ON candidate.id = link.candidate_id
+          JOIN ops.discovery_candidates candidate ON candidate.id = link.discovery_candidate_id
           WHERE link.workspace_id = $1 AND candidate.external_id = $2) AS links`,
       [localWorkspaceId, `fixture-${sessionId}`],
     );
-    expect(repeated.rows[0]).toEqual({ candidates: 1, links: 2 });
+    expect(repeated.rows[0]).toEqual({ candidates: 1, links: 1 });
     const candidateId = operation.json<{ candidates: Array<{ id: string }> }>().candidates[0]!.id;
     const resultSetId = requested.json<{ resultSetId: string }>().resultSetId;
     const restored = await app.inject({
@@ -1060,6 +1027,17 @@ describe('Phase 06 explorer and authoring contracts', () => {
         }),
       ],
     });
+    const defaultCorpus = await app.inject({
+      method: 'POST',
+      url: '/api/v1/corpus/search',
+      headers: mutationHeaders,
+      payload: { query: 'controlled discovery' },
+    });
+    expect(
+      defaultCorpus
+        .json<{ items: Array<{ id: string; layer: string }> }>()
+        .items.some((item) => item.id === candidateId && item.layer === 'source_lead'),
+    ).toBe(false);
     const admitted = await app.inject({
       method: 'POST',
       url: `/api/v1/discovery/candidates/${candidateId}/admit`,
@@ -1075,6 +1053,28 @@ describe('Phase 06 explorer and authoring contracts', () => {
     });
     expect(admitted.statusCode, admitted.body).toBe(201);
     expect(admitted.json()).toMatchObject({ candidateId, providerId: expect.any(String) });
+    await pool.query(
+      `INSERT INTO ops.discovery_candidates
+         (id, operation_id, workspace_id, adapter_key, external_id, canonical_uri,
+          title, summary, kind_hint, source_payload_hash, source_payload, provenance,
+          review_state)
+       SELECT gen_random_uuid(), $1::uuid, $2::uuid, 'github',
+              'crowding-' || $1::uuid::text || '-' || item::text,
+              'https://github.com/maestro-e2e/crowding-' || $1::uuid::text || '-' || item::text,
+              'Controlled discovery raw lead ' || item::text,
+              'A highly matching controlled discovery lead that has not been admitted.',
+              'oss_project',
+              md5('crowding-' || $1::uuid::text || '-' || item::text) ||
+                md5('crowding-' || $1::uuid::text || '-' || item::text),
+              jsonb_build_object('fixture', true, 'sequence', item),
+              jsonb_build_object(
+                'adapter', 'github', 'adapterVersion', 'controlled-fixture-v1',
+                'observedAt', '2026-09-29T12:00:00.000Z', 'reviewState', 'lead'
+              ),
+              'lead'
+       FROM generate_series(1, 220) item`,
+      [operationId, localWorkspaceId],
+    );
     const admittedCorpus = await app.inject({
       method: 'POST',
       url: '/api/v1/corpus/search',
@@ -1096,6 +1096,37 @@ describe('Phase 06 explorer and authoring contracts', () => {
         .json<{ items: Array<{ id: string; layer: string }> }>()
         .items.some((item) => item.id === candidateId && item.layer === 'source_lead'),
     ).toBe(false);
+    const admittedCorpusBody = admittedCorpus.json<{
+      corpusCount: number;
+      matchedCount: number;
+      facets: { layers: Array<{ value: string; count: number }> };
+    }>();
+    expect(admittedCorpusBody.corpusCount).toBeLessThan(220);
+    expect(admittedCorpusBody.matchedCount).toBeLessThan(220);
+    expect(admittedCorpusBody.facets.layers).not.toContainEqual(
+      expect.objectContaining({ value: 'source_lead' }),
+    );
+
+    const crowdedLeadReplay = await app.inject({
+      method: 'POST',
+      url: '/api/v1/corpus/search',
+      headers: mutationHeaders,
+      payload: { query: 'controlled discovery', layer: 'source_lead', limit: 50 },
+    });
+    expect(crowdedLeadReplay.statusCode).toBe(200);
+    const crowdedLeadReplayBody = crowdedLeadReplay.json<{
+      corpusCount: number;
+      facets: { layers: Array<{ value: string; count: number }> };
+      items: Array<{ layer: string }>;
+    }>();
+    expect(crowdedLeadReplayBody.corpusCount).toBeGreaterThanOrEqual(220);
+    expect(crowdedLeadReplayBody).toMatchObject({
+      facets: {
+        layers: [expect.objectContaining({ value: 'source_lead' })],
+      },
+      items: expect.arrayContaining([expect.objectContaining({ layer: 'source_lead' })]),
+    });
+    expect(crowdedLeadReplayBody.facets.layers[0]!.count).toBeGreaterThan(0);
     await pool.query(
       `UPDATE ops.source_adapter_configs SET enabled = false WHERE adapter_key = 'github'`,
     );

@@ -225,21 +225,16 @@ export async function loadQueryKnowledge(
         FROM catalog.knowledge_projections projection
         WHERE projection.publication_state <> 'withdrawn'
           AND (projection.expires_at IS NULL OR projection.expires_at > now())
-          AND to_tsvector(
-                'simple'::regconfig,
-                projection.preferred_label || ' ' || projection.summary || ' '
-                  || projection.search_text
-              ) @@ to_tsquery('simple'::regconfig, NULLIF($2, ''))
+          AND projection.retrieval_search_vector
+                @@ to_tsquery('simple'::regconfig, NULLIF($2, ''))
         ORDER BY projection.id
         LIMIT $3
       ), lexical_document_ids AS (
         SELECT document.id
         FROM catalog.knowledge_documents document
         WHERE document.publication_state <> 'withdrawn'
-          AND to_tsvector(
-                'simple'::regconfig,
-                document.title || ' ' || document.summary || ' ' || document.search_text
-              ) @@ to_tsquery('simple'::regconfig, NULLIF($2, ''))
+          AND document.retrieval_search_vector
+                @@ to_tsquery('simple'::regconfig, NULLIF($2, ''))
         ORDER BY document.id
         LIMIT $3
       ), lexical_alias_entity_ids AS (

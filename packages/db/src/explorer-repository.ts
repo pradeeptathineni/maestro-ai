@@ -17,6 +17,7 @@ import {
   querySubjectTerms,
   runRetrievalPipeline,
   stableUuid,
+  structuredRerankPolicyVersion,
   type DuplicateResolution,
   type FusedRetrievalCandidate,
   type QueryInterpretation,
@@ -43,8 +44,8 @@ import { inTransaction } from './transaction.js';
 
 type JsonRow = Record<string, unknown>;
 
-const retrievalPolicyVersion = 'retrieval-fabric-v7';
-const defaultFusionPolicy: RetrievalFusionPolicy = 'normalized-weighted-fusion-v1';
+export const explorerRetrievalPolicyVersion = 'retrieval-fabric-v7' as const;
+export const explorerDefaultFusionPolicy: RetrievalFusionPolicy = 'normalized-weighted-fusion-v1';
 
 interface ProjectionRow {
   projectionId: string;
@@ -143,7 +144,8 @@ interface ResultItemRow extends JsonRow {
   entityClass: string;
   matchScore: number | null;
   matchBand: 'Direct' | 'Strong' | 'Related' | 'Peripheral' | null;
-  signalBasis: 'typed_cohort_metrics' | 'legacy_compatibility_projection' | 'historical_query_signal';
+  signalBasis:
+    'typed_cohort_metrics' | 'legacy_compatibility_projection' | 'historical_query_signal';
 }
 
 function json(value: unknown): string {
@@ -285,17 +287,11 @@ async function loadRetrievalIndex(
         AND (
           kp.aliases && $6::text[]
           OR kp.capability_keys && $6::text[]
-          OR to_tsvector(
-               'simple'::regconfig,
-               kp.preferred_label || ' ' || kp.summary || ' ' || kp.search_text
-             ) @@ to_tsquery('simple'::regconfig, NULLIF($2, ''))
+          OR kp.retrieval_search_vector @@ to_tsquery('simple'::regconfig, NULLIF($2, ''))
         )
       ORDER BY
         ts_rank_cd(
-          to_tsvector(
-            'simple'::regconfig,
-            kp.preferred_label || ' ' || kp.summary || ' ' || kp.search_text
-          ),
+          kp.retrieval_search_vector,
           to_tsquery('simple'::regconfig, NULLIF($2, ''))
         ) DESC,
         kp.preferred_label, kp.id
@@ -317,10 +313,7 @@ async function loadRetrievalIndex(
     ), selected_projections AS (
       SELECT kp.id, candidates.selection_priority,
              ts_rank_cd(
-               to_tsvector(
-                 'simple'::regconfig,
-                 kp.preferred_label || ' ' || kp.summary || ' ' || kp.search_text
-               ),
+               kp.retrieval_search_vector,
                to_tsquery('simple'::regconfig, NULLIF($2, ''))
              ) AS lexical_rank
       FROM candidate_projection_ids candidates
@@ -404,10 +397,7 @@ async function loadRetrievalIndex(
                       AND selected_assignment.concept_id = ANY($4::uuid[])
                   ) THEN 1 ELSE 2 END AS selection_priority,
              ts_rank_cd(
-               to_tsvector(
-                 'simple'::regconfig,
-                 document.title || ' ' || document.summary || ' ' || document.search_text
-               ),
+               document.retrieval_search_vector,
                to_tsquery('simple'::regconfig, NULLIF($2, ''))
              ) AS lexical_rank
       FROM catalog.knowledge_documents document
@@ -423,10 +413,7 @@ async function loadRetrievalIndex(
           )
           OR document.aliases && $6::text[]
           OR document.mechanism_keys && $6::text[]
-          OR to_tsvector(
-               'simple'::regconfig,
-               document.title || ' ' || document.summary || ' ' || document.search_text
-             ) @@ to_tsquery('simple'::regconfig, NULLIF($2, ''))
+          OR document.retrieval_search_vector @@ to_tsquery('simple'::regconfig, NULLIF($2, ''))
         )
       ORDER BY selection_priority, lexical_rank DESC, document.title, document.id
       LIMIT $5
@@ -793,7 +780,7 @@ function supportsOpenWorldPromotion(
   if (matchedExplicitTerms.length < 2) return false;
   const explicitCoverage = matchedExplicitTerms.length / Math.max(queryTerms.size, 1);
   return (
-    candidate.matchBand === 'Direct' || candidate.matchBand === 'Strong' || explicitCoverage >= 0.4
+    candidate.matchBand === 'Direct' || candidate.matchBand === 'Strong' || explicitCoverage >= 0.3
   );
 }
 
@@ -801,7 +788,7 @@ async function prepareSnapshot(
   client: PoolClient,
   interpretation: QueryInterpretation,
   asOf: Date,
-  fusionPolicy: RetrievalFusionPolicy = defaultFusionPolicy,
+  fusionPolicy: RetrievalFusionPolicy = explorerDefaultFusionPolicy,
 ): Promise<PreparedSnapshot> {
   const index = await loadRetrievalIndex(client, interpretation);
   let firstPassCoverage: ResearchCoverageAssessment | null = null;
@@ -1209,15 +1196,14 @@ async function insertResultSetRevision(
         rerank_policy_version, candidate_pool_hash, retrieval_passes, stop_reason,
         coverage_assessment, result_hash, created_at, expires_at)
      VALUES ($1, $2, $3, $4, $5, 'complete', $6, $7, $8, $9, $10, $11,
-             $12, $13, 'structured-rerank-v2', $14, $15, $16, $17, $18,
-             $19, $20)`,
+             $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)`,
     [
       resultSetId,
       input.workspaceId,
       input.sessionId,
       input.revision,
       input.predecessorId,
-      retrievalPolicyVersion,
+      explorerRetrievalPolicyVersion,
       intrinsicSignalPolicyV3.version,
       indexRevision,
       ranked.length,
@@ -1236,6 +1222,7 @@ async function insertResultSetRevision(
         projectContextAffectsSignal: false,
       }),
       input.prepared.fusionPolicy,
+      structuredRerankPolicyVersion,
       input.prepared.candidatePoolHash,
       input.prepared.retrievalPasses,
       retrievalStopReason(input.prepared),
@@ -1597,7 +1584,7 @@ export async function createExplorerSession(
       client,
       initialInterpretation,
       createdAt,
-      options.fusionPolicy ?? defaultFusionPolicy,
+      options.fusionPolicy ?? explorerDefaultFusionPolicy,
     );
     const forcedPartial =
       initialInterpretation.missingContext.some((facet) => facet.key === 'independent_evidence') ||
@@ -1636,7 +1623,6 @@ export async function createExplorerSession(
           ? 'local_retrieval_evidence'
           : initialInterpretation.coverageBasis,
     };
-    const coverageAssessment = prepared.finalCoverage;
     const plan = buildDiscoveryPlan(input.query, interpretation, {
       externalSourcesEnabled: input.searchConnectedSources ?? false,
     });
@@ -1659,7 +1645,7 @@ export async function createExplorerSession(
         json({ interpreted: interpretation.explicitFacets, supplied: input.explicitFacets ?? {} }),
         json(interpretation.inferredFacets),
         interpretation.interpretationMethod,
-        retrievalPolicyVersion,
+        explorerRetrievalPolicyVersion,
         prepared.indexRevision,
         retentionUntil,
         createdAt,
@@ -1711,10 +1697,10 @@ export async function createExplorerSession(
         truncated: Math.max(0, prepared.availableCount - prepared.ranked.length),
       },
       retrieval: {
-        policyVersion: retrievalPolicyVersion,
+        policyVersion: explorerRetrievalPolicyVersion,
         candidatePoolHash: prepared.candidatePoolHash,
         fusionPolicy: prepared.fusionPolicy,
-        rerankPolicy: 'structured-rerank-v2',
+        rerankPolicy: structuredRerankPolicyVersion,
         passes: prepared.retrievalPasses,
         stopReason: retrievalStopReason(prepared),
         firstPassCoverage: prepared.firstPassCoverage,
@@ -1782,7 +1768,7 @@ export async function refreshExplorerSession(
       client,
       row.interpretation,
       createdAt,
-      previous.fusionPolicy ?? defaultFusionPolicy,
+      previous.fusionPolicy ?? explorerDefaultFusionPolicy,
     );
     if (
       previous.indexRevision === prepared.indexRevision &&
@@ -2070,7 +2056,7 @@ export async function getExplorerResultPage(
   resultSetId: string,
   query: ResultPageQuery,
 ): Promise<unknown> {
-  const [page, discoveryOperations] = await Promise.all([
+  const [page, discoveryOperations, researchRun] = await Promise.all([
     resultRows(pool, workspaceId, resultSetId, query),
     pool.query<{ id: string; adapterKey: string; state: string }>(
       `SELECT id, adapter_key AS "adapterKey", state, plan_route_id AS "planRouteId",
@@ -2080,6 +2066,20 @@ export async function getExplorerResultPage(
        WHERE result_set_id = $1 AND workspace_id = $2
          AND adapter_key <> 'local_semantic'
        ORDER BY created_at, id`,
+      [resultSetId, workspaceId],
+    ),
+    pool.query<{
+      id: string;
+      mode: string;
+      strategy: string;
+      state: string;
+      safeDetail: string;
+    }>(
+      `SELECT id, mode, strategy, state, safe_detail AS "safeDetail"
+       FROM ops.research_runs
+       WHERE result_set_id = $1 AND workspace_id = $2
+       ORDER BY created_at DESC, id DESC
+       LIMIT 1`,
       [resultSetId, workspaceId],
     ),
   ]);
@@ -2100,6 +2100,7 @@ export async function getExplorerResultPage(
     filteredCount: page.rows.length,
     items,
     discoveryOperations: discoveryOperations.rows,
+    researchRun: researchRun.rows[0] ?? null,
     nextCursor:
       hasMore && items.length ? encodeCursor(resultSetId, items.at(-1)!.id, viewHash) : null,
   };

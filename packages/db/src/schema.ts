@@ -1,6 +1,7 @@
 import { sql } from 'drizzle-orm';
 import {
   boolean,
+  customType,
   integer,
   jsonb,
   numeric,
@@ -15,6 +16,12 @@ import {
 export const catalog = pgSchema('catalog');
 export const workspace = pgSchema('workspace');
 export const ops = pgSchema('ops');
+
+const tsvector = customType<{ data: string }>({
+  dataType() {
+    return 'tsvector';
+  },
+});
 
 export const domainTaxonomyVersions = catalog.table(
   'domain_taxonomy_versions',
@@ -759,6 +766,7 @@ export const knowledgeProjections = catalog.table('knowledge_projections', {
   preferredLabel: text('preferred_label').notNull(),
   summary: text().notNull(),
   searchText: text('search_text').notNull(),
+  retrievalSearchVector: tsvector('retrieval_search_vector'),
   aliases: text().array().notNull().default([]),
   capabilityKeys: text('capability_keys').array().notNull().default([]),
   valueProfile: jsonb('value_profile').notNull(),
@@ -791,6 +799,7 @@ export const knowledgeDocuments = catalog.table('knowledge_documents', {
     .notNull()
     .references(() => sourceObservations.id),
   searchText: text('search_text').notNull(),
+  retrievalSearchVector: tsvector('retrieval_search_vector'),
   aliases: text().array().notNull().default([]),
   mechanismKeys: text('mechanism_keys').array().notNull().default([]),
   valueProfile: jsonb('value_profile').notNull(),
@@ -1554,22 +1563,32 @@ export const researchRuns = ops.table('research_runs', {
   id: uuid().primaryKey(),
   workspaceId: uuid('workspace_id').notNull(),
   querySessionId: uuid('query_session_id').notNull(),
-  initialPlanHash: text('initial_plan_hash').notNull(),
+  resultSetId: uuid('result_set_id').notNull(),
+  idempotencyKey: text('idempotency_key').notNull(),
+  mode: text().notNull(),
+  strategy: text().notNull(),
   state: text().notNull(),
-  maximumExternalCalls: integer('maximum_external_calls').notNull(),
-  maximumCandidates: integer('maximum_candidates').notNull(),
-  maximumElapsedMs: integer('maximum_elapsed_ms').notNull(),
-  firstPassCoverage: jsonb('first_pass_coverage'),
-  finalCoverage: jsonb('final_coverage'),
-  observedPlan: jsonb('observed_plan'),
-  observedPlanHash: text('observed_plan_hash'),
-  completedPassCount: integer('completed_pass_count'),
-  retrievalReceipt: jsonb('retrieval_receipt'),
-  retrievalReceiptHash: text('retrieval_receipt_hash'),
+  skillVersion: text('skill_version').notNull(),
+  protocolVersion: text('protocol_version').notNull(),
+  queryHash: text('query_hash').notNull(),
+  policyHash: text('policy_hash').notNull(),
+  modelAdapterKey: text('model_adapter_key'),
+  modelIdentifier: text('model_identifier'),
+  modelConfigHash: text('model_config_hash'),
+  allowedSourceKeys: text('allowed_source_keys').array().notNull(),
+  budget: jsonb().notNull(),
+  disclosure: jsonb().notNull(),
+  reservedModelCalls: integer('reserved_model_calls').notNull().default(0),
+  consumedModelCalls: integer('consumed_model_calls').notNull().default(0),
   stopReason: text('stop_reason'),
-  startedAt: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
-  deadlineAt: timestamp('deadline_at', { withTimezone: true }).notNull(),
+  receipt: jsonb(),
+  errorCode: text('error_code'),
+  safeDetail: text('safe_detail').notNull(),
+  leaseToken: uuid('lease_token'),
+  leaseUntil: timestamp('lease_until', { withTimezone: true }),
+  startedAt: timestamp('started_at', { withTimezone: true }),
   finishedAt: timestamp('finished_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
@@ -1588,6 +1607,7 @@ export const discoveryOperations = ops.table('discovery_operations', {
   reservedCalls: integer('reserved_calls').notNull(),
   consumedCalls: integer('consumed_calls').notNull().default(0),
   resultCount: integer('result_count').notNull().default(0),
+  resultLimit: integer('result_limit').notNull().default(20),
   errorCode: text('error_code'),
   safeDetail: text('safe_detail'),
   planRouteId: text('plan_route_id'),
@@ -1595,9 +1615,8 @@ export const discoveryOperations = ops.table('discovery_operations', {
   routingReason: text('routing_reason'),
   sourcePlanState: text('source_plan_state').notNull().default('planned'),
   researchRunId: uuid('research_run_id'),
-  passIndex: integer('pass_index').notNull().default(1),
-  leaseToken: uuid('lease_token'),
-  leaseUntil: timestamp('lease_until', { withTimezone: true }),
+  researchStep: integer('research_step'),
+  researchActionKey: text('research_action_key'),
   startedAt: timestamp('started_at', { withTimezone: true }),
   finishedAt: timestamp('finished_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -1647,9 +1666,9 @@ export const discoveryCandidates = ops.table(
 
 export const discoveryOperationCandidates = ops.table('discovery_operation_candidates', {
   operationId: uuid('operation_id').notNull(),
-  candidateId: uuid('candidate_id').notNull(),
+  discoveryCandidateId: uuid('discovery_candidate_id').notNull(),
   workspaceId: uuid('workspace_id').notNull(),
-  observedAt: timestamp('observed_at', { withTimezone: true }).notNull().defaultNow(),
+  linkedAt: timestamp('linked_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
 export const discoveryAdmissions = ops.table('discovery_admissions', {
@@ -1675,6 +1694,11 @@ export const semanticProposals = ops.table('semantic_proposals', {
   workspaceId: uuid('workspace_id').notNull(),
   querySessionId: uuid('query_session_id'),
   operationId: uuid('operation_id'),
+  researchRunId: uuid('research_run_id'),
+  proposalType: text('proposal_type'),
+  stepIndex: integer('step_index'),
+  modelConfigHash: text('model_config_hash'),
+  validationReceipt: jsonb('validation_receipt'),
   taskKey: text('task_key').notNull(),
   adapterKey: text('adapter_key').notNull(),
   adapterVersion: text('adapter_version').notNull(),
@@ -1687,6 +1711,17 @@ export const semanticProposals = ops.table('semantic_proposals', {
   usage: jsonb().notNull().default({}),
   safetyChecks: jsonb('safety_checks').notNull(),
   reviewState: text('review_state').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const researchRunEvents = ops.table('research_run_events', {
+  id: uuid().primaryKey(),
+  researchRunId: uuid('research_run_id').notNull(),
+  workspaceId: uuid('workspace_id').notNull(),
+  stepIndex: integer('step_index').notNull(),
+  eventType: text('event_type').notNull(),
+  payloadHash: text('payload_hash').notNull(),
+  payload: jsonb().notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 

@@ -1,8 +1,8 @@
-# ADR-004: Standalone technology-intelligence product and discovery refoundation
+# Phase 08 deterministic refoundation experiment
 
-- Status: accepted for Phase 08 implementation
+- Status: superseded as the primary semantic architecture; retained as design history
 - Date: 2026-09-30
-- Supersedes: no historical ADR; narrows the active product described by ADR-001 through ADR-003
+- Current authority: [ADR-004: Model-led, evidence-bound research](ADR-004-model-led-research.md)
 
 ## Context
 
@@ -22,7 +22,12 @@ clearer.
 `Signals AI` is the internal working name for this implementation. Current public products and
 marks create material collision risk, so that working name is not a public rename decision.
 
-## Decision
+## Experimental decisions and retained subset
+
+ADR-004 superseded the experiment's growing deterministic query grammar, retrieval heuristics, and
+seeded concept vocabulary as Maestro's primary open-world intelligence. The implementation retains
+only the parts that remain useful as bounded fallback, candidate generation, exact checking,
+evidence structure, and replay substrate under the model-led protocol.
 
 1. The active product is a standalone, local-first technology and capability intelligence system.
    Search and Corpus are its permanent center. It owns query interpretation, bounded research,
@@ -72,7 +77,8 @@ marks create material collision risk, so that working name is not a public renam
 
 ## Consequences
 
-Phase 08 adds forward-only schemas and new versioned policies while preserving every old migration,
-score policy, receipt, provenance link, and replay path. Search becomes more general and auditable,
-but it still makes no whole-web completeness claim. The internal working name can appear in current
-design records; a public rename remains a separate human and legal-risk decision.
+The retained subset adds forward-only schemas and versioned fallback policies while preserving
+every old migration, score policy, receipt, provenance link, and replay path. It does not replace
+the model-led research protocol, establish whole-web completeness, or make proxy evaluation human
+gold. The internal working name can appear in this historical record; a public rename remains a
+separate human and legal-risk decision.

@@ -58,6 +58,24 @@ function observeRuntime(page: Page): () => void {
   };
 }
 
+async function patchSearchResponses(
+  page: Page,
+  sessionPatch: Record<string, unknown>,
+  resultPatch: Record<string, unknown> = sessionPatch,
+): Promise<void> {
+  await page.route('**/api/v1/explorer/sessions', async (route) => {
+    if (route.request().method() !== 'POST') return route.continue();
+    const response = await route.fetch();
+    const body = (await response.json()) as Record<string, unknown>;
+    await route.fulfill({ response, json: { ...body, ...sessionPatch } });
+  });
+  await page.route(/\/api\/v1\/explorer\/result-sets\/[^/?]+\?/, async (route) => {
+    const response = await route.fetch();
+    const body = (await response.json()) as Record<string, unknown>;
+    await route.fulfill({ response, json: { ...body, ...resultPatch } });
+  });
+}
+
 function syntheticGraphFixture(totalNodes: number, totalEdges: number) {
   const groupCount = 10;
   const providerCount = totalNodes - groupCount;
@@ -112,16 +130,11 @@ function syntheticGraphFixture(totalNodes: number, totalEdges: number) {
       kind: provider.kind,
       group: provider.group,
       explanation: 'Synthetic performance fixture; not catalog knowledge.',
-      matchBand: 'Related',
-      signalDisplay: provider.signalDisplay,
-      evidenceConfidence: 0.5,
-      trendState: 'unknown',
       relation: {
         type: 'provides',
         scope: 'synthetic graph performance fixture',
         status: provider.displayState === 'provisional' ? 'provisional' : 'source_supported',
       },
-      relationships: [],
     })),
   };
 }
@@ -234,11 +247,11 @@ test('query-first explorer keeps list, map, detail, comparison, and save on one 
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.goto('/');
   await expect(
-    page.getByRole('heading', { level: 1, name: 'Find existing tools for what you need' }),
+    page.getByRole('heading', { level: 1, name: 'Find what exists for what you need' }),
   ).toBeVisible();
   await captureIfRequested(page, 'explorer-1440-start.png');
   await page.getByLabel('Capability question').fill(privateQuery);
-  await page.getByRole('button', { name: 'Search' }).click();
+  await page.getByRole('button', { name: 'Search', exact: true }).click();
   const queryDetails = page.getByText('Search interpretation and query details');
   await expect(queryDetails).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Results', exact: true })).toBeVisible();
@@ -253,7 +266,9 @@ test('query-first explorer keeps list, map, detail, comparison, and save on one 
   await page.setViewportSize({ width: 1440, height: 1000 });
   await queryDetails.click();
   await expect(page.getByText('intrinsic-signal-v3')).toBeVisible();
-  await expect(page.getByText('Context Mode', { exact: true }).first()).toBeVisible();
+  await expect(
+    page.getByRole('button', { name: 'Use capability:code-context-reduction' }),
+  ).toBeVisible();
   await expectNoSeriousAccessibilityViolations(page);
   await captureIfRequested(page, 'explorer-1440-list.png');
 
@@ -262,11 +277,7 @@ test('query-first explorer keeps list, map, detail, comparison, and save on one 
   await expect(page.getByRole('dialog')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Close detail' })).toBeFocused();
   await expect(page.getByRole('heading', { name: 'Signal calculation' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'Why it matched' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'Why Signal is high or low' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Sources and evidence' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'Relationships' })).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'Missing evidence and limits' })).toBeVisible();
   await captureIfRequested(page, 'explorer-1440-detail.png');
   await page.keyboard.press('Escape');
   await expect(firstInspect).toBeFocused();
@@ -295,12 +306,7 @@ test('query-first explorer keeps list, map, detail, comparison, and save on one 
   const browseMapItems = page.getByRole('button', { name: /Browse \d+ items/ });
   await expect(browseMapItems).toBeVisible();
   await browseMapItems.click();
-  await expect(
-    page
-      .locator('.map-accessible-tree')
-      .getByText(/Match.*Signal/)
-      .first(),
-  ).toBeVisible();
+  await expect(page.getByText(/query-result capability grouping/).first()).toBeVisible();
   await page.getByRole('button', { name: 'Hide item list' }).click();
   await captureIfRequested(page, 'explorer-1440-map.png');
 
@@ -355,7 +361,6 @@ test('G6 map stays bounded and interactive at declared synthetic sizes', async (
     fixture: string;
     nodes: number;
     edges: number;
-    targetMs: number;
     readyMs: number;
     maxInteractionLongTaskMs: number;
     interactionLongTasksOver200Ms: number;
@@ -363,13 +368,13 @@ test('G6 map stays bounded and interactive at declared synthetic sizes', async (
   }> = [];
 
   for (const shape of [
-    { nodes: 150, edges: 420, targetMs: 3_000 },
-    { nodes: 500, edges: 1_500, targetMs: 3_000 },
+    { nodes: 150, edges: 420 },
+    { nodes: 500, edges: 1_500 },
   ]) {
     fixture = syntheticGraphFixture(shape.nodes, shape.edges);
     await page.goto('/');
     await page.getByLabel('Capability question').fill('ai context reduction');
-    await page.getByRole('button', { name: 'Search' }).click();
+    await page.getByRole('button', { name: 'Search', exact: true }).click();
     await page.evaluate(() => {
       const measuredWindow = window as typeof window & { __maestroLongTasks?: number[] };
       measuredWindow.__maestroLongTasks = [];
@@ -419,12 +424,11 @@ test('G6 map stays bounded and interactive at declared synthetic sizes', async (
       fixture: shape.nodes === 500 ? 'synthetic-stress' : 'synthetic-medium',
       nodes: fixture.nodes.length,
       edges: fixture.edges.length,
-      targetMs: shape.targetMs,
       readyMs,
       ...runtime,
     });
     await captureIfRequested(page, `graph-synthetic-${shape.nodes}.png`);
-    expect(readyMs).toBeLessThanOrEqual(shape.targetMs);
+    expect(readyMs).toBeLessThanOrEqual(2_000);
     expect(runtime.interactionLongTasksOver200Ms).toBe(0);
   }
 
@@ -435,7 +439,7 @@ test('G6 map stays bounded and interactive at declared synthetic sizes', async (
       reportPath,
       `${JSON.stringify(
         {
-          benchmarkId: 'bounded-g6-map-v2',
+          benchmarkId: 'phase06-g6-bounded-map-v1',
           executedAt: new Date().toISOString(),
           browser: 'Playwright Chromium',
           statement: 'Synthetic fixtures measure renderer mechanics, not knowledge quality.',
@@ -450,23 +454,27 @@ test('G6 map stays bounded and interactive at declared synthetic sizes', async (
   assertRuntime();
 });
 
-test('corpus separates saved leads from indexed knowledge and scores an explicit search', async ({
+test('corpus excludes live leads from admitted knowledge and scores an explicit search', async ({
   page,
 }) => {
   const assertRuntime = observeRuntime(page);
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.goto('/corpus');
   await expect(
-    page.getByRole('heading', { name: 'Browse saved technology research' }),
+    page.getByRole('heading', { name: 'Browse the durable research corpus' }),
   ).toBeVisible();
-  await expect(page.getByText(/saved lead is not reviewed knowledge/i)).toBeVisible();
+  await expect(
+    page.getByText(
+      /Live Search findings stay in research history until they pass an admission decision/i,
+    ),
+  ).toBeVisible();
+  await expect(page.getByLabel('Layer').locator('option[value="source_lead"]')).toHaveCount(0);
   await page.getByLabel('Search the corpus').fill('context reduction for coding agents');
   await page.getByRole('button', { name: 'Search corpus' }).click();
   expect(page.url()).not.toContain('context');
   await expect(page.getByText('Query-scored records')).toBeVisible();
-  await expect(page.getByText(/^Signal \d+$/).first()).toBeVisible();
-  await expect(page.getByText(/Match answers the query/i)).toBeVisible();
-  await expect(page.getByText(/evidence confidence/i).first()).toBeVisible();
+  await expect(page.getByText(/^Legacy query estimate \d+$/).first()).toBeVisible();
+  await expect(page.getByText(/preserved Phase 07 query-ranking estimate/i)).toBeVisible();
   await expectNoSeriousAccessibilityViolations(page);
   await captureIfRequested(page, 'corpus-1440-search.png');
 
@@ -516,7 +524,11 @@ test('generic browser authoring creates an attributed Corpus record without exec
   await expect(row).toBeVisible();
   await expect(row.getByText('Proposed', { exact: true })).toBeVisible();
   await expect(row.getByText(/Human Supplied Documentation/)).toBeVisible();
-  await expect(page.getByText(/saved lead is not reviewed knowledge/i)).toBeVisible();
+  await expect(
+    page.getByText(
+      /Live Search findings stay in research history until they pass an admission decision/i,
+    ),
+  ).toBeVisible();
   assertRuntime();
 });
 
@@ -531,33 +543,14 @@ test('connected source results remain visibly preliminary and source-linked', as
     );
     await route.fulfill({ response, json: body });
   });
-  await page.route('**/api/v1/explorer/sessions', async (route) => {
-    if (route.request().method() !== 'POST') {
-      await route.continue();
-      return;
-    }
-    const response = await route.fetch();
-    const body = (await response.json()) as Record<string, unknown>;
-    await route.fulfill({
-      response,
-      json: {
-        ...body,
-        externalDiscovery: { attempted: true, state: 'queued' },
-        discoveryOperations: [{ id: operationId, adapterKey: 'github', state: 'queued' }],
-      },
-    });
-  });
-  await page.route(/\/api\/v1\/explorer\/result-sets\/[^/?]+\?/, async (route) => {
-    const response = await route.fetch();
-    const body = (await response.json()) as Record<string, unknown>;
-    await route.fulfill({
-      response,
-      json: {
-        ...body,
-        discoveryOperations: [{ id: operationId, adapterKey: 'github', state: 'queued' }],
-      },
-    });
-  });
+  await patchSearchResponses(
+    page,
+    {
+      externalDiscovery: { attempted: true, state: 'queued' },
+      discoveryOperations: [{ id: operationId, adapterKey: 'github', state: 'queued' }],
+    },
+    { discoveryOperations: [{ id: operationId, adapterKey: 'github', state: 'queued' }] },
+  );
   await page.route('**/api/v1/discovery/operations/*', async (route) => {
     const requestedOperationId = new URL(route.request().url()).pathname.split('/').at(-1)!;
     await route.fulfill({
@@ -591,21 +584,268 @@ test('connected source results remain visibly preliminary and source-linked', as
 
   await page.goto('/');
   await page.getByLabel('Capability question').fill('context tool');
-  await page.getByRole('button', { name: 'Search' }).click();
+  await page.getByRole('button', { name: 'Search', exact: true }).click();
   const sourceResults = page.locator('details.source-results');
   await expect(sourceResults.getByText('Source plan and live leads')).toBeVisible();
   await sourceResults.locator('summary').click();
   await expect(page.getByText('example/context-tool')).toBeVisible();
-  await expect(page.getByText('Lead score 34', { exact: true })).toBeVisible();
-  await expect(
-    page.locator('.source-result-row').getByText('Preliminary', { exact: true }).first(),
-  ).toBeVisible();
+  await expect(page.getByText('Legacy query estimate 34', { exact: true })).toBeVisible();
+  await expect(page.getByText('Preliminary', { exact: true }).last()).toBeVisible();
   await expect(page.getByRole('link', { name: 'Open source' })).toHaveAttribute(
     'href',
     'https://github.com/example/context-tool',
   );
   await expectNoSeriousAccessibilityViolations(page);
   await captureIfRequested(page, 'explorer-1440-controlled-source.png');
+  assertRuntime();
+});
+
+test('model-led research renders sufficiency, exact citations, and source outcomes', async ({
+  page,
+}) => {
+  const assertRuntime = observeRuntime(page);
+  const runId = '33333333-3333-4333-8333-333333333333';
+  const candidateId = '44444444-4444-4444-8444-444444444444';
+  const researchSummary = {
+    id: runId,
+    mode: 'search',
+    strategy: 'model',
+    state: 'complete',
+    safeDetail: 'Model-led search completed with one cited evidence candidate.',
+  };
+  await patchSearchResponses(page, { researchRun: researchSummary });
+  await page.route(`**/api/v1/research/runs/${runId}`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ...researchSummary,
+        modelIdentifier: 'controlled-local-model',
+        stopReason: 'evidence_sufficient',
+        fallbackAvailable: false,
+        candidates: [
+          {
+            id: candidateId,
+            sourceKey: 'github',
+            title: 'example/evidence-bound-research',
+            summary: 'Controlled public evidence used by the model synthesis.',
+            canonicalUri: 'https://github.com/example/evidence-bound-research',
+            observedAt: '2026-09-30T12:00:00.000Z',
+            reviewState: 'lead',
+            kindHint: 'oss_project',
+          },
+        ],
+        operations: [
+          {
+            id: '55555555-5555-4555-8555-555555555555',
+            sourceKey: 'github',
+            state: 'complete',
+            resultCount: 1,
+            safeDetail: 'One bounded source result.',
+          },
+          {
+            id: '66666666-6666-4666-8666-666666666666',
+            sourceKey: 'mcp_registry',
+            state: 'empty',
+            resultCount: 0,
+            safeDetail: 'No matching registry results.',
+          },
+        ],
+        proposals: [
+          {
+            proposalType: 'synthesis',
+            output: {
+              protocolVersion: 'research-protocol-v2',
+              contextAssessment: 'sufficient',
+              abstentionReason: null,
+              summary: 'The evidence directly supports one bounded option.',
+              summaryCitationCandidateIds: [candidateId],
+              groups: [
+                {
+                  label: 'Direct evidence',
+                  description: 'Evidence directly tied to the need.',
+                  candidateIds: [candidateId],
+                },
+              ],
+              items: [
+                {
+                  candidateId,
+                  reason: 'The source directly addresses the research need.',
+                  uncertainty: 'Only one public source was available.',
+                  citationCandidateIds: [candidateId],
+                },
+              ],
+              limitations: ['Human usefulness is not proven by this controlled browser fixture.'],
+            },
+          },
+        ],
+      }),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByLabel('Capability question').fill('evidence bound research');
+  await page.getByRole('button', { name: 'Search', exact: true }).click();
+  await expect(page.getByText('Research synthesis · Sufficient context')).toBeVisible();
+  await expect(page.getByText('Summary evidence')).toBeVisible();
+  await expect(page.getByText('Evidence cited')).toBeVisible();
+  await expect(
+    page.getByLabel('Model-led source outcomes').getByText('Mcp Registry'),
+  ).toBeVisible();
+  await expect(page.getByRole('link', { name: /example\/evidence-bound-research/ })).toHaveCount(2);
+  await expectNoSeriousAccessibilityViolations(page);
+  await captureIfRequested(page, 'explorer-1440-model-led-citations.png');
+  assertRuntime();
+});
+
+test('historical v1 research synthesis remains replayable without rewriting it', async ({
+  page,
+}) => {
+  const assertRuntime = observeRuntime(page);
+  const runId = '34343434-3434-4434-8434-343434343434';
+  const candidateId = '45454545-4545-4454-8454-454545454545';
+  const researchSummary = {
+    id: runId,
+    mode: 'search',
+    strategy: 'model',
+    state: 'complete',
+    safeDetail: 'Historical model-led search completed with cited evidence.',
+  };
+  await patchSearchResponses(page, { researchRun: researchSummary });
+  await page.route(`**/api/v1/research/runs/${runId}`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ...researchSummary,
+        modelIdentifier: 'historical-local-model',
+        stopReason: 'evidence_sufficient',
+        fallbackAvailable: false,
+        candidates: [
+          {
+            id: candidateId,
+            sourceKey: 'github',
+            title: 'example/historical-evidence',
+            summary: 'Immutable evidence captured by the v1 research protocol.',
+            canonicalUri: 'https://github.com/example/historical-evidence',
+            observedAt: '2026-09-01T12:00:00.000Z',
+          },
+        ],
+        operations: [],
+        proposals: [
+          {
+            proposalType: 'synthesis',
+            output: {
+              protocolVersion: 'research-protocol-v1',
+              summary: 'Historical synthesis preserved under its original protocol.',
+              groups: [
+                {
+                  label: 'Historical evidence',
+                  description: 'Evidence selected by the original run.',
+                  candidateIds: [candidateId],
+                },
+              ],
+              items: [
+                {
+                  candidateId,
+                  reason: 'The original run selected this evidence.',
+                  uncertainty: 'This record predates the v2 sufficiency contract.',
+                  citationCandidateIds: [candidateId],
+                },
+              ],
+              limitations: ['Replayed without upgrading the immutable proposal.'],
+            },
+          },
+        ],
+      }),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByLabel('Capability question').fill('historical research replay');
+  await page.getByRole('button', { name: 'Search', exact: true }).click();
+  await expect(page.getByText('Research synthesis · Legacy context')).toBeVisible();
+  await expect(
+    page.getByText('Historical v1 synthesis replayed with its original evidence citations.'),
+  ).toBeVisible();
+  await expect(page.getByRole('link', { name: /example\/historical-evidence/ })).toHaveCount(2);
+  assertRuntime();
+});
+
+test('budget-denied model path keeps deterministic leads visible', async ({ page }) => {
+  const assertRuntime = observeRuntime(page);
+  const runId = '77777777-7777-4777-8777-777777777777';
+  const operationId = '88888888-8888-4888-8888-888888888888';
+  const researchSummary = {
+    id: runId,
+    mode: 'search',
+    strategy: 'model',
+    state: 'budget_denied',
+    safeDetail: 'The configured model-call budget denied this research run.',
+  };
+  await patchSearchResponses(
+    page,
+    {
+      researchRun: researchSummary,
+      discoveryOperations: [{ id: operationId, adapterKey: 'github', state: 'queued' }],
+    },
+    {
+      researchRun: researchSummary,
+      discoveryOperations: [{ id: operationId, adapterKey: 'github', state: 'complete' }],
+    },
+  );
+  await page.route(`**/api/v1/research/runs/${runId}`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ...researchSummary,
+        modelIdentifier: 'controlled-local-model',
+        stopReason: null,
+        fallbackAvailable: true,
+        candidates: [],
+        proposals: [],
+        operations: [],
+      }),
+    });
+  });
+  await page.route(`**/api/v1/discovery/operations/${operationId}`, async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        id: operationId,
+        adapterKey: 'github',
+        state: 'complete',
+        safeDetail: 'Deterministic fallback completed.',
+        candidates: [
+          {
+            id: '99999999-9999-4999-8999-999999999999',
+            adapterKey: 'github',
+            canonicalUri: 'https://github.com/example/deterministic-fallback',
+            title: 'example/deterministic-fallback',
+            summary: 'A deterministic lead preserved when the model budget was denied.',
+            kindHint: 'oss_project',
+            reviewState: 'lead',
+            matchedTerms: ['deterministic'],
+            relevanceOrdinal: 'direct',
+            signalDisplay: 31,
+            evidenceCoverage: 0.1,
+            displayState: 'provisional',
+          },
+        ],
+      }),
+    });
+  });
+
+  await page.goto('/');
+  await page.getByLabel('Capability question').fill('deterministic fallback');
+  await page.getByRole('button', { name: 'Search', exact: true }).click();
+  await expect(page.getByText('example/deterministic-fallback')).toBeVisible();
+  await expect(page.getByText('Legacy query estimate 31')).toBeVisible();
+  await expect(page.getByText(/model-call budget denied/i)).toBeVisible();
+  await expectNoSeriousAccessibilityViolations(page);
+  await captureIfRequested(page, 'explorer-1440-budget-fallback.png');
   assertRuntime();
 });
 
@@ -633,7 +873,7 @@ test('source search is explicit and local semantic assistance stays separate', a
 
   await page.getByRole('link', { name: 'Search', exact: true }).click();
   await page.getByLabel('Capability question').fill('context compression');
-  await page.getByRole('button', { name: 'Search' }).click();
+  await page.getByRole('button', { name: 'Search', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Results', exact: true })).toBeVisible();
   await expect(page.getByText(/no connected source request was queued/i)).toBeVisible();
   await captureIfRequested(page, 'explorer-1440-optional-integrations.png');

@@ -7,6 +7,7 @@ import {
   querySubjectConcepts,
   querySubjectTerms,
   runRetrievalPipeline,
+  structuredRerankPolicyVersion,
   type QueryInterpretation,
   type RerankedRetrievalCandidate,
   type RetrievalDocument,
@@ -17,10 +18,7 @@ import {
   type QueryValueInput,
 } from '../../scoring/src/index.js';
 import { postgresPrefixTsQuery, uniqueCandidateTerms } from './candidate-search.js';
-import {
-  discoveryLeadRetrievalDocument,
-  scoreDiscoveryCandidate,
-} from './discovery-repository.js';
+import { discoveryLeadRetrievalDocument, scoreDiscoveryCandidate } from './discovery-repository.js';
 import { DomainValidationError } from './errors.js';
 import { loadIntrinsicSignals } from './intrinsic-signal-repository.js';
 import { loadQueryKnowledge } from './taxonomy-repository.js';
@@ -72,7 +70,8 @@ interface ScoredCorpusRow extends CorpusRow {
   signalBand: QuerySignalResult['band'] | IntrinsicSignalResult['band'] | null;
   signalPolicyVersion:
     QuerySignalResult['policyVersion'] | IntrinsicSignalResult['policyVersion'] | null;
-  signalBasis: 'typed_cohort_metrics' | 'legacy_compatibility_projection' | 'source_metadata_estimate' | null;
+  signalBasis:
+    'typed_cohort_metrics' | 'legacy_compatibility_projection' | 'source_metadata_estimate' | null;
   evidenceConfidence: number | null;
   evidenceConfidenceDetail: IntrinsicSignalResult['evidenceConfidence'] | null;
   trend: IntrinsicSignalResult['trend'] | null;
@@ -311,17 +310,21 @@ async function loadCorpus(
   pool: Pool,
   workspaceId: string,
   interpretation: QueryInterpretation | null,
+  layer: CorpusLayer | undefined,
 ): Promise<{ rows: CorpusRow[]; total: number; candidateSelectionApplied: boolean }> {
   const totals = await pool.query<{ total: number }>(
     `
     SELECT (
       (SELECT count(*) FROM catalog.knowledge_projections kp
-       WHERE kp.publication_state <> 'withdrawn'
+       WHERE ($2::text IS NULL OR $2 = 'indexed_knowledge')
+         AND kp.publication_state <> 'withdrawn'
          AND (kp.expires_at IS NULL OR kp.expires_at > now()))
       + (SELECT count(*) FROM catalog.knowledge_documents kd
-         WHERE kd.publication_state <> 'withdrawn')
+         WHERE ($2::text IS NULL OR $2 = 'knowledge_document')
+           AND kd.publication_state <> 'withdrawn')
       + (SELECT count(DISTINCT dc.canonical_uri) FROM ops.discovery_candidates dc
-         WHERE dc.workspace_id = $1 AND dc.review_state = 'lead'
+         WHERE $2 = 'source_lead'
+           AND dc.workspace_id = $1 AND dc.review_state = 'lead'
            AND NOT EXISTS (
              SELECT 1
              FROM ops.discovery_candidates admitted_candidate
@@ -332,10 +335,12 @@ async function loadCorpus(
            ))
     )::int AS total
   `,
-    [workspaceId],
+    [workspaceId, layer ?? null],
   );
   const total = totals.rows[0]!.total;
-  const candidateSelectionApplied = Boolean(interpretation && total > corpusCandidateThreshold);
+  const candidateSelectionApplied = Boolean(
+    interpretation && layer !== 'source_lead' && total > corpusCandidateThreshold,
+  );
   const candidateTerms = interpretation
     ? uniqueCandidateTerms([
         querySubjectTerms(interpretation),
@@ -356,6 +361,7 @@ async function loadCorpus(
        FROM catalog.knowledge_projections kp
        JOIN catalog.knowledge_entities entity ON entity.provider_id = kp.provider_id
        WHERE $2::boolean
+         AND ($9::text IS NULL OR $9 = 'indexed_knowledge')
          AND kp.publication_state <> 'withdrawn'
          AND (kp.expires_at IS NULL OR kp.expires_at > now())
          AND (
@@ -370,22 +376,17 @@ async function loadCorpus(
        SELECT kp.id, 2 AS selection_priority
        FROM catalog.knowledge_projections kp
        WHERE $2::boolean
+         AND ($9::text IS NULL OR $9 = 'indexed_knowledge')
          AND kp.publication_state <> 'withdrawn'
          AND (kp.expires_at IS NULL OR kp.expires_at > now())
          AND (
            kp.aliases && $4::text[]
            OR kp.capability_keys && $4::text[]
-           OR to_tsvector(
-                'simple'::regconfig,
-                kp.preferred_label || ' ' || kp.summary || ' ' || kp.search_text
-              ) @@ to_tsquery('simple'::regconfig, NULLIF($3, ''))
+           OR kp.retrieval_search_vector @@ to_tsquery('simple'::regconfig, NULLIF($3, ''))
          )
        ORDER BY
          ts_rank_cd(
-           to_tsvector(
-             'simple'::regconfig,
-             kp.preferred_label || ' ' || kp.summary || ' ' || kp.search_text
-           ),
+           kp.retrieval_search_vector,
            to_tsquery('simple'::regconfig, NULLIF($3, ''))
          ) DESC,
          kp.preferred_label, kp.id
@@ -394,6 +395,7 @@ async function loadCorpus(
        SELECT kp.id, 2 AS selection_priority
        FROM catalog.knowledge_projections kp
        WHERE NOT $2::boolean
+         AND ($9::text IS NULL OR $9 = 'indexed_knowledge')
          AND kp.publication_state <> 'withdrawn'
          AND (kp.expires_at IS NULL OR kp.expires_at > now())
      ), candidate_projection_ids AS (
@@ -407,10 +409,7 @@ async function loadCorpus(
      ), selected_projections AS (
        SELECT kp.id, candidates.selection_priority,
          ts_rank_cd(
-           to_tsvector(
-             'simple'::regconfig,
-             kp.preferred_label || ' ' || kp.summary || ' ' || kp.search_text
-           ),
+           kp.retrieval_search_vector,
            to_tsquery('simple'::regconfig, NULLIF($3, ''))
          ) AS lexical_rank
        FROM candidate_projection_ids candidates
@@ -420,7 +419,8 @@ async function loadCorpus(
      ), selected_documents AS (
        SELECT kd.id
        FROM catalog.knowledge_documents kd
-       WHERE kd.publication_state <> 'withdrawn'
+       WHERE ($9::text IS NULL OR $9 = 'knowledge_document')
+         AND kd.publication_state <> 'withdrawn'
          AND (
            NOT $2::boolean
            OR EXISTS (
@@ -439,10 +439,7 @@ async function loadCorpus(
            )
            OR kd.aliases && $4::text[]
            OR kd.mechanism_keys && $4::text[]
-           OR to_tsvector(
-                'simple'::regconfig,
-                kd.title || ' ' || kd.summary || ' ' || kd.search_text
-              ) @@ to_tsquery('simple'::regconfig, NULLIF($3, ''))
+           OR kd.retrieval_search_vector @@ to_tsquery('simple'::regconfig, NULLIF($3, ''))
          )
        ORDER BY
          CASE WHEN EXISTS (
@@ -460,10 +457,7 @@ async function loadCorpus(
              )
          ) THEN 0 ELSE 1 END,
          ts_rank_cd(
-           to_tsvector(
-             'simple'::regconfig,
-             kd.title || ' ' || kd.summary || ' ' || kd.search_text
-           ),
+           kd.retrieval_search_vector,
            to_tsquery('simple'::regconfig, NULLIF($3, ''))
          ) DESC,
          kd.title, kd.id
@@ -473,7 +467,8 @@ async function loadCorpus(
               dc.id, dc.canonical_uri, dc.title, dc.summary, dc.kind_hint,
               dc.source_payload, dc.provenance, dc.created_at
        FROM ops.discovery_candidates dc
-       WHERE dc.workspace_id = $1
+       WHERE $9 = 'source_lead'
+         AND dc.workspace_id = $1
          AND dc.review_state = 'lead'
          AND NOT EXISTS (
            SELECT 1
@@ -614,6 +609,7 @@ async function loadCorpus(
       exactEntityIds,
       resolvedConceptIds,
       corpusCandidateOverfetch,
+      layer ?? null,
     ],
   );
   return { rows: result.rows, total, candidateSelectionApplied };
@@ -641,7 +637,10 @@ export async function listResearchCorpus(
   const interpretation = normalizedQuery
     ? interpretQuery(normalizedQuery, {}, knowledge ?? undefined)
     : null;
-  const corpusSelection = await loadCorpus(pool, workspaceId, interpretation);
+  // The default Corpus universe contains admitted knowledge only. The legacy source-lead layer is
+  // loaded as a separate replay view so raw Search leads cannot consume retrieval or coverage
+  // budgets, alter facets, or inflate Corpus counts before the public layer filter is applied.
+  const corpusSelection = await loadCorpus(pool, workspaceId, interpretation, query.layer);
   const corpus = corpusSelection.rows;
   const asOf = new Date();
   const intrinsicByEntity = await loadIntrinsicSignals(
@@ -663,27 +662,23 @@ export async function listResearchCorpus(
     corpus.map((row) => [corpusRetrievalDocument(row).candidateKey, row] as const),
   );
   const pipeline = interpretation
-    ? runRetrievalPipeline(
-        corpus.map(corpusRetrievalDocument),
-        interpretation,
-        {
-          fusionPolicy: 'normalized-weighted-fusion-v1',
-          maximumCandidates: 200,
-          shouldRunSecondPass: (firstPassCandidates, resolvedDocuments) => {
-            const documentByCandidate = new Map(
-              resolvedDocuments.map((document) => [document.candidateKey, document] as const),
-            );
-            return assessResearchCoverage(
-              interpretation,
-              firstPassCandidates
-                .slice(0, 100)
-                .map((candidate) => documentByCandidate.get(candidate.candidateKey))
-                .filter((document): document is RetrievalDocument => Boolean(document))
-                .map(corpusCoverageSummary),
-            ).needsSecondPass;
-          },
+    ? runRetrievalPipeline(corpus.map(corpusRetrievalDocument), interpretation, {
+        fusionPolicy: 'normalized-weighted-fusion-v1',
+        maximumCandidates: 200,
+        shouldRunSecondPass: (firstPassCandidates, resolvedDocuments) => {
+          const documentByCandidate = new Map(
+            resolvedDocuments.map((document) => [document.candidateKey, document] as const),
+          );
+          return assessResearchCoverage(
+            interpretation,
+            firstPassCandidates
+              .slice(0, 100)
+              .map((candidate) => documentByCandidate.get(candidate.candidateKey))
+              .filter((document): document is RetrievalDocument => Boolean(document))
+              .map(corpusCoverageSummary),
+          ).needsSecondPass;
         },
-      )
+      })
     : null;
   const retrievalByCandidate = new Map(
     pipeline?.selected.map((candidate) => [candidate.candidateKey, candidate] as const) ?? [],
@@ -719,14 +714,14 @@ export async function listResearchCorpus(
         value: 'source_lead',
         count: matched.filter((row) => row.layer === 'source_lead').length,
       },
-    ],
+    ].filter((facet) => facet.count > 0),
     states: countFacets(matched, 'state'),
     sources: sourceFacets(matched),
     kinds: countFacets(matched, 'kind'),
     entityClasses: countFacets(matched, 'entityClass'),
   };
   const filtered = matched
-    .filter((row) => !query.layer || row.layer === query.layer)
+    .filter((row) => (query.layer ? row.layer === query.layer : row.layer !== 'source_lead'))
     .filter((row) => !query.state || row.state === query.state)
     .filter((row) => !query.source || row.sources.includes(query.source))
     .filter((row) => !query.kind || row.kind === query.kind)
@@ -770,7 +765,7 @@ export async function listResearchCorpus(
       ? {
           policyVersion: 'retrieval-pipeline-v1',
           fusionPolicy: pipeline.fusionPolicy,
-          rerankPolicy: 'structured-rerank-v2',
+          rerankPolicy: structuredRerankPolicyVersion,
           passes: pipeline.retrievalPasses,
           duplicateResolutionCount: pipeline.duplicateResolutions.filter(
             (resolution) => resolution.method !== 'distinct',

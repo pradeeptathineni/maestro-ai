@@ -2,6 +2,7 @@ import { querySubjectConcepts, querySubjectTerms, type QueryInterpretation } fro
 
 export type RetrievalPass = 1 | 2;
 export type RetrievalFusionPolicy = 'reciprocal-rank-fusion-v1' | 'normalized-weighted-fusion-v1';
+export const structuredRerankPolicyVersion = 'structured-rerank-v2' as const;
 export type RetrievalKey =
   'exact-identity-v1' | 'lexical-token-v1' | 'concept-neighborhood-v1' | 'concept-gap-v1';
 
@@ -68,7 +69,7 @@ export interface FusedRetrievalCandidate {
 }
 
 export interface RerankedRetrievalCandidate extends FusedRetrievalCandidate {
-  rerankPolicy: 'structured-rerank-v2';
+  rerankPolicy: typeof structuredRerankPolicyVersion;
   rerankPosition: number;
   rerankScore: number;
   matchScore: number;
@@ -204,6 +205,11 @@ function similarity(left: string, right: string): number {
   const leftRoots = roots(left);
   const rightRoots = roots(right);
   if (leftRoots.some((root) => rightRoots.includes(root))) return 0.94;
+  const shorter = left.length <= right.length ? left : right;
+  const longer = left.length <= right.length ? right : left;
+  // Four-character technical abbreviations such as "auth" are common query vocabulary. Treat
+  // them as a bounded prefix match, while keeping shorter fragments too weak to match.
+  if (shorter.length >= 4 && longer.length >= 6 && longer.startsWith(shorter)) return 0.82;
   if (
     Math.min(left.length, right.length) >= 4 &&
     (left.startsWith(right) || right.startsWith(left))
@@ -290,13 +296,17 @@ export function assessRetrievalMatch(
       (entityClass === 'document' && document.subjectType === 'document'),
   );
   const entityClassKnown = !['', 'lead', 'other', 'unknown'].includes(document.entityClass);
-  const typeCompatibility = !interpretation.requestedEntityClasses.length || requestedClass
-    ? 'compatible'
-    : entityClassKnown
-      ? 'incompatible'
-      : 'unknown';
+  const typeCompatibility =
+    !interpretation.requestedEntityClasses.length || requestedClass
+      ? 'compatible'
+      : entityClassKnown
+        ? 'incompatible'
+        : 'unknown';
   const typeCompatible = typeCompatibility !== 'incompatible';
-  const minimumLexicalMatches = Math.max(1, Math.ceil(queryTerms.length * 0.5));
+  // Natural-language needs often contain contextual phrasing that a relevant record should not
+  // repeat verbatim. Require two independent lexical anchors once a query has four or more
+  // discriminative terms; concepts and exact identity remain stronger evidence.
+  const minimumLexicalMatches = Math.min(2, Math.max(1, Math.ceil(queryTerms.length * 0.5)));
   if (
     !exactIdentity &&
     !directConcepts.length &&
@@ -587,7 +597,8 @@ export function resolveRetrievalDuplicates(documents: RetrievalDocument[]): {
   const unite = (left: number, right: number): void => {
     const leftRoot = find(left);
     const rightRoot = find(right);
-    if (leftRoot !== rightRoot) parent[Math.max(leftRoot, rightRoot)] = Math.min(leftRoot, rightRoot);
+    if (leftRoot !== rightRoot)
+      parent[Math.max(leftRoot, rightRoot)] = Math.min(leftRoot, rightRoot);
   };
   const entityOwner = new Map<string, number>();
   const identityOwner = new Map<string, number>();
@@ -668,7 +679,9 @@ export function resolveRetrievalDuplicates(documents: RetrievalDocument[]): {
   }
   return {
     documents: kept.sort((left, right) => left.candidateKey.localeCompare(right.candidateKey)),
-    resolutions: resolutions.sort((left, right) => left.candidateKey.localeCompare(right.candidateKey)),
+    resolutions: resolutions.sort((left, right) =>
+      left.candidateKey.localeCompare(right.candidateKey),
+    ),
   };
 }
 
@@ -791,7 +804,7 @@ export function structuredRerank(
       return [
         {
           ...candidate,
-          rerankPolicy: 'structured-rerank-v2' as const,
+          rerankPolicy: structuredRerankPolicyVersion,
           rerankPosition: 0,
           rerankScore: precise(rerankScore),
           matchedTerms: match.matchedTerms,
@@ -877,10 +890,7 @@ export function runRetrievalPipeline(
     : { rankings: [], hits: [] };
   const rankings = [...firstPass.rankings, ...secondPass.rankings];
   const reciprocalRankFusion = fuseRetrievalRankings(rankings, 'reciprocal-rank-fusion-v1');
-  const normalizedWeightedFusion = fuseRetrievalRankings(
-    rankings,
-    'normalized-weighted-fusion-v1',
-  );
+  const normalizedWeightedFusion = fuseRetrievalRankings(rankings, 'normalized-weighted-fusion-v1');
   const reciprocalRankReranked = diversifyBroadRetrieval(
     structuredRerank(reciprocalRankFusion, resolved.documents, interpretation),
     resolved.documents,

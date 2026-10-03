@@ -13,7 +13,7 @@ import {
   type IntrinsicDimensionKey,
   type MetricDirection,
 } from '../../scoring/src/index.js';
-import { DomainValidationError, NotFoundError } from './errors.js';
+import { ConflictError, DomainValidationError, NotFoundError } from './errors.js';
 import { inTransaction } from './transaction.js';
 
 function json(value: unknown): string {
@@ -132,6 +132,19 @@ export async function recordEntityMetricObservation(
       'Metric windows must be valid, ordered, and no later than the observation.',
     );
   }
+  const observationInputHash = hashCanonical({
+    knowledgeEntityId: input.knowledgeEntityId,
+    metricKey: input.metricKey,
+    intrinsicDimension: input.intrinsicDimension,
+    direction: input.direction,
+    rawValue: input.rawValue,
+    rawUnit: input.rawUnit,
+    aggregation: input.aggregation,
+    windowStart: input.windowStart.toISOString(),
+    windowEnd: input.windowEnd.toISOString(),
+    sourceObservationId: input.sourceObservationId,
+    observedAt: input.observedAt.toISOString(),
+  });
   return inTransaction(pool, async (client) => {
     await client.query(
       `SELECT pg_advisory_xact_lock(hashtext(
@@ -145,8 +158,24 @@ export async function recordEntityMetricObservation(
         input.windowEnd,
       ],
     );
-    const existing = await client.query<{ id: string }>(
-      `SELECT id FROM catalog.entity_metric_observations
+    const existing = await client.query<{
+      id: string;
+      intrinsicDimension: IntrinsicDimensionKey | null;
+      direction: MetricDirection | null;
+      rawValue: number | null;
+      rawUnit: string;
+      aggregation: 'total' | 'snapshot' | null;
+      observedAt: Date;
+      normalizationInputHash: string | null;
+      observationInputHash: string | null;
+    }>(
+      `SELECT id, intrinsic_dimension AS "intrinsicDimension",
+              metric_direction AS direction, raw_value::float8 AS "rawValue",
+              raw_unit AS "rawUnit", metric_aggregation AS aggregation,
+              observed_at AS "observedAt",
+              normalization_input_hash AS "normalizationInputHash",
+              normalization_detail->>'observationInputHash' AS "observationInputHash"
+       FROM catalog.entity_metric_observations
        WHERE knowledge_entity_id = $1 AND metric_key = $2 AND source_observation_id = $3
          AND window_start = $4 AND window_end = $5`,
       [
@@ -157,7 +186,24 @@ export async function recordEntityMetricObservation(
         input.windowEnd,
       ],
     );
-    if (existing.rows[0]?.id) return existing.rows[0].id;
+    if (existing.rows[0]) {
+      const stored = existing.rows[0];
+      const identical =
+        stored.intrinsicDimension === input.intrinsicDimension &&
+        stored.direction === input.direction &&
+        stored.rawValue === input.rawValue &&
+        stored.rawUnit === input.rawUnit &&
+        stored.aggregation === input.aggregation &&
+        stored.observedAt.toISOString() === input.observedAt.toISOString() &&
+        stored.observationInputHash === observationInputHash &&
+        Boolean(stored.normalizationInputHash);
+      if (!identical) {
+        throw new ConflictError(
+          'Metric observation identity already exists with different immutable inputs.',
+        );
+      }
+      return stored.id;
+    }
 
     const source = await client.query<{
       sourceId: string;
@@ -215,8 +261,7 @@ export async function recordEntityMetricObservation(
       (input.windowEnd.getTime() - input.windowStart.getTime()) / (24 * 60 * 60 * 1000);
     const comparisonValue =
       input.aggregation === 'total' ? input.rawValue / windowDays : input.rawValue;
-    const comparisonUnit =
-      input.aggregation === 'total' ? `${input.rawUnit}/day` : input.rawUnit;
+    const comparisonUnit = input.aggregation === 'total' ? `${input.rawUnit}/day` : input.rawUnit;
     const reference = await client.query<{
       id: string;
       rawValue: number;
@@ -253,6 +298,7 @@ export async function recordEntityMetricObservation(
       .toLocaleLowerCase('en-US')
       .replace(/\s+/g, '-')}`;
     const normalizationInput = {
+      observationInputHash,
       policyVersion: cohortMetricNormalizationPolicyV1,
       metricKey: input.metricKey,
       intrinsicDimension: input.intrinsicDimension,
@@ -322,6 +368,7 @@ export async function recordEntityMetricObservation(
           outlierClipped: normalization.outlierClipped,
           sourceReliabilityScore: sourceRow.reliabilityScore,
           sourceAuthorityClass: sourceRow.authorityClass ?? 'unknown',
+          observationInputHash,
           normalizationInputHash,
         }),
         normalizationInputHash,
@@ -396,6 +443,18 @@ export async function recordCorroboration(
          "sourceObservationId" uuid, "evidenceItemId" uuid, direction text
        )
        JOIN catalog.evidence_items evidence ON evidence.id = requested."evidenceItemId"
+       JOIN catalog.knowledge_entity_evidence_bindings entity_binding
+         ON entity_binding.knowledge_entity_id = $3
+        AND entity_binding.evidence_item_id = evidence.id
+        AND entity_binding.predicate = $4
+        AND entity_binding.applicability_scope = $5
+       JOIN LATERAL (
+         SELECT revision.id
+         FROM catalog.knowledge_entity_revisions revision
+         WHERE revision.entity_id = $3 AND revision.created_at <= $2
+         ORDER BY revision.revision DESC, revision.created_at DESC, revision.id DESC
+         LIMIT 1
+       ) applicable_revision ON applicable_revision.id = entity_binding.entity_revision_id
        JOIN catalog.source_observations observation
          ON observation.id = requested."sourceObservationId"
         AND observation.id = evidence.source_observation_id
@@ -408,11 +467,17 @@ export async function recordCorroboration(
          ORDER BY assessment.observed_at DESC, assessment.created_at DESC, assessment.id DESC
          LIMIT 1
        ) reliability ON true`,
-      [json(requested), input.observedAt],
+      [
+        json(requested),
+        input.observedAt,
+        input.knowledgeEntityId,
+        input.predicate,
+        input.applicabilityScope,
+      ],
     );
     if (bound.rows.length !== requested.length) {
       throw new DomainValidationError(
-        'Every corroboration item must bind an existing evidence item to its own source observation.',
+        'Every corroboration item must bind the exact entity revision, predicate, applicability scope, and source observation.',
       );
     }
     if (bound.rows.some((row) => !row.reliabilityAssessmentId)) {
@@ -429,10 +494,7 @@ export async function recordCorroboration(
       if (row.authorityClass === 'primary') return 'primary';
       if (row.authorityClass === 'official') return 'publisher';
       if (row.authorityClass === 'community') return 'community';
-      if (
-        row.authorityClass === 'independent' &&
-        row.evidenceIndependence === 'independent'
-      ) {
+      if (row.authorityClass === 'independent' && row.evidenceIndependence === 'independent') {
         return 'independent';
       }
       return 'aggregator';

@@ -7,6 +7,7 @@ export * from './gates.js';
 export * from './ids.js';
 export * from './jobs.js';
 export * from './query.js';
+export * from './research.js';
 export * from './retrieval.js';
 export * from './types.js';
 export * from './url.js';

@@ -12,9 +12,16 @@ import type {
 } from '../types.js';
 import { Badge, Empty, ErrorPanel, Loading, StateBadge } from '../ui.js';
 import { useWorkspaceProjects } from '../workspace-queries.js';
+import {
+  ResearchCitationList,
+  ResearchEvidenceList,
+  normalizeResearchEvidenceSynthesis,
+  type ResearchEvidenceCandidate,
+} from '../ResearchEvidenceList.js';
 
-const loadExplorerMap = () => import('../ExplorerMap.js');
-const ExplorerMap = lazy(async () => ({ default: (await loadExplorerMap()).ExplorerMap }));
+const ExplorerMap = lazy(async () => ({
+  default: (await import('../ExplorerMap.js')).ExplorerMap,
+}));
 
 interface ExplorerHistoryItem {
   id: string;
@@ -57,16 +64,10 @@ interface DiscoveryCandidate {
   reviewState: string;
   matchedTerms: string[];
   relevanceOrdinal: string;
-  matchScore: number;
-  matchBand: string | null;
-  matchReasons: string[];
-  matchPolicyVersion: string;
   signalDisplay: number;
   evidenceCoverage: number;
   displayState: string;
   signalExplanation: string;
-  rerankPosition: number;
-  sourceAdapters: string[];
 }
 
 interface DiscoveryOperation {
@@ -75,30 +76,37 @@ interface DiscoveryOperation {
   state: string;
   safeDetail: string;
   candidates: DiscoveryCandidate[];
-  candidateScope: 'query_session_fused';
-  researchRun: {
+}
+
+interface ResearchRun {
+  id: string;
+  mode: 'search' | 'corpus';
+  strategy: 'model' | 'deterministic_fallback';
+  state: string;
+  modelIdentifier: string | null;
+  stopReason: string | null;
+  safeDetail: string;
+  fallbackAvailable: boolean;
+  candidates: ResearchEvidenceCandidate[];
+  proposals: Array<{ proposalType: string; output: unknown }>;
+  operations: Array<{
     id: string;
-    state: 'first_pass' | 'second_pass' | 'complete' | 'stopped';
-    stopReason: string | null;
-  } | null;
-  researchOperations: Array<{
-    id: string;
-    adapterKey: string;
+    sourceKey: string;
     state: string;
-    passIndex: 1 | 2;
-    variantIndex: number;
+    resultCount: number;
+    safeDetail: string;
   }>;
 }
 
 interface SearchSession extends ExplorerSession {
   discoveryOperations: Array<{ id: string; adapterKey: string; state: string }>;
-}
-
-interface TaxonomyResponse {
-  facets: Array<{
-    key: string;
-    values: Array<{ stableKey: string; label: string; count: number }>;
-  }>;
+  researchRun: {
+    id: string;
+    mode: 'search' | 'corpus';
+    strategy: 'model' | 'deterministic_fallback';
+    state: string;
+    safeDetail: string;
+  } | null;
 }
 
 const resultSetPattern =
@@ -107,45 +115,6 @@ const resultPageSize = 10;
 
 function signalLabel(item: ExplorerResultItem): string {
   return item.signalDisplay === null ? 'Excluded' : `Signal ${item.signalDisplay}`;
-}
-
-function matchLabel(item: ExplorerResultItem): string {
-  return `${item.matchBand ?? label(item.relevanceOrdinal)} Match`;
-}
-
-function confidenceLabel(item: ExplorerResultItem): string {
-  const detail = item.evidenceConfidenceDetail;
-  if (detail) return `${detail.band} evidence confidence · ${detail.display}%`;
-  return `${formatFractionPercent(item.evidenceConfidence)} legacy evidence confidence`;
-}
-
-function sourceCoverage(item: ExplorerResultItem): number {
-  return item.evidenceConfidenceDetail?.coverage ?? item.evidenceCoverage;
-}
-
-function trendLabel(item: ExplorerResultItem): string {
-  return item.trendState ? label(item.trendState) : 'Trend unavailable';
-}
-
-function signalExplanation(item: ExplorerItemDetail): string {
-  const scored = item.valueInputs
-    .filter((input) => input.adjusted !== null)
-    .sort((left, right) => (right.adjusted ?? 0) - (left.adjusted ?? 0));
-  const strongest = scored.slice(0, 2).map((input) => label(input.key));
-  const gaps = [
-    ...new Set([
-      ...item.missing,
-      ...item.valueInputs.flatMap((input) => input.missing),
-      ...(item.evidenceConfidenceDetail?.limitations ?? []),
-    ]),
-  ];
-  const drivers = strongest.length
-    ? `${strongest.join(' and ')} are the strongest measured dimensions.`
-    : 'No measured dimension is strong enough to identify as a driver.';
-  const qualification = gaps.length
-    ? `The estimate is tempered by ${gaps.slice(0, 2).join(' ').trim()}`
-    : 'No additional policy-visible evidence gap was recorded.';
-  return `${item.signalBand ?? signalStateLabel(item.displayState)} is a query-independent, type-aware estimate. ${drivers} ${qualification}`;
 }
 
 function signalStateLabel(state: string): string {
@@ -174,32 +143,6 @@ function saveJson(filename: string, value: unknown): void {
   URL.revokeObjectURL(url);
 }
 
-function suggestedCapabilityKey(title: string): string {
-  return (
-    title
-      .normalize('NFKC')
-      .toLocaleLowerCase('en-US')
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-+|-+$/g, '')
-      .slice(0, 100) || 'reviewed-discovery'
-  );
-}
-
-function suggestedAdmissionType(candidate: DiscoveryCandidate): string {
-  if (candidate.adapterKey === 'github' || candidate.adapterKey === 'mcp_registry') {
-    const kind = candidate.kindHint === 'repository' ? 'oss_project' : candidate.kindHint;
-    return `implementation:${kind ?? 'other'}`;
-  }
-  if (candidate.kindHint === 'article') return 'document:article';
-  if (candidate.kindHint === 'paper' || candidate.kindHint === 'research') {
-    return 'document:research';
-  }
-  if (candidate.kindHint === 'specification' || candidate.kindHint === 'standard') {
-    return `document:${candidate.kindHint}`;
-  }
-  return 'document:resource';
-}
-
 export function ExplorePage() {
   const client = useQueryClient();
   const [parameters, setParameters] = useSearchParams();
@@ -211,8 +154,6 @@ export function ExplorePage() {
   const [view, setView] = useState<'list' | 'map'>('list');
   const [sort, setSort] = useState('recommended');
   const [kind, setKind] = useState('');
-  const [entityClass, setEntityClass] = useState('');
-  const [matchBand, setMatchBand] = useState('');
   const [evidenceState, setEvidenceState] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [compareIds, setCompareIds] = useState<string[]>([]);
@@ -220,6 +161,7 @@ export function ExplorePage() {
   const [projectContextId, setProjectContextId] = useState('');
   const [shortlistName, setShortlistName] = useState('Search shortlist');
   const [discoveryOperationIds, setDiscoveryOperationIds] = useState<string[]>([]);
+  const [researchRunId, setResearchRunId] = useState<string | null>(null);
   const [notice, setNotice] = useState('');
   const [additionalPage, setAdditionalPage] = useState<{
     viewKey: string;
@@ -237,30 +179,41 @@ export function ExplorePage() {
     queryKey: ['integrations'],
     queryFn: () => api<{ items: IntegrationStatus[] }>('/api/v1/integrations'),
   });
-  const taxonomy = useQuery({
-    queryKey: ['taxonomy-facets'],
-    queryFn: () => api<TaxonomyResponse>('/api/v1/taxonomy/facets'),
-  });
   const discoveryOperations = useQueries({
     queries: discoveryOperationIds.map((operationId) => ({
       queryKey: ['discovery-operation', operationId],
       queryFn: () => api<DiscoveryOperation>(`/api/v1/discovery/operations/${operationId}`),
       refetchInterval: (query: { state: { data?: DiscoveryOperation } }) =>
-        ['queued', 'running'].includes(query.state.data?.state ?? '') ||
-        ['first_pass', 'second_pass'].includes(query.state.data?.researchRun?.state ?? '')
-          ? 1_000
-          : false,
+        ['queued', 'running'].includes(query.state.data?.state ?? '') ? 1_000 : false,
     })),
+  });
+  const researchRun = useQuery({
+    queryKey: ['research-run', researchRunId],
+    enabled: Boolean(researchRunId),
+    queryFn: () => api<ResearchRun>(`/api/v1/research/runs/${researchRunId}`),
+    refetchInterval: (query: { state: { data?: ResearchRun } }) =>
+      ['queued', 'running'].includes(query.state.data?.state ?? '') ? 1_000 : false,
+  });
+  const runFallback = useMutation({
+    mutationFn: () => {
+      if (!researchRunId) throw new Error('No research run is available for fallback.');
+      return api<{ operations: Array<{ id: string }> }>(
+        `/api/v1/research/runs/${researchRunId}/fallback`,
+        { method: 'POST', body: JSON.stringify({}) },
+      );
+    },
+    onSuccess: ({ operations }) => {
+      setDiscoveryOperationIds(operations.map((operation) => operation.id));
+      setNotice('Deterministic connected-source fallback started against the frozen result set.');
+    },
   });
 
   const resultQuery = useMemo(() => {
     const query = new URLSearchParams({ limit: String(resultPageSize), sort });
     if (kind) query.set('kind', kind);
-    if (entityClass) query.set('entityClass', entityClass);
-    if (matchBand) query.set('matchBand', matchBand);
     if (evidenceState) query.set('evidenceState', evidenceState);
     return query.toString();
-  }, [entityClass, evidenceState, kind, matchBand, sort]);
+  }, [evidenceState, kind, sort]);
   const graphQueryString = useMemo(() => {
     const query = new URLSearchParams(resultQuery);
     query.set('limit', '100');
@@ -274,18 +227,6 @@ export function ExplorePage() {
     queryFn: () =>
       api<ExplorerResultPage>(`/api/v1/explorer/result-sets/${resultSetId}?${resultQuery}`),
   });
-  useEffect(() => {
-    if (!results.data || !resultSetId) return;
-    let cancelled = false;
-    const timer = window.setTimeout(() => {
-      if (cancelled) return;
-      void loadExplorerMap().then((module) => module.preloadExplorerMapRenderer());
-    }, 0);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
-  }, [resultSetId, results.data]);
   const graph = useQuery({
     queryKey: ['explorer-graph', resultSetId, graphQueryString],
     enabled: Boolean(resultSetId) && view === 'map',
@@ -338,16 +279,19 @@ export function ExplorePage() {
       setCompareIds([]);
       setComparison(null);
       setDiscoveryOperationIds(session.discoveryOperations.map((operation) => operation.id));
+      setResearchRunId(session.researchRun?.id ?? null);
       setClarification('');
       const activeOperationCount = session.discoveryOperations.filter((operation) =>
         ['queued', 'running'].includes(operation.state),
       ).length;
       setNotice(
-        activeOperationCount
-          ? `Live research is running across ${activeOperationCount} connected route${activeOperationCount === 1 ? '' : 's'}. ${session.counts.assessed} Corpus matches are ready for cross-checking.`
-          : session.discoveryOperations.length
-            ? `The live source plan was recorded, but no connected request was queued. ${session.counts.assessed} Corpus matches are available.`
-            : `No connected source is enabled. ${session.counts.assessed} Corpus matches are available.`,
+        session.researchRun?.state === 'queued'
+          ? `${session.counts.assessed} indexed results are ready. Model-led live research is running.`
+          : activeOperationCount
+            ? `${session.counts.assessed} indexed results are ready. ${activeOperationCount} connected source search${activeOperationCount === 1 ? ' is' : 'es are'} running.`
+            : session.discoveryOperations.length
+              ? `${session.counts.assessed} indexed results are ready. The source plan was recorded; no connected source request was queued.`
+              : `${session.counts.assessed} indexed results are ready. No connected source is enabled.`,
       );
       void client.invalidateQueries({ queryKey: ['explorer-history'] });
     },
@@ -436,37 +380,6 @@ export function ExplorePage() {
       void client.invalidateQueries({ queryKey: ['watches'] });
     },
   });
-  const admitLead = useMutation({
-    mutationFn: (input: {
-      candidateId: string;
-      body: {
-        entityClass: 'implementation' | 'document';
-        kind: string;
-        title: string;
-        summary: string;
-        publisher: string;
-        capabilityKey: string;
-        capabilityName: string;
-        searchTerms: string[];
-        limitations: string[];
-        reviewState: 'proposed' | 'reviewed';
-        rationale: string;
-      };
-    }) =>
-      api<{ candidateId: string; providerId: string | null; documentId: string | null }>(
-        `/api/v1/discovery/candidates/${input.candidateId}/admit`,
-        { method: 'POST', body: JSON.stringify(input.body) },
-      ),
-    onSuccess: (_, input) => {
-      setNotice('The reviewed lead was added to Corpus as durable indexed knowledge.');
-      void client.invalidateQueries({ queryKey: ['discovery-operation'] });
-      void client.invalidateQueries({ queryKey: ['corpus'] });
-      setDiscoveryOperationIds((ids) => [...ids]);
-      document
-        .querySelector<HTMLDetailsElement>(`#admit-${CSS.escape(input.candidateId)}`)
-        ?.removeAttribute('open');
-    },
-  });
 
   const inspect = useCallback((id: string) => {
     detailTrigger.current =
@@ -491,6 +404,7 @@ export function ExplorePage() {
   useEffect(() => {
     if (!results.data) return;
     setDiscoveryOperationIds(results.data.discoveryOperations.map((operation) => operation.id));
+    setResearchRunId(results.data.researchRun?.id ?? null);
   }, [results.data]);
   const interpretation = results.data?.resultSet.interpretation;
   const additionalItems = additionalPage?.viewKey === resultViewKey ? additionalPage.items : [];
@@ -510,20 +424,11 @@ export function ExplorePage() {
     refresh.error,
     redact.error,
     ...discoveryOperations.map((operation) => operation.error),
+    researchRun.error,
+    runFallback.error,
     watch.error,
     loadMore.error,
-    taxonomy.error,
-    admitLead.error,
   ].filter(Boolean);
-  const entityClassOptions =
-    taxonomy.data?.facets
-      .find((facet) => facet.key === 'entity_class')
-      ?.values.filter((value) => value.count > 0)
-      .map((value) => ({
-        value: value.stableKey.replace(/^entity-class:/, ''),
-        label: value.label,
-        count: value.count,
-      })) ?? [];
   const discoveryIntegrations =
     integrations.data?.items.filter(
       (integration) => integration.sourceClass !== 'local_semantic',
@@ -531,46 +436,29 @@ export function ExplorePage() {
   const enabledDiscoveryCount = discoveryIntegrations.filter(
     (integration) => integration.enabled,
   ).length;
-  const connectedSnapshot = discoveryOperations
-    .map((operation) => operation.data)
-    .filter((operation): operation is DiscoveryOperation => Boolean(operation))
-    .sort(
-      (left, right) =>
-        right.candidates.length - left.candidates.length ||
-        Number(right.researchRun?.state === 'complete') -
-          Number(left.researchRun?.state === 'complete'),
-    )[0];
-  const connectedCandidates = connectedSnapshot?.candidates ?? [];
-  const connectedRouteStatuses =
-    connectedSnapshot?.researchOperations ??
-    discoveryOperations.flatMap((operation) =>
-      operation.data
-        ? [
-            {
-              id: operation.data.id,
-              adapterKey: operation.data.adapterKey,
-              state: operation.data.state,
-              passIndex: 1 as const,
-              variantIndex: 1,
-            },
-          ]
-        : [],
-    );
+  const connectedCandidatesByUri = new Map<string, DiscoveryCandidate>();
+  for (const candidate of discoveryOperations.flatMap(
+    (operation) => operation.data?.candidates ?? [],
+  )) {
+    const current = connectedCandidatesByUri.get(candidate.canonicalUri);
+    if (!current || candidate.signalDisplay > current.signalDisplay) {
+      connectedCandidatesByUri.set(candidate.canonicalUri, candidate);
+    }
+  }
+  const connectedCandidates = [...connectedCandidatesByUri.values()].sort(
+    (left, right) =>
+      right.signalDisplay - left.signalDisplay || left.title.localeCompare(right.title),
+  );
   const connectedSearchesPending = discoveryOperations.some(
     (operation) =>
-      operation.isPending ||
-      ['queued', 'running'].includes(operation.data?.state ?? '') ||
-      ['first_pass', 'second_pass'].includes(operation.data?.researchRun?.state ?? ''),
+      operation.isPending || ['queued', 'running'].includes(operation.data?.state ?? ''),
   );
-  const detailMissing = detail.data
-    ? [
-        ...new Set([
-          ...detail.data.missing,
-          ...detail.data.valueInputs.flatMap((input) => input.missing),
-          ...(detail.data.evidenceConfidenceDetail?.limitations ?? []),
-        ]),
-      ]
-    : [];
+  const researchSynthesis = normalizeResearchEvidenceSynthesis(
+    researchRun.data?.proposals.find((proposal) => proposal.proposalType === 'synthesis')?.output,
+  );
+  const researchCandidates = new Map(
+    (researchRun.data?.candidates ?? []).map((candidate) => [candidate.id, candidate]),
+  );
 
   function toggleComparison(id: string): void {
     setComparison(null);
@@ -589,12 +477,11 @@ export function ExplorePage() {
         className={`explorer-hero${results.data ? ' populated' : ''}`}
         aria-labelledby="explorer-heading"
       >
-        <p className="eyebrow">Technology search</p>
-        <h1 id="explorer-heading">Find existing tools for what you need</h1>
+        <p className="eyebrow">Evidence-backed research</p>
+        <h1 id="explorer-heading">Find what exists for what you need</h1>
         <p>
-          Describe what you need. Search researches every source you have enabled now, then
-          cross-checks the durable Corpus with the same Match method. Signal, confidence, and
-          evidence remain separate from query relevance.
+          Describe what you need. Maestro searches admitted knowledge and enabled public sources,
+          preserves source outcomes, and keeps evidence quality separate from project fit.
         </p>
         <form
           className="explorer-query"
@@ -627,7 +514,7 @@ export function ExplorePage() {
         </form>
         <div className="privacy-line">
           <span>Local index available offline</span>
-          <span>Match answers the query; Signal describes the entity</span>
+          <span>Evidence state, query ranking, and project fit stay separate</span>
           <span>
             {enabledDiscoveryCount
               ? `${enabledDiscoveryCount} connected source${enabledDiscoveryCount === 1 ? '' : 's'} enabled`
@@ -776,8 +663,7 @@ export function ExplorePage() {
             {results.data.resultSet.projectContextId ? (
               <p className="authority-note">
                 Project fit is unknown and blocked until provider-specific gates and preferences are
-                assessed. This context is bound to the snapshot but alters neither Match nor
-                intrinsic Signal.
+                assessed. This context is bound to the snapshot but does not alter the query signal.
               </p>
             ) : null}
             <form
@@ -815,68 +701,177 @@ export function ExplorePage() {
             </form>
           </details>
 
-          <section className="source-results live-search-results" aria-labelledby="live-results-heading">
-            <div className="live-results-heading">
-              <div>
-                <p className="eyebrow">Live research</p>
-                <h2 id="live-results-heading">Live results</h2>
-              </div>
-              <span>
-                {connectedCandidates.length} lead{connectedCandidates.length === 1 ? '' : 's'} ·{' '}
-                {connectedSearchesPending ? 'research in progress' : 'research stopped'}
-              </span>
-            </div>
-            <div className="source-results-body">
-              <p className="hint">
-                These are the primary results of this live query. They use the same Match pipeline
-                as Corpus; their preliminary Signal is source metadata, not yet evidence-backed
-                Corpus knowledge.
-              </p>
-              {discoveryOperationIds.length ? (
-                <>
-                  <details className="live-route-status">
-                    <summary>
-                      Research route status ({connectedRouteStatuses.length})
-                    </summary>
-                    <div className="source-status-row" aria-live="polite">
-                      {connectedRouteStatuses.map((operation) => (
-                        <span key={operation.id}>
-                          <strong>
-                            {label(operation.adapterKey)} · pass {operation.passIndex}
-                          </strong>
-                          <StateBadge state={operation.state} />
+          {researchRun.data?.strategy === 'model' ? (
+            <details className="source-results" open>
+              <summary>
+                <div>
+                  <p className="eyebrow">Model-led live research</p>
+                  <strong>Planned, refined, and evidence-bound results</strong>
+                </div>
+                <StateBadge state={researchRun.data.state} />
+              </summary>
+              <div className="source-results-body">
+                <p className="hint">{researchRun.data.safeDetail}</p>
+                {researchRun.data.operations.length ? (
+                  <div className="source-status-row" aria-label="Model-led source outcomes">
+                    {researchRun.data.operations.map((operation) => (
+                      <span key={operation.id} title={operation.safeDetail}>
+                        <strong>{label(operation.sourceKey)}</strong>
+                        <StateBadge state={operation.state} />
+                        <small>{operation.resultCount} stored</small>
+                      </span>
+                    ))}
+                  </div>
+                ) : null}
+                {researchSynthesis ? (
+                  <>
+                    <div className="section-heading">
+                      <div>
+                        <h2>
+                          Research synthesis · {label(researchSynthesis.contextAssessment)} context
+                        </h2>
+                        <p>{researchSynthesis.summary}</p>
+                      </div>
+                      <p className="hint">
+                        {researchRun.data.modelIdentifier
+                          ? `Proposed by ${researchRun.data.modelIdentifier}; constrained and validated by the host.`
+                          : 'Model output was constrained and validated by the host.'}
+                      </p>
+                    </div>
+                    <ResearchCitationList
+                      candidates={researchCandidates}
+                      citationCandidateIds={researchSynthesis.summaryCitationCandidateIds}
+                      labelText="Summary evidence"
+                    />
+                    {researchSynthesis.protocolVersion === 'research-protocol-v1' ? (
+                      <p className="hint">
+                        Historical v1 synthesis replayed with its original evidence citations.
+                      </p>
+                    ) : null}
+                    {researchSynthesis.abstentionReason ? (
+                      <p className="authority-note">
+                        Abstained: {researchSynthesis.abstentionReason}
+                      </p>
+                    ) : null}
+                    <div className="chip-row" aria-label="Research groups">
+                      {researchSynthesis.groups.map((group) => (
+                        <span
+                          className="facet-chip explicit"
+                          key={group.label}
+                          title={group.description}
+                        >
+                          {group.label} ({group.candidateIds.length})
                         </span>
                       ))}
                     </div>
-                  </details>
-                  {connectedCandidates.length ? (
-                    <div className="source-result-list">
-                      {connectedCandidates.map((candidate) => (
-                        <article className="source-result-row" key={candidate.id}>
-                          <div className="result-identity">
-                            <div className="card-topline">
-                              <Badge>{label(candidate.kindHint ?? 'source result')}</Badge>
-                              <Badge>{signalStateLabel(candidate.displayState)}</Badge>
+                    <ResearchEvidenceList
+                      candidates={researchCandidates}
+                      items={researchSynthesis.items}
+                      selectionLabel="Model selected"
+                    />
+                    {researchSynthesis.limitations.length ? (
+                      <p className="hint">Limits: {researchSynthesis.limitations.join(' ')}</p>
+                    ) : null}
+                  </>
+                ) : ['queued', 'running'].includes(researchRun.data.state) ? (
+                  <Loading message="Researching enabled sources and checking evidence gaps…" />
+                ) : (
+                  <>
+                    <p className="source-empty">
+                      No validated synthesis was produced. Acquired leads below are unselected
+                      evidence, not model conclusions.
+                    </p>
+                    {researchRun.data.candidates.length ? (
+                      <div className="source-result-list">
+                        {researchRun.data.candidates.map((candidate) => (
+                          <article className="source-result-row" key={candidate.id}>
+                            <div className="result-identity">
+                              <Badge>{label(candidate.sourceKey)}</Badge>
+                              <h3>{candidate.title}</h3>
+                              <p>{candidate.summary}</p>
                             </div>
-                            <h3>{candidate.title}</h3>
-                            <p>{candidate.summary}</p>
-                          </div>
-                          <div className="query-signal live-lead-score">
-                            <strong>Lead score {candidate.signalDisplay}</strong>
-                            <span>
-                              {candidate.matchBand ?? label(candidate.relevanceOrdinal)} Match ·{' '}
-                              {signalStateLabel(candidate.displayState)}
-                            </span>
-                            <small>
-                              {formatFractionPercent(candidate.evidenceCoverage)} metadata coverage
-                            </small>
-                            {candidate.sourceAdapters.length > 1 ? (
+                            <a
+                              className="button secondary compact"
+                              href={candidate.canonicalUri}
+                              rel="noreferrer"
+                              target="_blank"
+                            >
+                              Open acquired lead
+                            </a>
+                          </article>
+                        ))}
+                      </div>
+                    ) : null}
+                    {researchRun.data.fallbackAvailable ? (
+                      <button
+                        className="button secondary compact"
+                        disabled={runFallback.isPending}
+                        onClick={() => runFallback.mutate()}
+                        type="button"
+                      >
+                        {runFallback.isPending
+                          ? 'Starting deterministic fallback…'
+                          : 'Run deterministic fallback'}
+                      </button>
+                    ) : null}
+                  </>
+                )}
+              </div>
+            </details>
+          ) : null}
+
+          {researchRun.data?.strategy !== 'model' || discoveryOperationIds.length > 0 ? (
+            <details className="source-results" open={researchRun.data?.state === 'budget_denied'}>
+              <summary>
+                <div>
+                  <p className="eyebrow">Connected sources</p>
+                  <strong>Source plan and live leads</strong>
+                </div>
+                <span>{discoveryOperationIds.length} planned route states</span>
+              </summary>
+              <div className="source-results-body">
+                {researchRun.data?.strategy === 'deterministic_fallback' ? (
+                  <p className="authority-note">{researchRun.data.safeDetail}</p>
+                ) : null}
+                <p className="hint">
+                  These leads use the preserved Phase 07 query-ranking estimate; evidence quality
+                  and Corpus admission remain separate.
+                </p>
+                {discoveryOperationIds.length ? (
+                  <>
+                    <div className="source-status-row" aria-live="polite">
+                      {discoveryOperations.map((operation, index) => (
+                        <span key={discoveryOperationIds[index]}>
+                          <strong>
+                            {label(operation.data?.adapterKey ?? `source ${index + 1}`)}
+                          </strong>
+                          <StateBadge state={operation.data?.state ?? 'running'} />
+                        </span>
+                      ))}
+                    </div>
+                    {connectedCandidates.length ? (
+                      <div className="source-result-list">
+                        {connectedCandidates.map((candidate) => (
+                          <article className="source-result-row" key={candidate.id}>
+                            <div className="result-identity">
+                              <div className="card-topline">
+                                <Badge>{label(candidate.kindHint ?? 'source result')}</Badge>
+                                <Badge>{signalStateLabel(candidate.displayState)}</Badge>
+                              </div>
+                              <h3>{candidate.title}</h3>
+                              <p>{candidate.summary}</p>
+                            </div>
+                            <div className="query-signal">
+                              <strong>Legacy query estimate {candidate.signalDisplay}</strong>
+                              <span>
+                                {label(candidate.relevanceOrdinal)} relevance ·{' '}
+                                {signalStateLabel(candidate.displayState)}
+                              </span>
                               <small>
-                                Found through {candidate.sourceAdapters.map(label).join(', ')}
+                                {formatFractionPercent(candidate.evidenceCoverage)} evidence
+                                coverage
                               </small>
-                            ) : null}
-                          </div>
-                          <div className="source-result-actions">
+                            </div>
                             <a
                               className="button secondary compact"
                               href={candidate.canonicalUri}
@@ -885,184 +880,32 @@ export function ExplorePage() {
                             >
                               Open source
                             </a>
-                            <details id={`admit-${candidate.id}`} className="lead-admission">
-                              <summary>Review and add to Corpus</summary>
-                              <form
-                                onSubmit={(event) => {
-                                  event.preventDefault();
-                                  const data = new FormData(event.currentTarget);
-                                  const searchTerms = String(data.get('searchTerms') ?? '')
-                                    .split(',')
-                                    .map((term) => term.trim())
-                                    .filter(Boolean);
-                                  const limitations = String(data.get('limitations') ?? '')
-                                    .split('\n')
-                                    .map((item) => item.trim())
-                                    .filter(Boolean);
-                                  const [entityClass, kind] = String(
-                                    data.get('admissionType') ?? 'document:resource',
-                                  ).split(':', 2) as ['implementation' | 'document', string];
-                                  admitLead.mutate({
-                                    candidateId: candidate.id,
-                                    body: {
-                                      entityClass,
-                                      kind,
-                                      title: String(data.get('title') ?? ''),
-                                      summary: String(data.get('summary') ?? ''),
-                                      publisher: String(data.get('publisher') ?? ''),
-                                      capabilityKey: String(data.get('capabilityKey') ?? ''),
-                                      capabilityName: String(data.get('capabilityName') ?? ''),
-                                      searchTerms,
-                                      limitations,
-                                      reviewState:
-                                        data.get('reviewState') === 'reviewed'
-                                          ? 'reviewed'
-                                          : 'proposed',
-                                      rationale: String(data.get('rationale') ?? ''),
-                                    },
-                                  });
-                                }}
-                              >
-                                <label>
-                                  Corpus record type
-                                  <select
-                                    defaultValue={suggestedAdmissionType(candidate)}
-                                    name="admissionType"
-                                  >
-                                    <optgroup label="Implementations">
-                                      <option value="implementation:oss_project">
-                                        Open-source project
-                                      </option>
-                                      <option value="implementation:service">Service</option>
-                                      <option value="implementation:api">API</option>
-                                      <option value="implementation:mcp_server">MCP server</option>
-                                      <option value="implementation:plugin">Plugin</option>
-                                      <option value="implementation:model">Model</option>
-                                      <option value="implementation:framework">Framework</option>
-                                      <option value="implementation:library">Library</option>
-                                      <option value="implementation:language">Language</option>
-                                      <option value="implementation:other">
-                                        Other implementation
-                                      </option>
-                                    </optgroup>
-                                    <optgroup label="Documents and knowledge">
-                                      <option value="document:article">Article</option>
-                                      <option value="document:research">Research</option>
-                                      <option value="document:resource">Resource or discussion</option>
-                                      <option value="document:specification">Specification</option>
-                                      <option value="document:standard">Standard</option>
-                                    </optgroup>
-                                  </select>
-                                </label>
-                                <label>
-                                  Corpus title
-                                  <input
-                                    defaultValue={candidate.title}
-                                    maxLength={500}
-                                    name="title"
-                                    required
-                                  />
-                                </label>
-                                <label>
-                                  Summary
-                                  <textarea
-                                    defaultValue={candidate.summary}
-                                    maxLength={2000}
-                                    name="summary"
-                                    required
-                                    rows={3}
-                                  />
-                                </label>
-                                <label>
-                                  Publisher or source owner
-                                  <input
-                                    defaultValue={new URL(candidate.canonicalUri).hostname}
-                                    maxLength={240}
-                                    name="publisher"
-                                    required
-                                  />
-                                </label>
-                                <label>
-                                  Capability name
-                                  <input
-                                    defaultValue={candidate.title}
-                                    maxLength={240}
-                                    name="capabilityName"
-                                    required
-                                  />
-                                </label>
-                                <label>
-                                  Stable capability key
-                                  <input
-                                    defaultValue={suggestedCapabilityKey(candidate.title)}
-                                    maxLength={120}
-                                    name="capabilityKey"
-                                    required
-                                  />
-                                </label>
-                                <label>
-                                  Search terms, comma separated
-                                  <input
-                                    defaultValue={candidate.matchedTerms.join(', ')}
-                                    name="searchTerms"
-                                    required
-                                  />
-                                </label>
-                                <label>
-                                  Known limitations, one per line
-                                  <textarea name="limitations" rows={2} />
-                                </label>
-                                <label>
-                                  Review state
-                                  <select defaultValue="proposed" name="reviewState">
-                                    <option value="proposed">Proposed — needs deeper review</option>
-                                    <option value="reviewed">Reviewed — evidence checked</option>
-                                  </select>
-                                </label>
-                                <label>
-                                  Admission rationale
-                                  <textarea
-                                    maxLength={2000}
-                                    name="rationale"
-                                    required
-                                    rows={3}
-                                  />
-                                </label>
-                                <button
-                                  className="button primary compact"
-                                  disabled={admitLead.isPending}
-                                  type="submit"
-                                >
-                                  {admitLead.isPending ? 'Adding…' : 'Add reviewed lead'}
-                                </button>
-                              </form>
-                            </details>
-                          </div>
-                        </article>
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="hint">
-                      {connectedSearchesPending
-                        ? 'Connected source searches are still running.'
-                        : 'No live leads were returned. Route states above preserve skipped, unsupported, disabled, failed, and empty outcomes.'}
-                    </p>
-                  )}
-                </>
-              ) : (
-                <p className="source-empty">
-                  No connected source is enabled. The local index still works without network
-                  access. <Link to="/workspace#integrations">Configure sources</Link>
-                </p>
-              )}
-            </div>
-          </section>
+                          </article>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="hint">
+                        {connectedSearchesPending
+                          ? 'Connected source searches are still running.'
+                          : 'No live leads were returned. Route states above preserve skipped, unsupported, disabled, failed, and empty outcomes.'}
+                      </p>
+                    )}
+                  </>
+                ) : (
+                  <p className="source-empty">
+                    No connected source is enabled. The local index still works without network
+                    access. <Link to="/workspace#integrations">Configure sources</Link>
+                  </p>
+                )}
+              </div>
+            </details>
+          ) : null}
 
           <section className="explorer-workbench" aria-labelledby="results-heading">
             <div className="workbench-toolbar">
               <div>
-                <p className="eyebrow">Corpus cross-check</p>
-                <h2 id="results-heading">Indexed Corpus matches</h2>
+                <p className="eyebrow">Local index</p>
+                <h2 id="results-heading">Results</h2>
               </div>
               <div className="segmented" aria-label="Result view">
                 <button
@@ -1086,8 +929,8 @@ export function ExplorePage() {
                 <span>Top result</span>
                 <strong>{visibleItems[0].name}</strong>
                 <small>
-                  {matchLabel(visibleItems[0])} · {signalLabel(visibleItems[0])} ·{' '}
-                  {confidenceLabel(visibleItems[0])}
+                  {label(visibleItems[0].relevanceOrdinal)} match · {signalLabel(visibleItems[0])} ·{' '}
+                  {formatFractionPercent(visibleItems[0].evidenceCoverage)} evidence coverage
                 </small>
               </button>
             ) : null}
@@ -1096,9 +939,10 @@ export function ExplorePage() {
                 Sort
                 <select value={sort} onChange={(event) => setSort(event.target.value)}>
                   <option value="recommended">Recommended</option>
-                  <option value="match">Match</option>
-                  <option value="signal">Signal</option>
-                  <option value="evidence">Evidence confidence</option>
+                  <option value="signal">Query signal</option>
+                  <option value="relevance">Relevance</option>
+                  <option value="evidence">Evidence coverage</option>
+                  <option value="maintenance">Conservative value</option>
                   <option value="name">Name</option>
                 </select>
               </label>
@@ -1114,31 +958,7 @@ export function ExplorePage() {
                 </select>
               </label>
               <label>
-                Entity class
-                <select
-                  value={entityClass}
-                  onChange={(event) => setEntityClass(event.target.value)}
-                >
-                  <option value="">All classes</option>
-                  {entityClassOptions.map((option) => (
-                    <option key={option.value} value={option.value}>
-                      {option.label} ({option.count})
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                Match
-                <select value={matchBand} onChange={(event) => setMatchBand(event.target.value)}>
-                  <option value="">All bands</option>
-                  <option value="Direct">Direct</option>
-                  <option value="Strong">Strong</option>
-                  <option value="Related">Related</option>
-                  <option value="Peripheral">Peripheral</option>
-                </select>
-              </label>
-              <label>
-                Signal state
+                Evidence state
                 <select
                   value={evidenceState}
                   onChange={(event) => setEvidenceState(event.target.value)}
@@ -1185,8 +1005,8 @@ export function ExplorePage() {
                     </label>
                     <div className="result-identity">
                       <div className="card-topline">
-                        <Badge>{label(item.entityClass)}</Badge>
                         <Badge>{label(item.kind)}</Badge>
+                        <Badge>{signalStateLabel(item.displayState)}</Badge>
                       </div>
                       <h3>{item.name}</h3>
                       <p>{item.description}</p>
@@ -1199,7 +1019,7 @@ export function ExplorePage() {
                       </div>
                     </div>
                     <div className="result-reason">
-                      <strong>{matchLabel(item)}</strong>
+                      <strong>{label(item.relevanceOrdinal)} match</strong>
                       <p>{item.explanation}</p>
                       {primaryCaveat(item) ? (
                         <small>Limitation: {primaryCaveat(item)}</small>
@@ -1207,12 +1027,10 @@ export function ExplorePage() {
                     </div>
                     <div className="query-signal">
                       <strong>{signalLabel(item)}</strong>
-                      <span>
-                        {item.signalBand ?? signalStateLabel(item.displayState)} ·{' '}
-                        {trendLabel(item)}
-                      </span>
-                      <small>{confidenceLabel(item)}</small>
-                      <small>{formatFractionPercent(sourceCoverage(item))} source coverage</small>
+                      <span>{signalStateLabel(item.displayState)}</span>
+                      <small>
+                        {formatFractionPercent(item.evidenceCoverage)} evidence coverage
+                      </small>
                     </div>
                     <button
                       className="button secondary compact"
@@ -1317,61 +1135,27 @@ export function ExplorePage() {
                   </thead>
                   <tbody>
                     <tr>
-                      <th>Entity class</th>
-                      {comparison.items.map((item) => (
-                        <td key={item.id}>{label(item.entityClass)}</td>
-                      ))}
-                    </tr>
-                    <tr>
-                      <th>Subtype</th>
+                      <th>Kind</th>
                       {comparison.items.map((item) => (
                         <td key={item.id}>{label(item.kind)}</td>
                       ))}
                     </tr>
                     <tr>
-                      <th>Match</th>
+                      <th>Relevance</th>
                       {comparison.items.map((item) => (
-                        <td key={item.id}>{matchLabel(item)}</td>
+                        <td key={item.id}>{label(item.relevanceOrdinal)}</td>
                       ))}
                     </tr>
                     <tr>
                       <th>Signal</th>
                       {comparison.items.map((item) => (
-                        <td key={item.id}>
-                          {signalLabel(item)} ·{' '}
-                          {item.signalBand ?? signalStateLabel(item.displayState)}
-                        </td>
+                        <td key={item.id}>{signalLabel(item)}</td>
                       ))}
                     </tr>
                     <tr>
-                      <th>Evidence confidence</th>
+                      <th>Coverage</th>
                       {comparison.items.map((item) => (
-                        <td key={item.id}>{confidenceLabel(item)}</td>
-                      ))}
-                    </tr>
-                    <tr>
-                      <th>Trend</th>
-                      {comparison.items.map((item) => (
-                        <td key={item.id}>{trendLabel(item)}</td>
-                      ))}
-                    </tr>
-                    <tr>
-                      <th>Source coverage</th>
-                      {comparison.items.map((item) => (
-                        <td key={item.id}>{formatFractionPercent(sourceCoverage(item))}</td>
-                      ))}
-                    </tr>
-                    <tr>
-                      <th>Relationships</th>
-                      {comparison.items.map((item) => (
-                        <td key={item.id}>
-                          {item.relations
-                            .map(
-                              (relation) =>
-                                `${label(relation.type)} ${relation.targetName ?? relation.targetCapabilityName ?? ''}`,
-                            )
-                            .join('; ') || 'None recorded'}
-                        </td>
+                        <td key={item.id}>{formatFractionPercent(item.evidenceCoverage)}</td>
                       ))}
                     </tr>
                     <tr>
@@ -1447,23 +1231,11 @@ export function ExplorePage() {
             </button>
           </div>
           <p id="detail-summary">{detail.data.description}</p>
-          <div className="chip-row detail-facets" aria-label="Entity facets">
-            <span className="facet-chip explicit">Class: {label(detail.data.entityClass)}</span>
-            <span className="facet-chip">Subtype: {label(detail.data.kind)}</span>
-            <span className="facet-chip">Group: {detail.data.capabilityGroup}</span>
-            {detail.data.capabilities.slice(0, 5).map((capability) => (
-              <span className="facet-chip" key={capability}>
-                {label(capability)}
-              </span>
-            ))}
-          </div>
           <div className="signal-callout">
             <strong>{signalLabel(detail.data)}</strong>
             <span>
-              {detail.data.signalBand ?? signalStateLabel(detail.data.displayState)} ·{' '}
-              {confidenceLabel(detail.data)}
+              {detail.data.policyVersion} · {label(detail.data.relevanceOrdinal)} relevance
             </span>
-            <small>{trendLabel(detail.data)} · query-independent intrinsic estimate</small>
           </div>
           {detail.data.providerId ? (
             <button
@@ -1484,44 +1256,9 @@ export function ExplorePage() {
               Open document source
             </a>
           ) : null}
-          <h3>Why it matched</h3>
-          <p>
-            <strong>{matchLabel(detail.data)}</strong> · {detail.data.explanation}
-          </p>
-          <div className="chip-row detail-facets" aria-label="Match path">
-            {detail.data.matchedConcepts.map((concept) => (
-              <span className="facet-chip inferred" key={concept.id}>
-                {label(concept.facetKey)}: {concept.label}
-              </span>
-            ))}
-            {detail.data.matchedFields.map((field) => (
-              <span className="facet-chip" key={field}>
-                {label(field)} field
-              </span>
-            ))}
-          </div>
-          <h3>Why Signal is high or low</h3>
-          <p>{signalExplanation(detail.data)}</p>
-          <div className="signal-facts">
-            <div>
-              <strong>Evidence confidence</strong>
-              <span>{confidenceLabel(detail.data)}</span>
-            </div>
-            <div>
-              <strong>Source coverage</strong>
-              <span>{formatFractionPercent(sourceCoverage(detail.data))}</span>
-            </div>
-            <div>
-              <strong>Trend</strong>
-              <span>{trendLabel(detail.data)}</span>
-              <small>{detail.data.trend?.reasons.join(' ') || 'No comparable history yet.'}</small>
-            </div>
-          </div>
+          <h3>Why it appears</h3>
+          <p>{detail.data.explanation}</p>
           <h3>Signal calculation</h3>
-          <p className="muted">
-            {detail.data.policyVersion}. Values are normalized within a type profile; Match is not
-            an input.
-          </p>
           <div className="input-grid">
             {detail.data.valueInputs.map((input) => (
               <div key={input.key}>
@@ -1535,21 +1272,10 @@ export function ExplorePage() {
                   confidence {formatFractionPercent(input.confidence)} · coverage{' '}
                   {formatFractionPercent(input.coverage)} · prior {input.prior}
                 </small>
-                {input.reasons.length ? <small>{input.reasons.join(' ')}</small> : null}
-                {input.missing.length ? (
-                  <small className="missing-text">Missing: {input.missing.join('; ')}</small>
-                ) : null}
               </div>
             ))}
           </div>
           <h3>Sources and evidence</h3>
-          <p className="muted">
-            {detail.data.evidence.length} bound evidence item
-            {detail.data.evidence.length === 1 ? '' : 's'} across{' '}
-            {detail.data.evidenceConfidenceDetail?.sourceGroupIds.length ?? 0} declared source group
-            {(detail.data.evidenceConfidenceDetail?.sourceGroupIds.length ?? 0) === 1 ? '' : 's'}.
-            Coverage does not imply independent corroboration.
-          </p>
           {detail.data.evidence.length ? (
             detail.data.evidence.map((item) => (
               <article className="evidence-mini" key={`${item.id}:${item.dimensionKey}`}>
@@ -1570,37 +1296,6 @@ export function ExplorePage() {
             <p className="muted">
               No evidence item is bound. The estimate uses declared priors and the policy's
               uncertainty deduction.
-            </p>
-          )}
-          <h3>Relationships</h3>
-          {detail.data.relations.length ? (
-            <ul className="relationship-list">
-              {detail.data.relations.map((relation, index) => (
-                <li
-                  key={`${relation.type}:${relation.targetProviderId ?? relation.targetCapabilityId ?? index}`}
-                >
-                  <strong>{label(relation.type)}</strong>{' '}
-                  {relation.targetName ?? relation.targetCapabilityName ?? 'Related entity'}
-                  <span>
-                    {relation.scope ?? relation.rationale ?? 'No narrower scope recorded.'} ·{' '}
-                    {label(relation.status)}
-                  </span>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <p className="muted">No evidence-bearing relationship is recorded for this snapshot.</p>
-          )}
-          <h3>Missing evidence and limits</h3>
-          {detailMissing.length ? (
-            <ul className="missing-evidence-list">
-              {detailMissing.map((missing) => (
-                <li key={missing}>{missing}</li>
-              ))}
-            </ul>
-          ) : (
-            <p className="muted">
-              No policy-visible gap is recorded; this is not a claim of complete market knowledge.
             </p>
           )}
           <p className="drawer-hash">
@@ -1650,8 +1345,8 @@ export function ExplorePage() {
           </div>
           <div>
             <span>2</span>
-            <strong>Review Match and Signal</strong>
-            <p>See why it matched, intrinsic strength, confidence, trend, and missing evidence.</p>
+            <strong>Review the signal</strong>
+            <p>See relevance, confidence, evidence, and missing information.</p>
           </div>
           <div>
             <span>3</span>

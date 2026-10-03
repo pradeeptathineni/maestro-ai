@@ -7,7 +7,7 @@ import {
   createPool,
   databaseUrl,
   recoverDueWatches,
-  recoverStaleDiscoveryOperations,
+  recoverStaleResearchRuns,
 } from '../../../packages/db/src/index.js';
 import { dispatchOutbox } from './outbox.js';
 import { createTaskList } from './tasks.js';
@@ -46,14 +46,13 @@ const dispatch = async (): Promise<void> => {
 };
 const recoverSchedules = async (): Promise<void> => {
   if (stopping) return;
-  await Promise.all([
-    recoverDueWatches(pool),
-    recoverStaleDiscoveryOperations(pool),
-  ]).catch((error: unknown) => {
-    process.stderr.write(
-      `Recovery failed: ${error instanceof Error ? error.message : String(error)}\n`,
-    );
-  });
+  await Promise.all([recoverDueWatches(pool), recoverStaleResearchRuns(pool)]).catch(
+    (error: unknown) => {
+      process.stderr.write(
+        `Recovery failed: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+    },
+  );
 };
 await recoverSchedules();
 await dispatch();

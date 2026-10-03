@@ -90,10 +90,7 @@ export function assessCorroboration(evidence: CorroborationEvidence[]): Corrobor
   );
   const independentGroups = new Set(
     supporting
-      .filter(
-        (item) =>
-          item.role === 'independent' && !primaryGroups.has(item.independenceGroup),
-      )
+      .filter((item) => item.role === 'independent' && !primaryGroups.has(item.independenceGroup))
       .map((item) => item.independenceGroup),
   );
   const communityGroups = new Set(

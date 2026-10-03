@@ -11,6 +11,7 @@ const { compressObservation } = require('@linger-alpha/cca/src/compression/compr
 
 const repositoryRoot = new URL('../', import.meta.url);
 const hookConfig = JSON.parse(await readFile(new URL('.codex/hooks.json', repositoryRoot), 'utf8'));
+const manifest = JSON.parse(await readFile(new URL('package.json', repositoryRoot), 'utf8'));
 const packConfig = JSON.parse(
   await readFile(new URL('repomix.config.json', repositoryRoot), 'utf8'),
 );
@@ -25,6 +26,11 @@ assert.match(
 );
 assert.match(hookCommand, /CCA_CONFIG_PATH/, 'hook must isolate state inside the repository');
 assert.doesNotMatch(hookCommand, /\/Users\//, 'hook must not contain a developer-specific path');
+assert.equal(
+  manifest.scripts?.['context:pack'],
+  'node scripts/run-context-pack.mjs',
+  'context packing must reject caller arguments through the reviewed wrapper',
+);
 assert.equal(
   packConfig.security?.enableSecurityCheck,
   true,

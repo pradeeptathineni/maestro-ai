@@ -1,6 +1,6 @@
 # Maestro repository guide
 
-Read `README.md`, `docs/architecture/ADR-001-v0-foundation.md`, the latest numbered ADR, and `docs/architecture/schema.md` before changing cross-cutting behavior. Phase-specific execution evidence lives in the adjacent `../maestro-ai-planning/outputs/` workspace; do not copy private planning text into public code or fixtures.
+Read `README.md`, root `ARCHITECTURE.md`, `docs/architecture/ADR-001-v0-foundation.md`, the latest numbered ADR, and `docs/architecture/schema.md` before changing cross-cutting behavior. Phase-specific execution evidence lives in the adjacent `../maestro-ai-planning/outputs/` workspace; do not copy private planning text into public code or fixtures.
 
 ## Boundaries
 
@@ -8,6 +8,7 @@ Read `README.md`, `docs/architecture/ADR-001-v0-foundation.md`, the latest numbe
 - Keep `catalog` public/shareable, `workspace` private, and `ops` operational. Public records must never depend on private workspace content.
 - No candidate installation or execution, arbitrary crawling, cloud/model fallback, hosted auth, sandbox, gateway or agent-runtime implementation is authorized by the current intelligence-product scope.
 - Preserve immutable records and old replay semantics. New corrections create revisions or append-only successors.
+- Keep open-world interpretation, refinement, and organization in the bounded research-model protocol. Deterministic mechanisms should validate, constrain, retrieve, compare, or replay; do not add evaluation-query vocabulary or one-off semantic branches.
 
 ## Safe commands
 

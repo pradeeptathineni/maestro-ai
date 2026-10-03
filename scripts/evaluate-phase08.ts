@@ -9,10 +9,12 @@ import {
 import {
   createExplorerSession,
   createPool,
+  explorerDefaultFusionPolicy,
+  explorerRetrievalPolicyVersion,
   getExplorerResultPage,
   migrate,
 } from '../packages/db/src/index.js';
-import { hashCanonical } from '../packages/domain/src/index.js';
+import { hashCanonical, structuredRerankPolicyVersion } from '../packages/domain/src/index.js';
 import {
   phase06QueryEvaluationV1,
   type Phase06EvaluationQuery,
@@ -49,6 +51,9 @@ interface ResultItem {
 interface ResultPage {
   resultSet: {
     candidatePoolHash: string;
+    retrievalPolicyVersion: string;
+    fusionPolicyVersion: string;
+    rerankPolicyVersion: string;
     retrievalPasses: number;
     stopReason: string;
     interpretation: {
@@ -208,10 +213,35 @@ function broadShape(result: RankedQuery, item: Phase08ExpertDraft) {
 }
 
 async function runLocalEvaluation(pool: Pool) {
+  const observedConfigurations = new Map<
+    string,
+    {
+      retrievalPolicyVersion: string;
+      fusionPolicyVersion: string;
+      rerankPolicyVersion: string;
+    }
+  >();
+  const rankAndRecordConfiguration = async (query: string): Promise<RankedQuery> => {
+    const result = await rank(pool, query);
+    const configuration = {
+      retrievalPolicyVersion: result.page.resultSet.retrievalPolicyVersion,
+      fusionPolicyVersion: result.page.resultSet.fusionPolicyVersion,
+      rerankPolicyVersion: result.page.resultSet.rerankPolicyVersion,
+    };
+    if (
+      configuration.retrievalPolicyVersion !== explorerRetrievalPolicyVersion ||
+      configuration.fusionPolicyVersion !== explorerDefaultFusionPolicy ||
+      configuration.rerankPolicyVersion !== structuredRerankPolicyVersion
+    ) {
+      throw new Error('Evaluation result-set policy metadata does not match the runtime contract.');
+    }
+    observedConfigurations.set(hashCanonical(configuration), configuration);
+    return result;
+  };
   const phase06ByQuery = new Map(phase06QueryEvaluationV1.map((item) => [item.query, item]));
   const development = [];
   for (const item of phase08DevelopmentQueries) {
-    const result = await rank(pool, item.query);
+    const result = await rankAndRecordConfiguration(item.query);
     const source = phase06ByQuery.get(item.query);
     development.push({
       ...item,
@@ -235,7 +265,7 @@ async function runLocalEvaluation(pool: Pool) {
 
   const expertDraft = [];
   for (const item of phase08ExpertDraftQrels) {
-    const result = await rank(pool, item.query);
+    const result = await rankAndRecordConfiguration(item.query);
     const names = result.page.items.map((row) => row.name);
     expertDraft.push({
       id: item.id,
@@ -255,7 +285,7 @@ async function runLocalEvaluation(pool: Pool) {
 
   const challenge = [];
   for (const item of phase08ChallengeQueries) {
-    const result = await rank(pool, item.query);
+    const result = await rankAndRecordConfiguration(item.query);
     const plan = result.page.resultSet.queryPlan;
     challenge.push({
       ...item,
@@ -281,7 +311,11 @@ async function runLocalEvaluation(pool: Pool) {
     .map((row) => row.proxyJudgment)
     .filter((row): row is NonNullable<typeof row> => row !== null);
   const expertMetrics = expertDraft.map((row) => row.metrics);
+  if (observedConfigurations.size !== 1) {
+    throw new Error('Evaluation result sets used inconsistent retrieval policy configurations.');
+  }
   return {
+    effectiveConfiguration: [...observedConfigurations.values()][0]!,
     development: {
       manifestCount: phase08DevelopmentQueries.length,
       labeledProxyCount: proxyRows.length,
@@ -432,6 +466,15 @@ async function main(): Promise<void> {
   try {
     const local = await runLocalEvaluation(pool);
     const live = await runLiveEvaluation();
+    const configuration = {
+      retrievalPolicyVersion: local.effectiveConfiguration.retrievalPolicyVersion,
+      fusionPolicyVersion: local.effectiveConfiguration.fusionPolicyVersion,
+      rerankPolicyVersion: local.effectiveConfiguration.rerankPolicyVersion,
+      retrieval: `deterministic-v4 + ${local.effectiveConfiguration.retrievalPolicyVersion} + ${local.effectiveConfiguration.fusionPolicyVersion} + ${local.effectiveConfiguration.rerankPolicyVersion}`,
+      signal: 'intrinsic-signal-v3 (not a relevance input)',
+      externalPrivateContextSent: false,
+      productionImportsQrels: false,
+    };
     const report = {
       evaluationId: 'phase08-stratified-evaluation-v1',
       executedAt: new Date().toISOString(),
@@ -440,14 +483,9 @@ async function main(): Promise<void> {
         expertDraft: phase08ExpertDraftQrels,
         challenge: phase08ChallengeQueries,
         live: phase08LiveQueries,
+        configuration,
       }),
-      configuration: {
-        retrieval:
-          'deterministic-v4 + retrieval-fabric-v6 + normalized-weighted-fusion-v1 + structured-rerank-v1',
-        signal: 'intrinsic-signal-v3 (not a relevance input)',
-        externalPrivateContextSent: false,
-        productionImportsQrels: false,
-      },
+      configuration,
       phase07Comparison: {
         evidenceClass: 'agent_proxy_not_human_gold',
         baselineSha: 'e08e1326eef5c5157310f234fd171de4cfaee22d',

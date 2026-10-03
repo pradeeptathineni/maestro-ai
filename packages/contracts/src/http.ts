@@ -300,6 +300,12 @@ export const SemanticProposalRequestBodySchema = Type.Object({
 });
 export type SemanticProposalRequestBody = Static<typeof SemanticProposalRequestBodySchema>;
 
+export const ResearchRunBodySchema = Type.Object({
+  mode: Type.Union([Type.Literal('search'), Type.Literal('corpus')]),
+  idempotencyKey: Type.String({ minLength: 1, maxLength: 120 }),
+});
+export type ResearchRunBody = Static<typeof ResearchRunBodySchema>;
+
 export const DiscoveryAdmissionBodySchema = Type.Object({
   ...KnowledgeReviewFields,
   entityClass: Type.Optional(

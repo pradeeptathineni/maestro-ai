@@ -252,9 +252,7 @@ export function learnResearchVocabulary(
   return [...proposals.values()]
     .filter(
       (proposal) =>
-        proposal.titleSupport > 0 ||
-        proposal.candidateIds.size >= 2 ||
-        proposal.adapters.size >= 2,
+        proposal.titleSupport > 0 || proposal.candidateIds.size >= 2 || proposal.adapters.size >= 2,
     )
     .sort(
       (left, right) =>
@@ -268,7 +266,9 @@ export function learnResearchVocabulary(
       const words = new Set(vocabularyWords(proposal.term));
       return !all.slice(0, index).some((selected) => {
         const selectedWords = new Set(vocabularyWords(selected.term));
-        return selectedWords.size > words.size && [...words].every((word) => selectedWords.has(word));
+        return (
+          selectedWords.size > words.size && [...words].every((word) => selectedWords.has(word))
+        );
       });
     })
     .slice(0, 4)

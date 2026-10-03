@@ -169,6 +169,27 @@ describe('retrieval fabric', () => {
     expect(retrieveFirstPass([typeOnly], query).hits).toEqual([]);
   });
 
+  it('accepts two independent anchors in a longer natural-language need', () => {
+    const query = interpretation({
+      normalizedText: 'coordinate an assistant across messaging repositories using auth',
+      terms: ['coordinate', 'assistant', 'messaging', 'repositories', 'using', 'auth'],
+      subjectTerms: ['coordinate', 'assistant', 'messaging', 'repositories', 'auth'],
+      canonicalConcepts: [],
+      resolvedConcepts: [],
+      subjectConcepts: [],
+    });
+    const integration = {
+      ...documents[2]!,
+      candidateKey: 'implementation:integration-platform',
+      entityId: 'integration-platform',
+      name: 'Integration Platform',
+      searchText: 'assistant tool integrations with managed authentication',
+    };
+    expect(assessRetrievalMatch(integration, query)).toMatchObject({
+      matchedTerms: expect.arrayContaining(['assistant', 'auth']),
+    });
+  });
+
   it('uses a bounded second pass to follow co-assigned domain concepts', () => {
     const first = retrieveFirstPass(documents, interpretation());
     const second = retrieveSecondPass(documents, interpretation(), first);

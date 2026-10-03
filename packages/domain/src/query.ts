@@ -317,9 +317,10 @@ function extractSubjectTerms(input: {
     }
   }
   const firstMeaningfulWord = input.sourceWords.find((word) => !STOP_WORDS.has(word));
-  const leadingRequestVerb = firstMeaningfulWord && LEADING_REQUEST_VERBS.has(firstMeaningfulWord)
-    ? firstMeaningfulWord
-    : null;
+  const leadingRequestVerb =
+    firstMeaningfulWord && LEADING_REQUEST_VERBS.has(firstMeaningfulWord)
+      ? firstMeaningfulWord
+      : null;
   const leadingRequestIndex = leadingRequestVerb
     ? input.meaningfulTerms.indexOf(leadingRequestVerb)
     : -1;

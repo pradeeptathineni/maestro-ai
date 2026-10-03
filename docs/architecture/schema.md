@@ -29,79 +29,36 @@ executable contract; this summary must not be used to infer a table that is not 
 
 The Phase 06 contract is split across migrations `0009`–`0014`: integrity/authoring, explorer
 snapshots, bounded discovery, query privacy controls, query-value projection cache, and optional
-semantic-adapter configuration. Phase 07 migration `0015` adds first-class knowledge documents,
-query plans, heterogeneous document results, source-route state, and restart-safe watch leases.
+semantic-adapter configuration. Phase 07 migration `0015` adds query-first source planning and
+durable discovery continuity. Phase 08 migration `0016` adds bounded research runs, attributable
+model proposals, source-action links, leases, and terminal receipts. Migration `0017` binds every
+research acquisition to its declared result limit and hardens research-run history and state
+transitions. Migration `0018` prevents late proposals, source operations, source links, or events
+from extending a terminal research history. Migration `0019` requires every research source
+operation to match the active run's exact workspace, query session, and immutable result-set
+snapshot. Migration `0020_research_child_serialization.sql` serializes research child inserts and
+source-operation updates with parent finalization, so recovery cannot be crossed by a late evidence
+or attempt commit.
 
-Phase 08 migration `0016` adds a compatibility layer rather than replacing those records:
+The additive intelligence substrate uses parallel, fully named Phase 08 migrations; numeric
+prefixes alone are not identifiers. `0016_faceted_knowledge.sql` through
+`0023_ai_development_tools_domain.sql` add versioned facets and relationships, two-pass retrieval
+lineage, query-independent intrinsic Signal, evidence confidence, source reliability,
+corroboration, append-only current views, and a current-scheme bridge for retained entities.
+`0024_shared_match_and_discovery_links.sql` deliberately reuses the model-led
+`ops.discovery_operation_candidates` table and only admits the shared Match policy version.
+`0025_typed_signal_normalization.sql`, `0026_evidence_bound_corroboration.sql`, and
+`0028_typed_discovery_admission.sql` add typed normalization, exact evidence bindings, and atomic
+human-reviewed admission as either an implementation or a document. The discarded duplicate
+research-run and operation-lease migrations were never released and are not part of the contract.
+`0030_precomputed_search_vectors.sql` stores the exact existing full-text expressions so bounded
+candidate ranking does not re-tokenize every matching row. `0031_corroboration_entity_binding.sql`
+requires every corroboration item to support the exact applicable entity revision, predicate, and
+scope at the database boundary.
 
-- `facet_definitions`, `concept_schemes`, `concepts`, `concept_labels`, and `concept_relations`
-  represent versioned entity-class, interface, service-model, domain, capability, and document-type
-  semantics;
-- `knowledge_entities` gives existing providers and documents stable canonical subject identities;
-- immutable `knowledge_entity_revisions` and `knowledge_document_revisions` preserve current and
-  future corrections without rewriting the Phase 07 rows;
-- `entity_facet_assignments` binds orthogonal, evidence-qualified facets to subjects; and
-- `knowledge_relationships` projects old provider/document links into typed, directional,
-  evidence-bearing, revision-scoped relationships.
+The readiness gate requires all 34 repository migration files by exact filename; catalog
+cardinality is diagnostic data, not readiness.
 
-Compatibility triggers project future writes through the historical provider/document APIs into
-the new layer. They do not reverse-sync or change old score, query, receipt, or provenance meaning.
-
-Migration `0017` adds general entity/document/interface alternate labels and service-operation
-concepts, then makes research-plan budgets, stop policy, coverage assessment, planned pass count,
-and stop reason independently queryable. Historical Phase 07 plans retain `NULL` for fields that
-were not captured by their policy; their original JSON and plan hash remain unchanged.
-
-Migration `0018` adds immutable retrieval lineage without changing a historical result set:
-
-- `query_retrieval_runs` records bounded local retriever/pass execution and disclosure limits;
-- `query_retrieval_hits` records native rank, score, matched terms, concepts, and candidate source;
-- `query_candidate_fusions` preserves both compared fusion rankings, structured rerank outputs,
-  entity-resolution evidence, and the selected policy for every frozen candidate; and
-- nullable result-set metadata records the candidate-pool hash, selected fusion/rerank policy,
-  pass count, stop reason, and coverage assessment. Pre-Phase-08 result sets retain `NULL` for facts
-  their original policy did not capture.
-
-The default Phase 08 policy is normalized weighted fusion; reciprocal-rank fusion remains persisted
-as the comparison baseline over the identical frozen pool. Neither policy changes intrinsic Signal
-or grants discovery, installation, or execution authority.
-
-Migration `0019` adds immutable `intrinsic_signal_runs` for the query-independent
-`intrinsic-signal-v3` policy. Each receipt binds one canonical entity revision to type-aware,
-cohort-normalized inputs, evidence-confidence detail, an explicit trend window, and the exact
-policy/input hash. New query result items reference that public catalog receipt while the historical
-`query_signal_runs` and embedded document score fields remain intact for v1/v2 replay. Match stays
-in query-scoped retrieval lineage with a score, band, reasons, and concept path; it is never folded
-into intrinsic Signal. Pre-`0019` query results retain their original policy and nullable intrinsic
-reference.
-
-The readiness gate checks the ordered repository migrations; catalog cardinality remains diagnostic
-data rather than readiness.
-
-Drizzle declarations mirror base-table contracts but do not replace reviewed SQL; derived current
-views remain explicit migrations and raw repository queries. Startup never uses schema push.
-Corrections to immutable evidence, score, context, and decision records require a new revision or
-explicit supersession.
-
-Migration `0020` records append-only source reliability, metric history, corroboration, refresh
-policy, and typed concept/query/entity watches. Query deletion disables its watches in the same
-transaction; refresh attempts retain their target, lease, source-attempt, change, and stop-reason
-lineage.
-
-Migration `0021` binds predecessor and supersession foreign keys to their logical owner. A revision
-cannot cite a row from another entity, document, source, query session, provider, facet, or
-relationship subject merely because the referenced UUID exists. Source-reliability and
-corroboration writers also serialize appends on the logical history key so concurrent writes form
-one lineage.
-
-Migration `0022` adds indexed current-state projections over immutable histories. The current
-concept-scheme view selects the newest active version per stable scheme key. Current facet and
-relationship views honor validity windows and exclude rows with an effective append-only
-successor. Historical base rows remain directly queryable and unchanged; current search and filter
-paths use the projections so a correction does not leave both predecessor and successor active.
-
-Migration `0023` additively introduces the current-scheme `AI development tools` domain and projects
-the retained Phase 07 AI-engineering entity assignments into it. It does not retire, relabel, or
-rewrite the version-1 taxonomy or any historical result. The bridge lets the current interpreter
-and filters reach those subjects through an ordinary concept relationship instead of a query-string
-special case.
+Drizzle declarations mirror queryable concepts but do not replace reviewed SQL. Startup never uses
+schema push. Corrections to immutable evidence, score, context, and decision records require a new
+revision or explicit supersession.

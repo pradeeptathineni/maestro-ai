@@ -7,20 +7,14 @@ import type {
 } from '../../contracts/src/index.js';
 import {
   assessRetrievalMatch,
-  assessResearchCoverage,
   hashCanonical,
   buildDiscoveryPlan,
   interpretQuery,
-  learnResearchVocabulary,
   newOpaqueId,
-  rankSourcesByMeasuredValue,
-  runRetrievalPipeline,
   type DiscoveryPlan,
   type DiscoveryRouteState,
-  type LearnedResearchTerm,
   type QueryInterpretation,
   type RetrievalDocument,
-  type RetrievalPipelineResult,
 } from '../../domain/src/index.js';
 import {
   calculateCompatibilityIntrinsicSignal,
@@ -136,39 +130,42 @@ export function discoveryLeadValueProfile(input: {
   ];
 }
 
-function discoveryLeadType(candidate: {
-  adapterKey?: string;
-  kindHint: string | null;
-}): { subjectType: 'implementation' | 'document'; entityClass: string } {
+function discoveryLeadType(candidate: { adapterKey?: string; kindHint: string | null }): {
+  subjectType: 'implementation' | 'document';
+  entityClass: string;
+} {
   const kind = candidate.kindHint?.trim().toLocaleLowerCase('en-US') ?? '';
-  const documentKinds = new Set([
-    'article',
-    'community_discussion',
-    'documentation',
-    'paper',
-    'research',
-    'specification',
-    'standard',
-  ]);
-  const implementationKinds = new Set([
-    'agent',
-    'framework',
-    'library',
-    'mcp_server',
-    'model',
-    'oss_project',
-    'platform',
-    'plugin',
-    'repository',
-    'runtime',
-    'service',
-    'tool',
-  ]);
-  if (documentKinds.has(kind)) return { subjectType: 'document', entityClass: kind };
-  if (implementationKinds.has(kind)) {
-    return { subjectType: 'implementation', entityClass: 'implementation' };
+  if (
+    new Set([
+      'article',
+      'community_discussion',
+      'documentation',
+      'paper',
+      'research',
+      'specification',
+      'standard',
+    ]).has(kind)
+  ) {
+    return { subjectType: 'document', entityClass: kind };
   }
-  if (candidate.adapterKey === 'github' || candidate.adapterKey === 'mcp_registry') {
+  if (
+    new Set([
+      'agent',
+      'framework',
+      'library',
+      'mcp_server',
+      'model',
+      'oss_project',
+      'platform',
+      'plugin',
+      'repository',
+      'runtime',
+      'service',
+      'tool',
+    ]).has(kind) ||
+    candidate.adapterKey === 'github' ||
+    candidate.adapterKey === 'mcp_registry'
+  ) {
     return { subjectType: 'implementation', entityClass: 'implementation' };
   }
   if (candidate.adapterKey === 'hacker_news') {
@@ -278,10 +275,6 @@ export async function listAdapterStatus(pool: Pool): Promise<unknown[]> {
            COALESCE(budget.denied_calls, 0) AS "deniedCallsToday",
            latest.state AS "healthState", latest.safe_detail AS "healthDetail",
            latest.checked_at AS "lastCheckedAt"
-           ,yield_window.attempted_calls AS "measuredCalls",
-           yield_window.unique_candidates AS "measuredUniqueCandidates",
-           yield_window.admitted_candidates AS "measuredAdmissions",
-           yield_window.corroborated_candidates AS "measuredCorroborations"
     FROM ops.source_adapter_configs config
     LEFT JOIN LATERAL (
       SELECT * FROM ops.source_health_events health
@@ -289,15 +282,6 @@ export async function listAdapterStatus(pool: Pool): Promise<unknown[]> {
     ) latest ON true
     LEFT JOIN ops.adapter_daily_budgets budget
       ON budget.adapter_key = config.adapter_key AND budget.budget_date = current_date
-    LEFT JOIN LATERAL (
-      SELECT COALESCE(sum(attempted_calls), 0)::int AS attempted_calls,
-             COALESCE(sum(unique_candidates), 0)::int AS unique_candidates,
-             COALESCE(sum(admitted_candidates), 0)::int AS admitted_candidates,
-             COALESCE(sum(corroborated_candidates), 0)::int AS corroborated_candidates
-      FROM ops.adapter_yield_observations measured
-      WHERE measured.adapter_key = config.adapter_key
-        AND measured.window_end >= now() - interval '30 days'
-    ) yield_window ON true
     ORDER BY config.adapter_key
   `);
   return result.rows.map((row) => ({
@@ -372,23 +356,26 @@ export async function configureAdapter(
   return result.rows[0];
 }
 
-interface DiscoveryRequestRoute {
-  planRouteId: string;
-  variantIndex: number;
-  routingReason: string;
-  sourcePlanState: DiscoveryRouteState;
-  outboundQuery: string | null;
-  researchRunId?: string;
-  passIndex?: 1 | 2;
-}
-
-async function requestDiscoveryWithClient(
-  client: PoolClient,
+export async function requestDiscovery(
+  pool: Pool,
   workspaceId: string,
   querySessionId: string,
   input: DiscoveryRequestBody,
-  route?: DiscoveryRequestRoute,
+  route?: {
+    planRouteId: string;
+    variantIndex: number;
+    routingReason: string;
+    sourcePlanState: DiscoveryRouteState;
+    outboundQuery: string | null;
+    researchRunId?: string;
+    researchStep?: number;
+    researchActionKey?: string;
+    resultSetId?: string;
+    resultLimit?: number;
+    dispatch?: 'outbox' | 'inline';
+  },
 ): Promise<unknown> {
+  return inTransaction(pool, async (client) => {
     const intent = input.intent ?? 'deepen';
     const existing = await client.query<JsonRow>(
       `SELECT id, state, adapter_key AS "adapterKey", created_at AS "createdAt"
@@ -401,10 +388,12 @@ async function requestDiscoveryWithClient(
        FROM workspace.query_sessions qs
        JOIN LATERAL (
          SELECT id FROM workspace.query_result_sets current
-         WHERE current.query_session_id = qs.id ORDER BY revision DESC LIMIT 1
+         WHERE current.query_session_id = qs.id
+           AND ($3::uuid IS NULL OR current.id = $3::uuid)
+         ORDER BY revision DESC LIMIT 1
        ) qrs ON true
        WHERE qs.id = $1 AND qs.workspace_id = $2 AND qs.deleted_at IS NULL`,
-      [querySessionId, workspaceId],
+      [querySessionId, workspaceId, route?.resultSetId ?? null],
     );
     if (!session.rowCount) throw new NotFoundError('Query session not found.');
     const config = await client.query<{
@@ -470,11 +459,11 @@ async function requestDiscoveryWithClient(
       `INSERT INTO ops.discovery_operations
          (id, workspace_id, query_session_id, result_set_id, adapter_key, idempotency_key,
           intent, outbound_query, outbound_query_hash, disclosure, state, reserved_calls,
-          safe_detail, finished_at, plan_route_id, variant_index, routing_reason,
-          source_plan_state, research_run_id, pass_index)
+          result_limit, safe_detail, finished_at, plan_route_id, variant_index, routing_reason,
+          source_plan_state, research_run_id, research_step, research_action_key)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
-               CASE WHEN $11 IN ('not_configured', 'budget_denied', 'skipped', 'unsupported')
-                    THEN now() ELSE NULL END, $14, $15, $16, $17, $18, $19)`,
+               $14, CASE WHEN $11 IN ('not_configured', 'budget_denied', 'skipped', 'unsupported')
+                    THEN now() ELSE NULL END, $15, $16, $17, $18, $19, $20, $21)`,
       [
         operationId,
         workspaceId,
@@ -482,7 +471,7 @@ async function requestDiscoveryWithClient(
         session.rows[0]!.resultSetId,
         input.adapterKey,
         input.idempotencyKey,
-        intent,
+        route?.researchRunId ? 'research_action' : intent,
         route?.outboundQuery ?? input.approvedPublicQuery,
         hashCanonical(route?.outboundQuery ?? input.approvedPublicQuery),
         json({
@@ -492,6 +481,7 @@ async function requestDiscoveryWithClient(
         }),
         state,
         reservedCalls,
+        route?.resultLimit ?? 20,
         state === 'skipped' || state === 'unsupported'
           ? route!.routingReason
           : state === 'not_configured'
@@ -504,7 +494,8 @@ async function requestDiscoveryWithClient(
         route?.routingReason ?? null,
         route?.sourcePlanState ?? 'planned',
         route?.researchRunId ?? null,
-        route?.passIndex ?? 1,
+        route?.researchStep ?? null,
+        route?.researchActionKey ?? null,
       ],
     );
     if (state === 'queued') {
@@ -527,492 +518,9 @@ async function requestDiscoveryWithClient(
       variantIndex: route?.variantIndex ?? 1,
       routingReason: route?.routingReason ?? null,
       sourcePlanState: route?.sourcePlanState ?? 'planned',
-      researchRunId: route?.researchRunId ?? null,
-      passIndex: route?.passIndex ?? 1,
+      resultLimit: route?.resultLimit ?? 20,
     };
-}
-
-export async function requestDiscovery(
-  pool: Pool,
-  workspaceId: string,
-  querySessionId: string,
-  input: DiscoveryRequestBody,
-  route?: DiscoveryRequestRoute,
-): Promise<unknown> {
-  return inTransaction(pool, (client) =>
-    requestDiscoveryWithClient(client, workspaceId, querySessionId, input, route),
-  );
-}
-
-const terminalDiscoveryStates = new Set([
-  'partial',
-  'complete',
-  'failed',
-  'cancelled',
-  'not_configured',
-  'budget_denied',
-  'skipped',
-  'unsupported',
-]);
-
-interface LiveResearchCandidateRow extends JsonRow {
-  id: string;
-  adapterKey: string;
-  title: string;
-  summary: string;
-  kindHint: string | null;
-  canonicalUri: string;
-  operationIds?: string[];
-}
-
-interface ResearchRetrievalLineage {
-  candidateId: string;
-  contributingCandidateIds: string[];
-  sourceAdapters: string[];
-  operationIds: string[];
-  fusionPolicy: string;
-  fusedRank: number;
-  fusedScore: number;
-  fusionContributions: unknown[];
-  rerankPolicy: string;
-  rerankPosition: number;
-  rerankScore: number;
-  matchScore: number;
-  matchBand: string;
-  matchedTerms: string[];
-  matchedConceptIds: string[];
-  reasons: string[];
-}
-
-interface ResearchRetrievalReceipt {
-  policyVersion: 'live-research-receipt-v1';
-  originalQuery: string;
-  interpretationVersion: QueryInterpretation['interpretationMethod'];
-  retrievalPipelineVersion: 'retrieval-pipeline-v1';
-  fusionPolicy: string;
-  rerankPolicy: 'structured-rerank-v2';
-  completedPassCount: 1 | 2;
-  candidatePoolHash: string;
-  candidateLineage: ResearchRetrievalLineage[];
-  duplicateResolutions: RetrievalPipelineResult['duplicateResolutions'];
-}
-
-function assessLiveResearchCoverage(
-  interpretation: QueryInterpretation,
-  candidates: LiveResearchCandidateRow[],
-): {
-  coverage: ReturnType<typeof assessResearchCoverage>;
-  distinctCandidates: number;
-  duplicateCandidates: number;
-  pipeline: RetrievalPipelineResult;
-  learnedVocabulary: LearnedResearchTerm[];
-} {
-  const pipeline = runRetrievalPipeline(
-    candidates.map(discoveryLeadRetrievalDocument),
-    interpretation,
-    {
-      fusionPolicy: 'normalized-weighted-fusion-v1',
-      maximumCandidates: 200,
-      shouldRunSecondPass: (firstPassCandidates, resolvedDocuments) => {
-        const documentByCandidate = new Map(
-          resolvedDocuments.map((document) => [document.candidateKey, document] as const),
-        );
-        return assessResearchCoverage(
-          interpretation,
-          firstPassCandidates
-            .slice(0, 100)
-            .map((candidate) => documentByCandidate.get(candidate.candidateKey))
-            .filter((document): document is RetrievalDocument => Boolean(document))
-            .map((document) => ({
-              entityClass: document.entityClass,
-              group: document.kind === 'other' ? null : document.kind,
-            })),
-        ).needsSecondPass;
-      },
-    },
-  );
-  const documentByCandidate = new Map(
-    pipeline.documents.map((document) => [document.candidateKey, document] as const),
-  );
-  const coverage = assessResearchCoverage(
-    interpretation,
-    pipeline.selected
-      .slice(0, 100)
-      .map((candidate) => documentByCandidate.get(candidate.candidateKey))
-      .filter((document): document is RetrievalDocument => Boolean(document))
-      .map((document) => ({
-        entityClass: document.entityClass,
-        group: document.kind === 'other' ? null : document.kind,
-      })),
-  );
-  const candidateByKey = new Map<string, LiveResearchCandidateRow>(
-    candidates.map((candidate) => [`lead:${candidate.id}`, candidate] as const),
-  );
-  const learnedVocabulary = learnResearchVocabulary(
-    interpretation,
-    pipeline.selected.flatMap((candidate) => {
-      const source = candidateByKey.get(candidate.candidateKey);
-      if (!source) return [];
-      return [
-        {
-          candidateId: source.id,
-          adapterKey: source.adapterKey,
-          canonicalUri: source.canonicalUri,
-          title: source.title,
-          summary: source.summary,
-          matchBand: candidate.matchBand,
-          matchScore: candidate.matchScore,
-          rerankPosition: candidate.rerankPosition,
-        },
-      ];
-    }),
-  );
-  return {
-    coverage,
-    distinctCandidates: pipeline.documents.length,
-    duplicateCandidates: pipeline.duplicateResolutions.filter(
-      (resolution) => resolution.method !== 'distinct',
-    ).length,
-    pipeline,
-    learnedVocabulary,
-  };
-}
-
-function researchRetrievalReceipt(
-  originalQuery: string,
-  interpretation: QueryInterpretation,
-  candidates: LiveResearchCandidateRow[],
-  pipeline: RetrievalPipelineResult,
-  completedPassCount: 1 | 2,
-): ResearchRetrievalReceipt {
-  const candidateByKey = new Map<string, LiveResearchCandidateRow>(
-    candidates.map((candidate) => [`lead:${candidate.id}`, candidate] as const),
-  );
-  const contributorsByCanonical = new Map<string, LiveResearchCandidateRow[]>();
-  for (const resolution of pipeline.duplicateResolutions) {
-    const contributor = candidateByKey.get(resolution.candidateKey);
-    if (!contributor) continue;
-    const contributors = contributorsByCanonical.get(resolution.canonicalCandidateKey) ?? [];
-    contributors.push(contributor);
-    contributorsByCanonical.set(resolution.canonicalCandidateKey, contributors);
-  }
-  const candidateLineage = pipeline.selected.flatMap((candidate) => {
-    const representative = candidateByKey.get(candidate.candidateKey);
-    if (!representative) return [];
-    const contributors = contributorsByCanonical.get(candidate.candidateKey) ?? [representative];
-    return [
-      {
-        candidateId: representative.id,
-        contributingCandidateIds: contributors.map((item) => item.id).sort(),
-        sourceAdapters: [...new Set(contributors.map((item) => item.adapterKey))].sort(),
-        operationIds: [
-          ...new Set(contributors.flatMap((item) => item.operationIds ?? [])),
-        ].sort(),
-        fusionPolicy: candidate.fusionPolicy,
-        fusedRank: candidate.fusedRank,
-        fusedScore: candidate.fusedScore,
-        fusionContributions: candidate.contributions,
-        rerankPolicy: candidate.rerankPolicy,
-        rerankPosition: candidate.rerankPosition,
-        rerankScore: candidate.rerankScore,
-        matchScore: candidate.matchScore,
-        matchBand: candidate.matchBand,
-        matchedTerms: candidate.matchedTerms,
-        matchedConceptIds: candidate.matchedConceptIds,
-        reasons: candidate.reasons,
-      },
-    ];
   });
-  return {
-    policyVersion: 'live-research-receipt-v1',
-    originalQuery,
-    interpretationVersion: interpretation.interpretationMethod,
-    retrievalPipelineVersion: 'retrieval-pipeline-v1',
-    fusionPolicy: pipeline.fusionPolicy,
-    rerankPolicy: 'structured-rerank-v2',
-    completedPassCount,
-    candidatePoolHash: hashCanonical(
-      candidates
-        .map((candidate) => ({
-          candidateId: candidate.id,
-          adapterKey: candidate.adapterKey,
-          canonicalUri: candidate.canonicalUri,
-        }))
-        .sort((left, right) => left.candidateId.localeCompare(right.candidateId)),
-    ),
-    candidateLineage,
-    duplicateResolutions: pipeline.duplicateResolutions,
-  };
-}
-
-async function persistObservedResearchPlan(
-  client: PoolClient,
-  workspaceId: string,
-  runId: string,
-  plan: DiscoveryPlan,
-): Promise<void> {
-  await client.query(
-    `UPDATE ops.research_runs
-     SET observed_plan = $3, observed_plan_hash = $4, updated_at = now()
-     WHERE id = $1 AND workspace_id = $2`,
-    [runId, workspaceId, json(plan), plan.planHash],
-  );
-}
-
-async function finishResearchRun(
-  client: PoolClient,
-  workspaceId: string,
-  runId: string,
-  stopReason: string,
-  coverage: ReturnType<typeof assessResearchCoverage>,
-  receipt: ResearchRetrievalReceipt,
-): Promise<void> {
-  const receiptHash = hashCanonical(receipt);
-  await client.query(
-    `UPDATE ops.research_runs
-     SET state = CASE WHEN $3 IN ('sufficient_live_coverage', 'second_pass_complete')
-                      THEN 'complete' ELSE 'stopped' END,
-         final_coverage = $4, stop_reason = $3, completed_pass_count = $5,
-         retrieval_receipt = $6, retrieval_receipt_hash = $7,
-         finished_at = now(), updated_at = now()
-     WHERE id = $1 AND workspace_id = $2`,
-    [
-      runId,
-      workspaceId,
-      stopReason,
-      json(coverage),
-      receipt.completedPassCount,
-      json(receipt),
-      receiptHash,
-    ],
-  );
-}
-
-async function advanceResearchRunWithClient(
-  client: PoolClient,
-  workspaceId: string,
-  runId: string,
-): Promise<unknown[]> {
-  const runResult = await client.query<{
-    querySessionId: string;
-    state: 'first_pass' | 'second_pass' | 'complete' | 'stopped';
-    maximumExternalCalls: number;
-    maximumCandidates: number;
-    deadlineAt: Date;
-    queryText: string;
-    interpretation: QueryInterpretation;
-    observedPlan: DiscoveryPlan | null;
-  }>(
-    `SELECT run.query_session_id AS "querySessionId", run.state,
-            run.maximum_external_calls AS "maximumExternalCalls",
-            run.maximum_candidates AS "maximumCandidates", run.deadline_at AS "deadlineAt",
-            session.query_text AS "queryText", session.normalized_intent AS interpretation,
-            run.observed_plan AS "observedPlan"
-     FROM ops.research_runs run
-     JOIN workspace.query_sessions session
-       ON session.id = run.query_session_id AND session.workspace_id = run.workspace_id
-     WHERE run.id = $1 AND run.workspace_id = $2
-     FOR UPDATE OF run`,
-    [runId, workspaceId],
-  );
-  if (!runResult.rowCount) throw new NotFoundError('Research run not found.');
-  const run = runResult.rows[0]!;
-  if (run.state === 'complete' || run.state === 'stopped') return [];
-  const passIndex = run.state === 'first_pass' ? 1 : 2;
-  const operations = await client.query<{
-    state: string;
-    reservedCalls: number;
-  }>(
-    `SELECT state, reserved_calls AS "reservedCalls"
-     FROM ops.discovery_operations
-     WHERE research_run_id = $1 AND workspace_id = $2 AND pass_index = $3
-     ORDER BY created_at, id`,
-    [runId, workspaceId, passIndex],
-  );
-  if (!operations.rowCount || operations.rows.some((operation) => !terminalDiscoveryStates.has(operation.state))) {
-    return [];
-  }
-  const candidates = await client.query<LiveResearchCandidateRow>(
-    `SELECT candidate.id, candidate.adapter_key AS "adapterKey",
-            candidate.title, candidate.summary, candidate.kind_hint AS "kindHint",
-            candidate.canonical_uri AS "canonicalUri",
-            array_agg(DISTINCT operation.id::text ORDER BY operation.id::text) AS "operationIds"
-     FROM ops.discovery_operations operation
-     JOIN ops.discovery_operation_candidates link
-       ON link.operation_id = operation.id AND link.workspace_id = operation.workspace_id
-     JOIN ops.discovery_candidates candidate
-       ON candidate.id = link.candidate_id AND candidate.workspace_id = link.workspace_id
-     WHERE operation.research_run_id = $1 AND operation.workspace_id = $2
-     GROUP BY candidate.id
-     ORDER BY candidate.id`,
-    [runId, workspaceId],
-  );
-  const assessed = assessLiveResearchCoverage(run.interpretation, candidates.rows);
-  const receipt = researchRetrievalReceipt(
-    run.queryText,
-    run.interpretation,
-    candidates.rows,
-    assessed.pipeline,
-    passIndex,
-  );
-  const allOperations = await client.query<{ externalCalls: number }>(
-    `SELECT COALESCE(sum(reserved_calls), 0)::int AS "externalCalls"
-     FROM ops.discovery_operations
-     WHERE research_run_id = $1 AND workspace_id = $2`,
-    [runId, workspaceId],
-  );
-  const externalCalls = allOperations.rows[0]!.externalCalls;
-  const sourceSucceeded = operations.rows.some((operation) =>
-    ['partial', 'complete'].includes(operation.state),
-  );
-  const elapsed = Date.now() >= run.deadlineAt.getTime();
-  const duplicateDominated =
-    candidates.rows.length >= 5 &&
-    assessed.distinctCandidates / Math.max(candidates.rows.length, 1) < 0.25;
-  if (elapsed) {
-    await finishResearchRun(
-      client,
-      workspaceId,
-      runId,
-      'elapsed_budget_exhausted',
-      assessed.coverage,
-      receipt,
-    );
-    return [];
-  }
-  if (candidates.rows.length >= run.maximumCandidates) {
-    await finishResearchRun(
-      client,
-      workspaceId,
-      runId,
-      'candidate_budget_reached',
-      assessed.coverage,
-      receipt,
-    );
-    return [];
-  }
-  if (duplicateDominated) {
-    await finishResearchRun(
-      client,
-      workspaceId,
-      runId,
-      'duplicate_dominance',
-      assessed.coverage,
-      receipt,
-    );
-    return [];
-  }
-  if (!sourceSucceeded) {
-    await finishResearchRun(
-      client,
-      workspaceId,
-      runId,
-      'source_denial_or_failure',
-      assessed.coverage,
-      receipt,
-    );
-    return [];
-  }
-  if (passIndex === 2) {
-    const learnedVocabulary = run.observedPlan?.secondPass.learnedVocabulary ?? [];
-    const completedPlan = buildDiscoveryPlan(run.queryText, run.interpretation, {
-      coverageAssessment: assessed.coverage,
-      externalSourcesEnabled: true,
-      secondPassExecuted: true,
-      learnedVocabulary,
-    });
-    await persistObservedResearchPlan(client, workspaceId, runId, completedPlan);
-    await finishResearchRun(
-      client,
-      workspaceId,
-      runId,
-      assessed.coverage.needsSecondPass ? 'second_pass_exhausted' : 'second_pass_complete',
-      assessed.coverage,
-      receipt,
-    );
-    return [];
-  }
-  const observedPlan = buildDiscoveryPlan(run.queryText, run.interpretation, {
-    coverageAssessment: assessed.coverage,
-    externalSourcesEnabled: true,
-    learnedVocabulary: assessed.learnedVocabulary,
-  });
-  await client.query(
-    `UPDATE ops.research_runs
-     SET first_pass_coverage = $3, updated_at = now()
-     WHERE id = $1 AND workspace_id = $2`,
-    [runId, workspaceId, json(assessed.coverage)],
-  );
-  if (!assessed.coverage.needsSecondPass) {
-    await persistObservedResearchPlan(client, workspaceId, runId, observedPlan);
-    await finishResearchRun(
-      client,
-      workspaceId,
-      runId,
-      'sufficient_live_coverage',
-      assessed.coverage,
-      receipt,
-    );
-    return [];
-  }
-  const remainingCalls = run.maximumExternalCalls - externalCalls;
-  const secondPassRoutes = observedPlan.secondPass.routes
-    .filter((route) => route.state === 'planned' && route.callLimit > 0)
-    .slice(0, Math.max(remainingCalls, 0));
-  if (!secondPassRoutes.length) {
-    await persistObservedResearchPlan(client, workspaceId, runId, observedPlan);
-    await finishResearchRun(
-      client,
-      workspaceId,
-      runId,
-      remainingCalls <= 0 ? 'external_call_budget_exhausted' : 'second_pass_exhausted',
-      assessed.coverage,
-      receipt,
-    );
-    return [];
-  }
-  await client.query(
-    `UPDATE ops.research_runs SET state = 'second_pass', updated_at = now()
-     WHERE id = $1 AND workspace_id = $2`,
-    [runId, workspaceId],
-  );
-  await persistObservedResearchPlan(client, workspaceId, runId, observedPlan);
-  const created: unknown[] = [];
-  for (const route of secondPassRoutes) {
-    created.push(
-      await requestDiscoveryWithClient(
-        client,
-        workspaceId,
-        run.querySessionId,
-        {
-          adapterKey: route.adapterKey,
-          approvedPublicQuery: run.queryText,
-          idempotencyKey: `search:${run.querySessionId}:${route.id}:${route.variantIndex}`,
-          intent: 'explore',
-        },
-        {
-          planRouteId: route.id,
-          variantIndex: route.variantIndex,
-          routingReason: route.reason,
-          sourcePlanState: route.state,
-          outboundQuery: route.variant,
-          researchRunId: runId,
-          passIndex: 2,
-        },
-      ),
-    );
-  }
-  if (
-    created.every(
-      (operation) =>
-        typeof operation === 'object' &&
-        operation !== null &&
-        (operation as { state?: string }).state !== 'queued',
-    )
-  ) {
-    created.push(...(await advanceResearchRunWithClient(client, workspaceId, runId)));
-  }
-  return created;
 }
 
 export async function requestEnabledDiscovery(
@@ -1020,149 +528,48 @@ export async function requestEnabledDiscovery(
   workspaceId: string,
   querySessionId: string,
   approvedPublicQuery: string,
+  resultSetId?: string,
 ): Promise<unknown[]> {
-  return inTransaction(pool, async (client) => {
-    const session = await client.query<{
-      interpretation: QueryInterpretation;
-      plan: DiscoveryPlan | null;
-    }>(
-      `SELECT qs.normalized_intent AS interpretation, qp.plan
-       FROM workspace.query_sessions qs
-       LEFT JOIN LATERAL (
-         SELECT plan FROM workspace.query_plans current_plan
-         WHERE current_plan.query_session_id = qs.id
-           AND current_plan.workspace_id = qs.workspace_id
-         ORDER BY current_plan.created_at DESC, current_plan.id DESC LIMIT 1
-       ) qp ON true
-       WHERE qs.id = $1 AND qs.workspace_id = $2 AND qs.deleted_at IS NULL`,
-      [querySessionId, workspaceId],
-    );
-    if (!session.rowCount) throw new NotFoundError('Query session not found.');
-    const storedPlan = session.rows[0]!.plan;
-    const plan =
-      storedPlan?.policyVersion === 'research-plan-v5'
-        ? storedPlan
-        : buildDiscoveryPlan(approvedPublicQuery, session.rows[0]!.interpretation, {
-            externalSourcesEnabled: true,
-          });
-    const plannedCalls = plan.routes.reduce(
-      (total, route) => total + (route.state === 'planned' ? route.callLimit : 0),
-      0,
-    );
-    if (plannedCalls > plan.budgets.maximumExternalCalls) {
-      throw new DomainValidationError('The persisted source plan exceeds its external-call budget.');
-    }
-    const existingRun = await client.query<{ id: string }>(
-      `SELECT id FROM ops.research_runs
-       WHERE workspace_id = $1 AND query_session_id = $2`,
-      [workspaceId, querySessionId],
-    );
-    if (existingRun.rowCount) {
-      const existingOperations = await client.query<JsonRow>(
-        `SELECT id, state, adapter_key AS "adapterKey", intent, disclosure,
-                reserved_calls AS "reservedCalls", plan_route_id AS "planRouteId",
-                variant_index AS "variantIndex", routing_reason AS "routingReason",
-                source_plan_state AS "sourcePlanState", research_run_id AS "researchRunId",
-                pass_index AS "passIndex", true AS duplicate
-         FROM ops.discovery_operations
-         WHERE research_run_id = $1 AND workspace_id = $2
-         ORDER BY pass_index, created_at, id`,
-        [existingRun.rows[0]!.id, workspaceId],
-      );
-      return existingOperations.rows;
-    }
-    const runId = newOpaqueId();
-    const startedAt = new Date();
-    const deadlineAt = new Date(startedAt.getTime() + plan.budgets.maximumElapsedMs);
-    await client.query(
-      `INSERT INTO ops.research_runs
-         (id, workspace_id, query_session_id, initial_plan_hash, state,
-          maximum_external_calls, maximum_candidates, maximum_elapsed_ms,
-          started_at, deadline_at)
-       VALUES ($1, $2, $3, $4, 'first_pass', $5, $6, $7, $8, $9)`,
-      [
-        runId,
+  const session = await pool.query<{
+    interpretation: QueryInterpretation;
+    plan: DiscoveryPlan | null;
+  }>(
+    `SELECT qs.normalized_intent AS interpretation, qp.plan
+     FROM workspace.query_sessions qs
+     LEFT JOIN workspace.query_plans qp
+       ON qp.query_session_id = qs.id AND qp.workspace_id = qs.workspace_id
+     WHERE qs.id = $1 AND qs.workspace_id = $2 AND qs.deleted_at IS NULL`,
+    [querySessionId, workspaceId],
+  );
+  if (!session.rowCount) throw new NotFoundError('Query session not found.');
+  const plan =
+    session.rows[0]!.plan ??
+    buildDiscoveryPlan(approvedPublicQuery, session.rows[0]!.interpretation);
+  const operations: unknown[] = [];
+  for (const route of plan.routes) {
+    operations.push(
+      await requestDiscovery(
+        pool,
         workspaceId,
         querySessionId,
-        plan.planHash,
-        plan.budgets.maximumExternalCalls,
-        plan.budgets.maximumCandidates,
-        plan.budgets.maximumElapsedMs,
-        startedAt,
-        deadlineAt,
-      ],
+        {
+          adapterKey: route.adapterKey,
+          approvedPublicQuery,
+          idempotencyKey: `search:${querySessionId}:${route.id}:1`,
+          intent: 'explore',
+        },
+        {
+          planRouteId: route.id,
+          variantIndex: 1,
+          routingReason: route.reason,
+          sourcePlanState: route.state,
+          outboundQuery: route.variant,
+          resultSetId,
+        },
+      ),
     );
-    const measured = await client.query<{
-      adapterKey: string;
-      attemptedCalls: number;
-      successfulCalls: number;
-      uniqueCandidates: number;
-      admittedCandidates: number;
-      corroboratedCandidates: number;
-      durationMs: number;
-      health: 'healthy' | 'partial' | 'failed' | 'unknown';
-    }>(`
-      SELECT adapter_key AS "adapterKey", attempted_calls AS "attemptedCalls",
-             successful_calls AS "successfulCalls", unique_candidates AS "uniqueCandidates",
-             admitted_candidates AS "admittedCandidates",
-             corroborated_candidates AS "corroboratedCandidates", duration_ms AS "durationMs",
-             health_state AS health
-      FROM ops.adapter_yield_observations
-      WHERE window_end >= now() - interval '30 days'
-      ORDER BY window_end DESC
-    `);
-    const values = rankSourcesByMeasuredValue(
-      plan.routes.map((route) => route.adapterKey),
-      measured.rows,
-    );
-    const preference = new Map(values.map((value, index) => [value.adapterKey, index]));
-    const orderedRoutes = plan.routes
-      .map((route, index) => ({ route, index }))
-      .sort(
-        (left, right) =>
-          Number(right.route.state === 'planned') - Number(left.route.state === 'planned') ||
-          (preference.get(left.route.adapterKey) ?? values.length) -
-            (preference.get(right.route.adapterKey) ?? values.length) ||
-          left.index - right.index,
-      )
-      .map(({ route }) => route);
-    const operations: unknown[] = [];
-    for (const route of orderedRoutes) {
-      operations.push(
-        await requestDiscoveryWithClient(
-          client,
-          workspaceId,
-          querySessionId,
-          {
-            adapterKey: route.adapterKey,
-            approvedPublicQuery,
-            idempotencyKey: `search:${querySessionId}:${route.id}:${route.variantIndex}`,
-            intent: 'explore',
-          },
-          {
-            planRouteId: route.id,
-            variantIndex: route.variantIndex,
-            routingReason: route.reason,
-            sourcePlanState: route.state,
-            outboundQuery: route.variant,
-            researchRunId: runId,
-            passIndex: 1,
-          },
-        ),
-      );
-    }
-    if (
-      operations.every(
-        (operation) =>
-          typeof operation === 'object' &&
-          operation !== null &&
-          (operation as { state?: string }).state !== 'queued',
-      )
-    ) {
-      operations.push(...(await advanceResearchRunWithClient(client, workspaceId, runId)));
-    }
-    return operations;
-  });
+  }
+  return operations;
 }
 
 export async function getDiscoveryOperation(
@@ -1171,30 +578,19 @@ export async function getDiscoveryOperation(
   operationId: string,
 ): Promise<unknown> {
   const operation = await pool.query<JsonRow>(
-    `SELECT operation.id, operation.query_session_id AS "querySessionId",
-            operation.adapter_key AS "adapterKey", operation.intent,
-            operation.disclosure, operation.state, operation.outbound_query AS "outboundQuery",
-            session.normalized_intent AS "queryInterpretation",
-            operation.plan_route_id AS "planRouteId",
-            operation.variant_index AS "variantIndex",
-            operation.routing_reason AS "routingReason",
-            operation.source_plan_state AS "sourcePlanState",
-            operation.research_run_id AS "researchRunId",
-            operation.pass_index AS "passIndex",
-            operation.reserved_calls AS "reservedCalls",
-            operation.consumed_calls AS "consumedCalls",
-            operation.result_count AS "resultCount", operation.error_code AS "errorCode",
-            operation.safe_detail AS "safeDetail", operation.started_at AS "startedAt",
-            operation.finished_at AS "finishedAt", operation.created_at AS "createdAt",
-            operation.updated_at AS "updatedAt"
-     FROM ops.discovery_operations operation
-     JOIN workspace.query_sessions session
-       ON session.id = operation.query_session_id AND session.workspace_id = operation.workspace_id
-     WHERE operation.id = $1 AND operation.workspace_id = $2`,
+    `SELECT id, adapter_key AS "adapterKey", intent, disclosure, state,
+            outbound_query AS "outboundQuery",
+            plan_route_id AS "planRouteId", variant_index AS "variantIndex",
+            routing_reason AS "routingReason", source_plan_state AS "sourcePlanState",
+            reserved_calls AS "reservedCalls", consumed_calls AS "consumedCalls",
+            result_count AS "resultCount", result_limit AS "resultLimit",
+            error_code AS "errorCode",
+            safe_detail AS "safeDetail", started_at AS "startedAt",
+            finished_at AS "finishedAt", created_at AS "createdAt", updated_at AS "updatedAt"
+     FROM ops.discovery_operations WHERE id = $1 AND workspace_id = $2`,
     [operationId, workspaceId],
   );
   if (!operation.rowCount) throw new NotFoundError('Discovery operation not found.');
-  const querySessionId = String(operation.rows[0]!.querySessionId);
   const [attempts, candidates, semanticProposal] = await Promise.all([
     pool.query<JsonRow>(
       `SELECT attempt, state, http_status AS "httpStatus", response_bytes AS "responseBytes",
@@ -1207,23 +603,15 @@ export async function getDiscoveryOperation(
     pool.query<JsonRow>(
       `SELECT candidate.id, candidate.adapter_key AS "adapterKey",
               candidate.external_id AS "externalId",
-              candidate.canonical_uri AS "canonicalUri", candidate.title, candidate.summary,
-              candidate.kind_hint AS "kindHint", candidate.source_payload AS "sourcePayload",
-              candidate.provenance, candidate.review_state AS "reviewState",
-              candidate.created_at AS "createdAt",
-              array_agg(DISTINCT link.operation_id::text ORDER BY link.operation_id::text)
-                AS "operationIds"
-       FROM ops.discovery_operations session_operation
-       JOIN ops.discovery_operation_candidates link
-         ON link.operation_id = session_operation.id
-        AND link.workspace_id = session_operation.workspace_id
-       JOIN ops.discovery_candidates candidate
-         ON candidate.id = link.candidate_id AND candidate.workspace_id = link.workspace_id
-       WHERE session_operation.query_session_id = $1
-         AND session_operation.workspace_id = $2
-       GROUP BY candidate.id
+              candidate.canonical_uri AS "canonicalUri", candidate.title,
+              candidate.summary, candidate.kind_hint AS "kindHint",
+              candidate.source_payload AS "sourcePayload", candidate.provenance,
+              candidate.review_state AS "reviewState", candidate.created_at AS "createdAt"
+       FROM ops.discovery_operation_candidates link
+       JOIN ops.discovery_candidates candidate ON candidate.id = link.discovery_candidate_id
+       WHERE link.operation_id = $1 AND link.workspace_id = $2
        ORDER BY candidate.title, candidate.id`,
-      [querySessionId, workspaceId],
+      [operationId, workspaceId],
     ),
     pool.query<JsonRow>(
       `SELECT id, task_key AS "taskKey", adapter_version AS "adapterVersion",
@@ -1235,147 +623,30 @@ export async function getDiscoveryOperation(
       [operationId, workspaceId],
     ),
   ]);
-  const query = operation.rows[0]!.queryInterpretation as QueryInterpretation;
-  const researchRunId = operation.rows[0]!.researchRunId;
-  const researchRun =
-    typeof researchRunId === 'string'
-      ? await pool.query<JsonRow>(
-          `SELECT id, state, maximum_external_calls AS "maximumExternalCalls",
-                  maximum_candidates AS "maximumCandidates",
-                  maximum_elapsed_ms AS "maximumElapsedMs",
-                  first_pass_coverage AS "firstPassCoverage",
-                  final_coverage AS "finalCoverage", stop_reason AS "stopReason",
-                  observed_plan AS "observedPlan", observed_plan_hash AS "observedPlanHash",
-                  completed_pass_count AS "completedPassCount",
-                  retrieval_receipt AS "retrievalReceipt",
-                  retrieval_receipt_hash AS "retrievalReceiptHash",
-                  started_at AS "startedAt", deadline_at AS "deadlineAt",
-                  finished_at AS "finishedAt", updated_at AS "updatedAt"
-           FROM ops.research_runs WHERE id = $1 AND workspace_id = $2`,
-          [researchRunId, workspaceId],
-        )
-      : null;
-  const researchOperations =
-    typeof researchRunId === 'string'
-      ? await pool.query<JsonRow>(
-          `SELECT id, adapter_key AS "adapterKey", state, pass_index AS "passIndex",
-                  variant_index AS "variantIndex", source_plan_state AS "sourcePlanState",
-                  safe_detail AS "safeDetail"
-           FROM ops.discovery_operations
-           WHERE research_run_id = $1 AND workspace_id = $2
-           ORDER BY pass_index, created_at, id`,
-          [researchRunId, workspaceId],
-        )
-      : null;
-  const typedCandidates = candidates.rows as Array<
-    JsonRow & {
-      id: string;
-      adapterKey: string;
-      title: string;
-      summary: string;
-      kindHint: string | null;
-      sourcePayload: unknown;
-      canonicalUri: string;
-      operationIds: string[];
-    }
-  >;
-  const documents = typedCandidates.map(discoveryLeadRetrievalDocument);
-  let firstPassCoverage = assessResearchCoverage(query, []);
-  const pipeline = runRetrievalPipeline(documents, query, {
-    fusionPolicy: 'normalized-weighted-fusion-v1',
-    maximumCandidates: 200,
-    shouldRunSecondPass: (firstPassCandidates, resolvedDocuments) => {
-      const documentByCandidate = new Map(
-        resolvedDocuments.map((document) => [document.candidateKey, document] as const),
-      );
-      firstPassCoverage = assessResearchCoverage(
+  const outboundQuery = operation.rows[0]!.outboundQuery;
+  const query = typeof outboundQuery === 'string' ? outboundQuery : '';
+  const scoredCandidates = candidates.rows
+    .map((candidate) =>
+      scoreDiscoveryCandidate(
         query,
-        firstPassCandidates
-          .slice(0, 100)
-          .map((candidate) => documentByCandidate.get(candidate.candidateKey))
-          .filter((document): document is RetrievalDocument => Boolean(document))
-          .map((document) => ({
-            entityClass: document.entityClass,
-            group: document.kind === 'other' ? null : document.kind,
-          })),
-      );
-      return firstPassCoverage.needsSecondPass;
-    },
-  });
-  const candidateByKey = new Map<string, (typeof typedCandidates)[number]>(
-    typedCandidates.map((candidate) => [`lead:${candidate.id}`, candidate] as const),
-  );
-  const currentPassCount = Math.max(
-    1,
-    ...(researchOperations?.rows.map((row) => Number(row.passIndex ?? 1)) ?? [1]),
-  ) as 1 | 2;
-  const activeReceipt = researchRetrievalReceipt(
-    query.sourceText ?? query.normalizedText,
-    query,
-    typedCandidates,
-    pipeline,
-    currentPassCount,
-  );
-  const persistedReceipt = researchRun?.rows[0]?.retrievalReceipt as
-    | ResearchRetrievalReceipt
-    | null
-    | undefined;
-  const displayedReceipt =
-    persistedReceipt?.policyVersion === 'live-research-receipt-v1'
-      ? persistedReceipt
-      : activeReceipt;
-  const scoredCandidates = displayedReceipt.candidateLineage.flatMap((retrieval) => {
-    const representative = candidateByKey.get(`lead:${retrieval.candidateId}`);
-    if (!representative) return [];
-    const scored = scoreDiscoveryCandidate(query, representative);
-    const relevance =
-      retrieval.matchBand === 'Direct'
-        ? { ordinal: 'direct', value: 100 }
-        : retrieval.matchBand === 'Strong'
-          ? { ordinal: 'partial', value: 75 }
-          : retrieval.matchBand === 'Related'
-            ? { ordinal: 'complementary', value: 50 }
-            : { ordinal: 'incidental', value: 25 };
-    return [
-      {
-        ...scored,
-        matchedTerms: retrieval.matchedTerms,
-        relevanceOrdinal: relevance.ordinal,
-        relevanceValue: relevance.value,
-        matchScore: retrieval.matchScore,
-        matchBand: retrieval.matchBand,
-        matchReasons: retrieval.reasons,
-        matchPolicyVersion: 'retrieval-match-v1',
-        sourceAdapters: retrieval.sourceAdapters,
-        operationIds: retrieval.operationIds,
-        contributingCandidateIds: retrieval.contributingCandidateIds,
-        fusionPolicy: retrieval.fusionPolicy,
-        fusedRank: retrieval.fusedRank,
-        rerankPolicy: retrieval.rerankPolicy,
-        rerankPosition: retrieval.rerankPosition,
-      },
-    ];
-  });
+        candidate as JsonRow & {
+          id: string;
+          title: string;
+          summary: string;
+          kindHint: string | null;
+          sourcePayload: unknown;
+        },
+      ),
+    )
+    .sort(
+      (left, right) =>
+        Number(right.signalUnrounded) - Number(left.signalUnrounded) ||
+        String(left.title).localeCompare(String(right.title)),
+    );
   return {
     ...operation.rows[0],
     attempts: attempts.rows,
     candidates: scoredCandidates,
-    candidateScope: 'query_session_fused',
-    retrievalMethod: {
-      policyVersion: displayedReceipt.retrievalPipelineVersion,
-      receiptPolicyVersion: displayedReceipt.policyVersion,
-      receiptHash: researchRun?.rows[0]?.retrievalReceiptHash ?? hashCanonical(displayedReceipt),
-      fusionPolicy: displayedReceipt.fusionPolicy,
-      rerankPolicy: displayedReceipt.rerankPolicy,
-      passes: displayedReceipt.completedPassCount,
-      firstPassCoverage: researchRun?.rows[0]?.firstPassCoverage ?? firstPassCoverage,
-      candidatePoolHash: displayedReceipt.candidatePoolHash,
-      duplicateResolutionCount: displayedReceipt.duplicateResolutions.filter(
-        (resolution) => resolution.method !== 'distinct',
-      ).length,
-    },
-    researchRun: researchRun?.rows[0] ?? null,
-    researchOperations: researchOperations?.rows ?? [],
     semanticProposal: semanticProposal.rows[0] ?? null,
   };
 }
@@ -1385,29 +656,41 @@ export async function cancelDiscoveryOperation(
   workspaceId: string,
   operationId: string,
 ): Promise<unknown> {
-  return inTransaction(pool, async (client) => {
-    const result = await client.query<JsonRow>(
-      `UPDATE ops.discovery_operations
-       SET state = CASE WHEN state = 'queued' THEN 'cancelled' ELSE 'cancel_requested' END,
-           safe_detail = 'Cancellation stops future dispatch; a submitted request may still complete.',
-           finished_at = CASE WHEN state = 'queued' THEN now() ELSE finished_at END,
-           updated_at = now()
-       WHERE id = $1 AND workspace_id = $2 AND state IN ('queued', 'running')
-       RETURNING id, state, safe_detail AS "safeDetail", research_run_id AS "researchRunId"`,
-      [operationId, workspaceId],
-    );
-    if (!result.rowCount) throw new ConflictError('Operation is not cancellable.');
-    const researchRunId = result.rows[0]!.researchRunId;
-    if (result.rows[0]!.state === 'cancelled' && typeof researchRunId === 'string') {
-      await advanceResearchRunWithClient(client, workspaceId, researchRunId);
-    }
-    return result.rows[0];
-  });
+  const result = await pool.query<JsonRow>(
+    `UPDATE ops.discovery_operations
+     SET state = CASE WHEN state = 'queued' THEN 'cancelled' ELSE 'cancel_requested' END,
+         safe_detail = 'Cancellation stops future dispatch; a submitted request may still complete.',
+         finished_at = CASE WHEN state = 'queued' THEN now() ELSE finished_at END,
+         updated_at = now()
+     WHERE id = $1 AND workspace_id = $2 AND state IN ('queued', 'running')
+     RETURNING id, state, safe_detail AS "safeDetail"`,
+    [operationId, workspaceId],
+  );
+  if (!result.rowCount) throw new ConflictError('Operation is not cancellable.');
+  return result.rows[0];
 }
 
 interface DiscoveryTaskPayload {
   operationId: string;
   workspaceId: string;
+}
+
+async function lockActiveResearchParentForOperation(
+  client: PoolClient,
+  payload: DiscoveryTaskPayload,
+): Promise<boolean> {
+  const association = await client.query<{ researchRunId: string | null }>(
+    `SELECT research_run_id AS "researchRunId"
+     FROM ops.discovery_operations WHERE id = $1 AND workspace_id = $2`,
+    [payload.operationId, payload.workspaceId],
+  );
+  if (!association.rows[0]?.researchRunId) return true;
+  const parent = await client.query<{ finishedAt: Date | null }>(
+    `SELECT finished_at AS "finishedAt" FROM ops.research_runs
+     WHERE id = $1 AND workspace_id = $2 FOR SHARE`,
+    [association.rows[0].researchRunId, payload.workspaceId],
+  );
+  return Boolean(parent.rowCount && !parent.rows[0]!.finishedAt);
 }
 
 function adapterFor(config: {
@@ -1431,45 +714,41 @@ export async function processDiscoveryOperation(
   payload: DiscoveryTaskPayload,
   adapterOverride?: DiscoveryAdapter,
 ): Promise<void> {
-  const claimToken = newOpaqueId();
-  const claimed = await pool.query<{
+  interface ClaimedOperation {
     adapterKey: string;
-    intent: 'explore' | 'deepen';
     baseUrl: string | null;
     timeoutMs: number;
     responseByteLimit: number;
+    resultLimit: number;
     query: string;
     attempt: number;
     startedAt: Date;
-    researchRunId: string | null;
-    passIndex: 1 | 2;
-  }>(
-    `UPDATE ops.discovery_operations operation
-     SET state = 'running', started_at = COALESCE(started_at, now()),
-         lease_token = $3,
-         lease_until = now() + (config.timeout_ms + 10000) * interval '1 millisecond',
-         updated_at = now()
-     FROM ops.source_adapter_configs config
-     WHERE operation.id = $1 AND operation.workspace_id = $2 AND operation.state = 'queued'
-       AND config.adapter_key = operation.adapter_key AND config.enabled
-     RETURNING operation.adapter_key AS "adapterKey", operation.intent,
-               config.base_url AS "baseUrl",
-               config.timeout_ms AS "timeoutMs", config.response_byte_limit AS "responseByteLimit",
-               operation.outbound_query AS query,
-               operation.started_at AS "startedAt",
-               operation.research_run_id AS "researchRunId",
-               operation.pass_index AS "passIndex",
-               COALESCE((SELECT max(attempt) + 1 FROM ops.discovery_attempts
-                         WHERE operation_id = operation.id), 1)::int AS attempt`,
-    [payload.operationId, payload.workspaceId, claimToken],
-  );
-  if (!claimed.rowCount) return;
-  const row = claimed.rows[0]!;
+  }
+  const row = await inTransaction(pool, async (client): Promise<ClaimedOperation | null> => {
+    if (!(await lockActiveResearchParentForOperation(client, payload))) return null;
+    const claimed = await client.query<ClaimedOperation>(
+      `UPDATE ops.discovery_operations operation
+       SET state = 'running', started_at = COALESCE(started_at, now()), updated_at = now()
+       FROM ops.source_adapter_configs config
+       WHERE operation.id = $1 AND operation.workspace_id = $2 AND operation.state = 'queued'
+         AND config.adapter_key = operation.adapter_key AND (config.enabled OR $3::boolean)
+       RETURNING operation.adapter_key AS "adapterKey", config.base_url AS "baseUrl",
+                 config.timeout_ms AS "timeoutMs", config.response_byte_limit AS "responseByteLimit",
+                 operation.outbound_query AS query, operation.result_limit AS "resultLimit",
+                 operation.started_at AS "startedAt",
+                 COALESCE((SELECT max(attempt) + 1 FROM ops.discovery_attempts
+                           WHERE operation_id = operation.id), 1)::int AS attempt`,
+      [payload.operationId, payload.workspaceId, Boolean(adapterOverride)],
+    );
+    return claimed.rows[0] ?? null;
+  });
+  if (!row) return;
   let result;
   try {
     const adapter = adapterOverride ?? adapterFor(row);
     if (adapter.key !== row.adapterKey) throw new Error('adapter_key_mismatch');
-    result = await adapter.search(row.query, 20);
+    result = await adapter.search(row.query, row.resultLimit);
+    result = { ...result, leads: result.leads.slice(0, row.resultLimit) };
   } catch {
     result = {
       state: 'failed' as const,
@@ -1480,17 +759,16 @@ export async function processDiscoveryOperation(
     };
   }
   await inTransaction(pool, async (client) => {
-    const latest = await client.query<{ state: string; leaseToken: string | null }>(
-      `SELECT state, lease_token AS "leaseToken"
-       FROM ops.discovery_operations WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
+    if (!(await lockActiveResearchParentForOperation(client, payload))) return;
+    const latest = await client.query<{ state: string }>(
+      `SELECT state FROM ops.discovery_operations WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
       [payload.operationId, payload.workspaceId],
     );
-    if (latest.rows[0]?.leaseToken !== claimToken) return;
+    if (!['running', 'cancel_requested'].includes(latest.rows[0]?.state ?? '')) return;
     const cancelled = latest.rows[0]?.state === 'cancel_requested';
-    let uniqueCandidates = 0;
     for (const lead of result.leads) {
       const candidateId = newOpaqueId();
-      const inserted = await client.query<{ id: string }>(
+      await client.query(
         `INSERT INTO ops.discovery_candidates
            (id, operation_id, workspace_id, adapter_key, external_id, canonical_uri,
             title, summary, kind_hint, source_payload_hash, source_payload, provenance, review_state)
@@ -1511,58 +789,18 @@ export async function processDiscoveryOperation(
           json(lead.provenance),
         ],
       );
-      const persistedCandidateId = inserted.rows[0]?.id
-        ? inserted.rows[0].id
-        : (
-            await client.query<{ id: string }>(
-              `SELECT id FROM ops.discovery_candidates
-               WHERE workspace_id = $1 AND adapter_key = $2 AND external_id = $3
-                 AND source_payload_hash = $4`,
-              [
-                payload.workspaceId,
-                row.adapterKey,
-                lead.externalId,
-                hashCanonical(lead.payload),
-              ],
-            )
-          ).rows[0]!.id;
-      await client.query(
-        `INSERT INTO ops.discovery_operation_candidates
-           (operation_id, candidate_id, workspace_id)
-         VALUES ($1, $2, $3)
-         ON CONFLICT DO NOTHING`,
-        [payload.operationId, persistedCandidateId, payload.workspaceId],
+      const stored = await client.query<{ id: string }>(
+        `SELECT id FROM ops.discovery_candidates
+         WHERE workspace_id = $1 AND adapter_key = $2 AND external_id = $3
+           AND source_payload_hash = $4`,
+        [payload.workspaceId, row.adapterKey, lead.externalId, hashCanonical(lead.payload)],
       );
-      if (inserted.rowCount) {
-        uniqueCandidates += 1;
-        const originClass =
-          row.adapterKey === 'github'
-            ? 'repository'
-            : row.adapterKey === 'mcp_registry'
-              ? 'structured_registry'
-              : row.adapterKey === 'hacker_news'
-                ? 'community'
-                : 'general_web';
-        const primarySourceUri =
-          row.adapterKey === 'github' || row.adapterKey === 'mcp_registry'
-            ? lead.canonicalUri
-            : null;
+      if (stored.rowCount) {
         await client.query(
-          `INSERT INTO ops.discovery_candidate_origins
-             (id, discovery_candidate_id, workspace_id, origin_class, retrieved_via,
-              origin_uri, primary_source_uri, corroboration_state, provenance_detail)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-          [
-            newOpaqueId(),
-            persistedCandidateId,
-            payload.workspaceId,
-            originClass,
-            row.adapterKey,
-            lead.canonicalUri,
-            primarySourceUri,
-            primarySourceUri ? 'primary_only' : 'unverified_lead',
-            json(lead.provenance),
-          ],
+          `INSERT INTO ops.discovery_operation_candidates
+             (operation_id, discovery_candidate_id, workspace_id)
+           VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+          [payload.operationId, stored.rows[0]!.id, payload.workspaceId],
         );
       }
     }
@@ -1605,7 +843,6 @@ export async function processDiscoveryOperation(
       `UPDATE ops.discovery_operations
        SET state = $3, consumed_calls = consumed_calls + 1, result_count = $4,
            error_code = $5, safe_detail = $6, finished_at = now(), updated_at = now()
-           , lease_token = NULL, lease_until = NULL
        WHERE id = $1 AND workspace_id = $2`,
       [
         payload.operationId,
@@ -1640,114 +877,6 @@ export async function processDiscoveryOperation(
           : 'Bounded discovery request completed.',
       ],
     );
-    const finishedAt = new Date();
-    await client.query(
-      `INSERT INTO ops.adapter_yield_observations
-         (id, adapter_key, source_value_policy_version, intent, attempted_calls,
-          successful_calls, returned_candidates, unique_candidates, duration_ms,
-          cost_state, health_state, window_start, window_end)
-       VALUES ($1, $2, 'source-value-v1', $3, 1, $4, $5, $6, $7,
-               'unavailable', $8, $9, $10)`,
-      [
-        newOpaqueId(),
-        row.adapterKey,
-        row.intent,
-        result.state === 'failed' ? 0 : 1,
-        result.leads.length,
-        uniqueCandidates,
-        Math.max(0, finishedAt.getTime() - row.startedAt.getTime()),
-        result.state === 'complete' ? 'healthy' : result.state,
-        row.startedAt,
-        finishedAt,
-      ],
-    );
-    if (row.researchRunId) {
-      await advanceResearchRunWithClient(client, payload.workspaceId, row.researchRunId);
-    }
-  });
-}
-
-/**
- * Terminally accounts for live-source work whose worker lease expired. The unknown request is not
- * replayed: doing so could duplicate a non-idempotent upstream call. Advancing the parent run keeps
- * partial-source behavior truthful and prevents the Search UI from polling forever.
- */
-export async function recoverStaleDiscoveryOperations(pool: Pool, limit = 50): Promise<number> {
-  return inTransaction(pool, async (client) => {
-    const stale = await client.query<{
-      id: string;
-      workspaceId: string;
-      adapterKey: string;
-      state: 'running' | 'cancel_requested';
-      outboundQueryHash: string;
-      reservedCalls: number;
-      startedAt: Date | null;
-      researchRunId: string | null;
-      nextAttempt: number;
-    }>(
-      `SELECT operation.id, operation.workspace_id AS "workspaceId",
-              operation.adapter_key AS "adapterKey", operation.state,
-              operation.outbound_query_hash AS "outboundQueryHash",
-              operation.reserved_calls AS "reservedCalls", operation.started_at AS "startedAt",
-              operation.research_run_id AS "researchRunId", attempts."nextAttempt"
-       FROM ops.discovery_operations operation
-       CROSS JOIN LATERAL (
-         SELECT LEAST(3, COALESCE(max(attempt), 0) + 1)::int AS "nextAttempt"
-         FROM ops.discovery_attempts
-         WHERE operation_id = operation.id AND workspace_id = operation.workspace_id
-       ) attempts
-       WHERE operation.state IN ('running', 'cancel_requested')
-         AND operation.lease_until < now()
-       ORDER BY operation.lease_until, operation.id
-       FOR UPDATE OF operation SKIP LOCKED
-       LIMIT $1`,
-      [Math.min(Math.max(limit, 1), 200)],
-    );
-    const touchedRuns = new Set<string>();
-    for (const operation of stale.rows) {
-      const cancelled = operation.state === 'cancel_requested';
-      await client.query(
-        `INSERT INTO ops.discovery_attempts
-           (id, operation_id, workspace_id, attempt, request_hash, state,
-            result_count, cost_state, error_code, safe_detail, started_at, finished_at)
-         VALUES ($1, $2, $3, $4, $5, $6, 0, 'unavailable', 'worker_lost',
-                 'The worker lease expired; upstream completion and cost are unknown.',
-                 COALESCE($7, now()), now())
-         ON CONFLICT (operation_id, attempt) DO NOTHING`,
-        [
-          newOpaqueId(),
-          operation.id,
-          operation.workspaceId,
-          operation.nextAttempt,
-          operation.outboundQueryHash,
-          cancelled ? 'cancelled' : 'failed',
-          operation.startedAt,
-        ],
-      );
-      await client.query(
-        `UPDATE ops.discovery_operations
-         SET state = $3, consumed_calls = GREATEST(consumed_calls, reserved_calls),
-             error_code = 'worker_lost',
-             safe_detail = 'Worker lease expired; no automatic external replay was attempted.',
-             lease_token = NULL, lease_until = NULL, finished_at = now(), updated_at = now()
-         WHERE id = $1 AND workspace_id = $2`,
-        [operation.id, operation.workspaceId, cancelled ? 'cancelled' : 'failed'],
-      );
-      if (operation.reservedCalls > 0) {
-        await client.query(
-          `UPDATE ops.adapter_daily_budgets
-           SET consumed_calls = consumed_calls + 1, updated_at = now()
-           WHERE adapter_key = $1 AND budget_date = current_date`,
-          [operation.adapterKey],
-        );
-      }
-      if (operation.researchRunId) touchedRuns.add(operation.researchRunId);
-    }
-    for (const runId of touchedRuns) {
-      const workspaceId = stale.rows.find((row) => row.researchRunId === runId)!.workspaceId;
-      await advanceResearchRunWithClient(client, workspaceId, runId);
-    }
-    return stale.rowCount ?? 0;
   });
 }
 
@@ -1779,6 +908,7 @@ export async function admitDiscoveryCandidate(
     if (candidate.rows[0]!.admissionId) {
       throw new ConflictError('Candidate is already admitted.');
     }
+
     const row = candidate.rows[0]!;
     const inferred = discoveryLeadType(row);
     const entityClass = input.entityClass ?? inferred.subjectType;
@@ -1799,8 +929,10 @@ export async function admitDiscoveryCandidate(
             : row.kindHint === 'standard'
               ? 'standard'
               : 'resource';
-    const kind = input.kind ??
+    const kind =
+      input.kind ??
       (entityClass === 'document' ? inferredDocumentKind : inferredImplementationKind);
+
     let furnished:
       | {
           subjectType: 'implementation';
@@ -1860,6 +992,7 @@ export async function admitDiscoveryCandidate(
       };
       furnished = { ...implementation, subjectType: 'implementation' };
     }
+
     const observation = await client.query<{ id: string }>(
       `SELECT source_observation_id AS id FROM catalog.evidence_items WHERE id = $1`,
       [furnished.evidenceId],

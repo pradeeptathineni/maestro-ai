@@ -57,9 +57,7 @@ const dimensionKeys = [
 ] as const;
 
 function metricDimension(row: MetricRow): IntrinsicDimensionKey | null {
-  return row.normalizationPolicyVersion === 'cohort-percentile-v1'
-    ? row.intrinsicDimension
-    : null;
+  return row.normalizationPolicyVersion === 'cohort-percentile-v1' ? row.intrinsicDimension : null;
 }
 
 function detailNumber(row: MetricRow, key: string): number | null {
@@ -71,7 +69,9 @@ function detailNumber(row: MetricRow, key: string): number | null {
 function detailStringArray(row: MetricRow, key: string): string[] {
   if (!row.normalizationDetail || typeof row.normalizationDetail !== 'object') return [];
   const value = (row.normalizationDetail as Record<string, unknown>)[key];
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === 'string')
+    : [];
 }
 
 function metricCombination(row: MetricRow): string {
@@ -103,8 +103,7 @@ function normalizeForSnapshot(
       )
       .sort(
         (left, right) =>
-          right.observedAt.getTime() - left.observedAt.getTime() ||
-          right.id.localeCompare(left.id),
+          right.observedAt.getTime() - left.observedAt.getTime() || right.id.localeCompare(left.id),
       );
     const currentByEntityAndOwner = new Map<string, MetricRow>();
     for (const peer of comparable) {
@@ -171,8 +170,7 @@ function latestPerMetricAndSource(rows: MetricRow[]): MetricRow[] {
   const latest = new Map<string, MetricRow>();
   for (const row of [...rows].sort(
     (left, right) =>
-      right.observedAt.getTime() - left.observedAt.getTime() ||
-      right.id.localeCompare(left.id),
+      right.observedAt.getTime() - left.observedAt.getTime() || right.id.localeCompare(left.id),
   )) {
     const key = `${row.metricKey}:${row.independenceGroup}`;
     if (!latest.has(key)) latest.set(key, row);
@@ -191,8 +189,7 @@ function typedDimensions(rows: MetricRow[], observedAt: Date): IntrinsicDimensio
     const cohort = [...new Set(measured.map((row) => row.cohortKey))].sort().join(' + ');
     const referenceConfidence = measured.length
       ? measured.reduce(
-          (sum, row) =>
-            sum + Math.min(1, (detailNumber(row, 'activeReferenceCount') ?? 1) / 10),
+          (sum, row) => sum + Math.min(1, (detailNumber(row, 'activeReferenceCount') ?? 1) / 10),
           0,
         ) / measured.length
       : 0;
@@ -207,14 +204,16 @@ function typedDimensions(rows: MetricRow[], observedAt: Date): IntrinsicDimensio
         ? 0
         : Math.min(
             0.95,
-            0.15 + Math.min(0.25, groups.size * 0.125) + referenceConfidence * 0.3 + sourceConfidence * 0.3,
+            0.15 +
+              Math.min(0.25, groups.size * 0.125) +
+              referenceConfidence * 0.3 +
+              sourceConfidence * 0.3,
           );
     return {
       key,
       normalized,
       confidence,
-      coverage:
-        normalized === null ? 0 : Math.min(1, measured.length / 2) * referenceConfidence,
+      coverage: normalized === null ? 0 : Math.min(1, measured.length / 2) * referenceConfidence,
       applicability: 'applicable' as const,
       state: normalized === null ? ('missing' as const) : ('present' as const),
       normalization: {
@@ -228,7 +227,10 @@ function typedDimensions(rows: MetricRow[], observedAt: Date): IntrinsicDimensio
         sourceMetric: measured.map((row) => row.metricKey).join(', ') || 'not_available',
         policyVersion: 'cohort-percentile-v1',
         cohortPolicyVersion: 'entity-class-cohort-v1',
-        inputHash: measured.map((row) => row.normalizationInputHash).filter(Boolean).join('+'),
+        inputHash: measured
+          .map((row) => row.normalizationInputHash)
+          .filter(Boolean)
+          .join('+'),
         referenceIds: [
           ...new Set(measured.flatMap((row) => detailStringArray(row, 'activeReferenceIds'))),
         ].sort(),
@@ -253,7 +255,8 @@ function typedTrend(rows: MetricRow[], observedAt: Date): ReturnType<typeof calc
     byMetric.set(row.metricKey, values);
   }
   const selected = [...byMetric.values()].sort(
-    (left, right) => right.length - left.length || left[0]!.metricKey.localeCompare(right[0]!.metricKey),
+    (left, right) =>
+      right.length - left.length || left[0]!.metricKey.localeCompare(right[0]!.metricKey),
   )[0];
   if (!selected?.length) {
     const windowEnd = observedAt;
@@ -291,16 +294,13 @@ function typedSignal(subject: IntrinsicSignalSubject, rows: MetricRow[]): Intrin
     dimensions,
     evidenceConfidence: {
       directness:
-        rows.reduce(
-          (sum, row) => sum + (detailNumber(row, 'sourceReliabilityScore') ?? 0.25),
-          0,
-        ) / rows.length,
+        rows.reduce((sum, row) => sum + (detailNumber(row, 'sourceReliabilityScore') ?? 0.25), 0) /
+        rows.length,
       independence: Math.min(1, 0.35 + groups.length * 0.25),
       applicability: measuredDimensions.length / dimensionKeys.length,
       freshness: Math.max(0.1, 1 - ageDays / 365),
       coverage:
-        dimensions.reduce((sum, dimension) => sum + dimension.coverage, 0) /
-        dimensionKeys.length,
+        dimensions.reduce((sum, dimension) => sum + dimension.coverage, 0) / dimensionKeys.length,
       contradiction: rows.some(
         (row) =>
           row.normalizationDetail &&
