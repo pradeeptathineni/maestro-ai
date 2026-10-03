@@ -37,6 +37,8 @@
     "quality:duplicates": "jscpd --config .jscpd.json",
     "quality:structure": "npm run quality:dead-code && npm run quality:duplicates",
     "security:dependencies": "node scripts/dependency-check.mjs",
+    "security:audit": "node scripts/dependency-audit-policy.mjs",
+    "security:audit:test": "node --test scripts/dependency-audit-policy.test.mjs",
     "security:secrets": "node scripts/secret-check.mjs",
     "start": "node --env-file-if-exists=.env dist/apps/api/src/server.js",
     "start:test-stack": "concurrently --kill-others --names api,worker --prefix-colors cyan,magenta \"npm:start\" \"npm:start:worker\"",

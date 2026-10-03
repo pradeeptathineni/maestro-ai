@@ -15,5 +15,6 @@ npm run build
 npm run test:provenance
 npm run security:dependencies
 npm run security:secrets
-npm audit --audit-level=high
+npm run security:audit:test
+npm run security:audit
 npm run test:e2e

@@ -30,10 +30,21 @@ maps, `@linger-alpha/cca@0.2.0` (MIT) for a reversible project hook, `knip@6.38.
 code/dependencies, and `jscpd@5.3.3` (MIT) for clone detection. None grants runtime execution
 authority or makes a catalog candidate trusted.
 
+On 2026-10-02 GitHub reviewed `GHSA-vfj7-8cjw-p6xm`, a high-severity stack-exhaustion advisory
+against every published `braces` version through the current `3.0.3`; upstream has no patched
+release as of 2026-10-03. Maestro reaches it only through the exact development path
+`repomix@1.18.1 -> globby@16.2.4 -> micromatch@4.0.8 -> braces@3.0.3`. The shipped application does
+not include Repomix, and `context:pack` supplies only the reviewed repository-owned configuration,
+not caller-provided patterns. `security:audit` therefore accepts that one exact audit payload and
+installed path while no fix exists. It rejects any new high/critical advisory, runtime reachability,
+version/path change, invocation change, or changed fix metadata so a patched release must be
+reviewed and adopted rather than silently remaining excepted.
+
 The verification gate checks that all direct packages remain at their exact reviewed versions and
-use the reviewed MIT, Apache-2.0, ISC, or MPL-2.0 licenses. The 2026-09-29 installed-tree audit reported
-zero known vulnerabilities. These are time-scoped dependency checks, not a claim that the
-application or dependencies are universally safe. CI and the local verification gate repeat them.
+use the reviewed MIT, Apache-2.0, ISC, or MPL-2.0 licenses. The 2026-09-29 installed-tree audit
+reported zero known vulnerabilities; the later, explicitly bounded no-fix exception is documented
+above. These are time-scoped dependency checks, not a claim that the application or dependencies
+are universally safe. CI and the local verification gate repeat them.
 
 Npm's local build-script policy may block optional `esbuild`/`fsevents` lifecycle scripts. Maestro
 does not require a global policy change: the pinned Vite build and browser gate are used to verify
