@@ -265,8 +265,10 @@ test('query-first explorer keeps list, map, detail, comparison, and save on one 
   await captureViewportIfRequested(page, 'explorer-390-first-result-viewport.png');
   await page.setViewportSize({ width: 1440, height: 1000 });
   await queryDetails.click();
-  await expect(page.getByText('query-signal-v2')).toBeVisible();
-  await expect(page.getByText('Context Mode', { exact: true }).first()).toBeVisible();
+  await expect(page.getByText('intrinsic-signal-v3')).toBeVisible();
+  await expect(
+    page.getByRole('button', { name: 'Use capability:code-context-reduction' }),
+  ).toBeVisible();
   await expectNoSeriousAccessibilityViolations(page);
   await captureIfRequested(page, 'explorer-1440-list.png');
 
@@ -461,7 +463,11 @@ test('corpus excludes live leads from admitted knowledge and scores an explicit 
   await expect(
     page.getByRole('heading', { name: 'Browse the durable research corpus' }),
   ).toBeVisible();
-  await expect(page.getByText(/Corpus contains admitted indexed knowledge/i)).toBeVisible();
+  await expect(
+    page.getByText(
+      /Live Search findings stay in research history until they pass an admission decision/i,
+    ),
+  ).toBeVisible();
   await expect(page.getByLabel('Layer').locator('option[value="source_lead"]')).toHaveCount(0);
   await page.getByLabel('Search the corpus').fill('context reduction for coding agents');
   await page.getByRole('button', { name: 'Search corpus' }).click();
@@ -518,7 +524,11 @@ test('generic browser authoring creates an attributed Corpus record without exec
   await expect(row).toBeVisible();
   await expect(row.getByText('Proposed', { exact: true })).toBeVisible();
   await expect(row.getByText(/Human Supplied Documentation/)).toBeVisible();
-  await expect(page.getByText(/Corpus contains admitted indexed knowledge/i)).toBeVisible();
+  await expect(
+    page.getByText(
+      /Live Search findings stay in research history until they pass an admission decision/i,
+    ),
+  ).toBeVisible();
   assertRuntime();
 });
 

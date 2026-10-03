@@ -10,6 +10,7 @@ npm run typecheck
 npm run context:verify
 npm run context:pack:test
 npm run quality:structure
+npm run test:anti-overfit
 npm test
 npm run test:integration
 npm run build

@@ -2,11 +2,22 @@ import { createHash, randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { Pool } from 'pg';
-import { verifyVerificationBundle } from '../../../packages/domain/src/index.js';
+import {
+  structuredRerankPolicyVersion,
+  verifyVerificationBundle,
+} from '../../../packages/domain/src/index.js';
+import type {
+  DiscoveryAdapter,
+  GitHubMetadataAdapter,
+} from '../../../packages/adapters/src/index.js';
 import {
   createPool,
+  explorerDefaultFusionPolicy,
+  explorerRetrievalPolicyVersion,
   processDiscoveryOperation,
   processSemanticInterpretation,
+  processWatchRefresh,
+  recordWatchCheck,
   recoverDueWatches,
 } from '../../../packages/db/src/index.js';
 import { localWorkspaceId, referenceProjectContextId } from '../../../packages/seed/src/import.js';
@@ -78,11 +89,20 @@ describe('Phase 06 explorer and authoring contracts', () => {
     const firstPage = first.json<{
       items: Array<{ id: string; signalDisplay: number | null; displayState: string }>;
       nextCursor: string;
-      resultSet: { id: string; signalPolicyVersion: string };
+      resultSet: {
+        id: string;
+        signalPolicyVersion: string;
+        retrievalPolicyVersion: string;
+        fusionPolicyVersion: string;
+        rerankPolicyVersion: string;
+      };
     }>();
     expect(firstPage.resultSet).toMatchObject({
       id: session.resultSetId,
-      signalPolicyVersion: 'query-signal-v2',
+      signalPolicyVersion: 'intrinsic-signal-v3',
+      retrievalPolicyVersion: explorerRetrievalPolicyVersion,
+      fusionPolicyVersion: explorerDefaultFusionPolicy,
+      rerankPolicyVersion: structuredRerankPolicyVersion,
     });
     expect(firstPage.items).toHaveLength(5);
     const second = await app.inject({
@@ -143,6 +163,76 @@ describe('Phase 06 explorer and authoring contracts', () => {
     expect(medicalCorpus.json()).toMatchObject({ matchedCount: 0, items: [] });
   });
 
+  it('serves versioned data-backed facets and filters Corpus by entity class', async () => {
+    const taxonomy = await app.inject({
+      method: 'GET',
+      url: '/api/v1/taxonomy/facets',
+      headers: hostHeaders,
+    });
+    expect(taxonomy.statusCode).toBe(200);
+    const body = taxonomy.json<{
+      semantics: string;
+      facets: Array<{
+        key: string;
+        values: Array<{ stableKey: string; count: number; scheme: { version: number } }>;
+      }>;
+    }>();
+    expect(body.semantics).toContain('independent facets');
+    expect(body.facets.map((facet) => facet.key)).toEqual([
+      'entity_class',
+      'interface',
+      'service_model',
+      'domain',
+      'capability',
+      'document_type',
+    ]);
+    expect(body.facets.find((facet) => facet.key === 'entity_class')?.values).toContainEqual(
+      expect.objectContaining({
+        stableKey: 'entity-class:implementation',
+        count: expect.any(Number),
+        scheme: expect.objectContaining({ version: 1 }),
+      }),
+    );
+
+    const documents = await app.inject({
+      method: 'GET',
+      url: '/api/v1/corpus?entityClass=document&limit=50',
+      headers: hostHeaders,
+    });
+    expect(documents.statusCode).toBe(200);
+    const documentBody = documents.json<{
+      facets: { entityClasses: Array<{ value: string; count: number }> };
+      items: Array<{ entityClass: string; layer: string }>;
+    }>();
+    expect(documentBody.facets.entityClasses).toContainEqual(
+      expect.objectContaining({ value: 'document' }),
+    );
+    expect(documentBody.items.length).toBeGreaterThan(0);
+    expect(documentBody.items.every((item) => item.entityClass === 'document')).toBe(true);
+
+    const browse = await app.inject({
+      method: 'GET',
+      url: '/api/v1/corpus?layer=indexed_knowledge&limit=5',
+      headers: hostHeaders,
+    });
+    expect(browse.statusCode).toBe(200);
+    expect(browse.json()).toMatchObject({
+      scoringApplied: false,
+      items: expect.arrayContaining([
+        expect.objectContaining({
+          signalDisplay: expect.any(Number),
+          signalBand: expect.any(String),
+          signalPolicyVersion: 'intrinsic-signal-v3',
+          evidenceConfidence: expect.any(Number),
+          evidenceConfidenceDetail: expect.objectContaining({
+            policyVersion: 'evidence-confidence-v1',
+          }),
+          trend: expect.objectContaining({ policyVersion: 'trend-v1' }),
+        }),
+      ]),
+    });
+  });
+
   it('dogfoods the explorer with a signal estimate for every returned tool', async () => {
     const session = await createSession(
       'ai coding agent repository skills hooks runtime verification orchestration multi-model integrations',
@@ -171,28 +261,8 @@ describe('Phase 06 explorer and authoring contracts', () => {
         }>().items,
       );
     }
-    for (const name of [
-      'Build Web Apps',
-      'Chisle',
-      'Codex Hooks',
-      'Codex Skills',
-      'Codex Subagents',
-      'Composio',
-      'GitNexus',
-      'LiteLLM Gateway',
-      'OpenAI Agents SDK',
-      'Ponytail',
-      'Reticle',
-      'Superpowers',
-    ]) {
-      expect(items).toContainEqual(
-        expect.objectContaining({
-          name,
-          displayState: 'provisional',
-          signalDisplay: expect.any(Number),
-        }),
-      );
-    }
+    expect(items.length).toBeGreaterThan(5);
+    expect(new Set(items.map((item) => item.name)).size).toBe(items.length);
     expect(items.every((item) => typeof item.signalDisplay === 'number')).toBe(true);
   });
 
@@ -244,8 +314,38 @@ describe('Phase 06 explorer and authoring contracts', () => {
       url: `/api/v1/explorer/result-sets/${session.resultSetId}?limit=10`,
       headers: hostHeaders,
     });
-    const items = list.json<{ items: Array<{ id: string }> }>().items;
+    const items = list.json<{
+      items: Array<{
+        id: string;
+        entityClass: string;
+        matchBand: string;
+        signalBand: string;
+        evidenceConfidence: number;
+        trendState: string;
+      }>;
+    }>().items;
     expect(items.length).toBeGreaterThanOrEqual(2);
+    expect(items[0]).toMatchObject({
+      entityClass: expect.any(String),
+      matchBand: expect.stringMatching(/^(Direct|Strong|Related|Peripheral)$/),
+      signalBand: expect.any(String),
+      evidenceConfidence: expect.any(Number),
+      trendState: expect.any(String),
+    });
+    const filtered = await app.inject({
+      method: 'GET',
+      url: `/api/v1/explorer/result-sets/${session.resultSetId}?limit=50&sort=match&entityClass=${encodeURIComponent(items[0]!.entityClass)}&matchBand=${encodeURIComponent(items[0]!.matchBand)}`,
+      headers: hostHeaders,
+    });
+    expect(filtered.statusCode).toBe(200);
+    expect(
+      filtered
+        .json<{ items: typeof items }>()
+        .items.every(
+          (item) =>
+            item.entityClass === items[0]!.entityClass && item.matchBand === items[0]!.matchBand,
+        ),
+    ).toBe(true);
     const graph = await app.inject({
       method: 'GET',
       url: `/api/v1/explorer/result-sets/${session.resultSetId}/graph?limit=3`,
@@ -256,7 +356,15 @@ describe('Phase 06 explorer and authoring contracts', () => {
       resultSetId: session.resultSetId,
       visibleCount: 3,
       hiddenCount: expect.any(Number),
-      accessibleItems: expect.any(Array),
+      accessibleItems: expect.arrayContaining([
+        expect.objectContaining({
+          matchBand: expect.any(String),
+          signalDisplay: expect.any(Number),
+          evidenceConfidence: expect.any(Number),
+          trendState: expect.any(String),
+          relationships: expect.any(Array),
+        }),
+      ]),
     });
     const expandedGraph = await app.inject({
       method: 'GET',
@@ -272,7 +380,14 @@ describe('Phase 06 explorer and authoring contracts', () => {
     expect(detail.statusCode).toBe(200);
     expect(detail.json()).toMatchObject({
       resultSetId: session.resultSetId,
-      policyVersion: 'query-signal-v2',
+      policyVersion: 'intrinsic-signal-v3',
+      entityClass: expect.any(String),
+      matchBand: expect.any(String),
+      matchedConcepts: expect.any(Array),
+      evidenceConfidenceDetail: expect.objectContaining({
+        policyVersion: 'evidence-confidence-v1',
+      }),
+      trend: expect.objectContaining({ policyVersion: 'trend-v1' }),
       valueInputs: expect.any(Array),
       evidence: expect.any(Array),
     });
@@ -317,9 +432,36 @@ describe('Phase 06 explorer and authoring contracts', () => {
     expect(detail.statusCode).toBe(200);
     expect(detail.json()).toMatchObject({
       subjectType: 'document',
+      entityClass: 'document',
+      matchBand: expect.any(String),
+      matchedConcepts: expect.any(Array),
       valueInputs: expect.any(Array),
       evidence: [expect.objectContaining({ dimensionKey: 'document_identity' })],
     });
+    const graph = await app.inject({
+      method: 'GET',
+      url: `/api/v1/explorer/result-sets/${session.resultSetId}/graph?limit=100`,
+      headers: hostHeaders,
+    });
+    expect(graph.statusCode).toBe(200);
+    expect(graph.json<{ edges: Array<{ id: string; type: string }> }>().edges).toContainEqual(
+      expect.objectContaining({
+        id: expect.stringMatching(/^document-subject:/),
+        type: 'evaluates',
+      }),
+    );
+    expect(
+      graph
+        .json<{
+          accessibleItems: Array<{
+            id: string;
+            relationships: Array<{ type: string; targetName: string }>;
+          }>;
+        }>()
+        .accessibleItems.find((item) => item.id === document!.id)?.relationships,
+    ).toContainEqual(
+      expect.objectContaining({ type: 'evaluates', targetName: 'Learned prompt compression' }),
+    );
     const saved = await app.inject({
       method: 'POST',
       url: `/api/v1/explorer/result-sets/${session.resultSetId}/shortlists`,
@@ -546,6 +688,12 @@ describe('Phase 06 explorer and authoring contracts', () => {
         diagnostics: {
           projectFitState: 'unknown_blocked',
           projectContextAffectsSignal: false,
+          candidateSelection: {
+            policyVersion: 'postgres-lexical-concept-candidates-v2',
+            applied: false,
+            selectedProviderCount: expect.any(Number),
+            selectedDocumentCount: expect.any(Number),
+          },
         },
       },
     });
@@ -752,7 +900,7 @@ describe('Phase 06 explorer and authoring contracts', () => {
       url: '/api/v1/explorer/sessions',
       headers: mutationHeaders,
       payload: {
-        query: 'ai repository review fixture',
+        query: 'ceramic glaze acoustic resonance analysis toolkit',
         searchConnectedSources: true,
       },
     });
@@ -764,47 +912,61 @@ describe('Phase 06 explorer and authoring contracts', () => {
         expect.objectContaining({ adapterKey: 'mcp_registry', state: 'skipped' }),
       ]),
     });
-    const operationId = requested.json<{
-      discoveryOperations: Array<{ id: string }>;
-    }>().discoveryOperations[0]!.id;
+    const githubOperations = requested
+      .json<{
+        discoveryOperations: Array<{
+          adapterKey: string;
+          variantIndex: number;
+          sourcePlanState: string;
+        }>;
+      }>()
+      .discoveryOperations.filter((operation) => operation.adapterKey === 'github');
+    expect(githubOperations).toEqual([
+      expect.objectContaining({ variantIndex: 1, sourcePlanState: 'planned' }),
+    ]);
+    const operationId = requested
+      .json<{ discoveryOperations: Array<{ id: string; adapterKey: string }> }>()
+      .discoveryOperations.find((candidate) => candidate.adapterKey === 'github')!.id;
+    const sessionId = requested.json<{ id: string }>().id;
+    const controlledAdapter: DiscoveryAdapter = {
+      key: 'github' as const,
+      version: 'controlled-fixture-v1',
+      async search() {
+        return {
+          state: 'complete' as const,
+          leads: [
+            {
+              externalId: `fixture-${sessionId}`,
+              canonicalUri: `https://github.com/maestro-fixture/${sessionId}`,
+              title: 'maestro-fixture/sonolith',
+              summary:
+                'Controlled discovery lead for ceramic glaze acoustic resonance analysis toolkits; used to verify admission without network access.',
+              kindHint: 'oss_project',
+              payload: {
+                fixture: true,
+                stars: 1_000,
+                archived: false,
+                updatedAt: '2026-09-28T12:00:00.000Z',
+              },
+              provenance: {
+                adapter: 'github',
+                adapterVersion: 'controlled-fixture-v1',
+                source: 'controlled integration fixture',
+                observedAt: '2026-09-29T12:00:00.000Z',
+                reviewState: 'lead',
+              },
+            },
+          ],
+          responseBytes: 128,
+          httpStatus: 200,
+          rateLimit: { remaining: null, resetAt: null, retryAfter: null },
+        };
+      },
+    };
     await processDiscoveryOperation(
       pool,
       { operationId, workspaceId: localWorkspaceId },
-      {
-        key: 'github',
-        version: 'controlled-fixture-v1',
-        async search() {
-          return {
-            state: 'complete',
-            leads: [
-              {
-                externalId: `fixture-${operationId}`,
-                canonicalUri: `https://github.com/maestro-fixture/${operationId}`,
-                title: 'maestro-fixture/discovered-option',
-                summary:
-                  'Controlled discovery lead used to verify admission without network access.',
-                kindHint: 'oss_project',
-                payload: {
-                  fixture: true,
-                  stars: 1_000,
-                  archived: false,
-                  updatedAt: '2026-09-28T12:00:00.000Z',
-                },
-                provenance: {
-                  adapter: 'github',
-                  adapterVersion: 'controlled-fixture-v1',
-                  source: 'controlled integration fixture',
-                  observedAt: '2026-09-29T12:00:00.000Z',
-                  reviewState: 'lead',
-                },
-              },
-            ],
-            responseBytes: 128,
-            httpStatus: 200,
-            rateLimit: { remaining: null, resetAt: null, retryAfter: null },
-          };
-        },
-      },
+      controlledAdapter,
     );
     const operation = await app.inject({
       method: 'GET',
@@ -816,7 +978,7 @@ describe('Phase 06 explorer and authoring contracts', () => {
       resultCount: 1,
       candidates: [
         expect.objectContaining({
-          title: 'maestro-fixture/discovered-option',
+          title: 'maestro-fixture/sonolith',
           reviewState: 'lead',
           displayState: 'provisional',
           signalDisplay: expect.any(Number),
@@ -824,6 +986,16 @@ describe('Phase 06 explorer and authoring contracts', () => {
         }),
       ],
     });
+    const repeated = await pool.query<{ candidates: number; links: number }>(
+      `SELECT
+         (SELECT count(*)::int FROM ops.discovery_candidates
+          WHERE workspace_id = $1 AND external_id = $2) AS candidates,
+         (SELECT count(*)::int FROM ops.discovery_operation_candidates link
+          JOIN ops.discovery_candidates candidate ON candidate.id = link.discovery_candidate_id
+          WHERE link.workspace_id = $1 AND candidate.external_id = $2) AS links`,
+      [localWorkspaceId, `fixture-${sessionId}`],
+    );
+    expect(repeated.rows[0]).toEqual({ candidates: 1, links: 1 });
     const candidateId = operation.json<{ candidates: Array<{ id: string }> }>().candidates[0]!.id;
     const resultSetId = requested.json<{ resultSetId: string }>().resultSetId;
     const restored = await app.inject({
@@ -879,8 +1051,30 @@ describe('Phase 06 explorer and authoring contracts', () => {
         rationale: 'Exercise the supported lead-to-knowledge service path.',
       },
     });
-    expect(admitted.statusCode).toBe(201);
+    expect(admitted.statusCode, admitted.body).toBe(201);
     expect(admitted.json()).toMatchObject({ candidateId, providerId: expect.any(String) });
+    await pool.query(
+      `INSERT INTO ops.discovery_candidates
+         (id, operation_id, workspace_id, adapter_key, external_id, canonical_uri,
+          title, summary, kind_hint, source_payload_hash, source_payload, provenance,
+          review_state)
+       SELECT gen_random_uuid(), $1::uuid, $2::uuid, 'github',
+              'crowding-' || $1::uuid::text || '-' || item::text,
+              'https://github.com/maestro-e2e/crowding-' || $1::uuid::text || '-' || item::text,
+              'Controlled discovery raw lead ' || item::text,
+              'A highly matching controlled discovery lead that has not been admitted.',
+              'oss_project',
+              md5('crowding-' || $1::uuid::text || '-' || item::text) ||
+                md5('crowding-' || $1::uuid::text || '-' || item::text),
+              jsonb_build_object('fixture', true, 'sequence', item),
+              jsonb_build_object(
+                'adapter', 'github', 'adapterVersion', 'controlled-fixture-v1',
+                'observedAt', '2026-09-29T12:00:00.000Z', 'reviewState', 'lead'
+              ),
+              'lead'
+       FROM generate_series(1, 220) item`,
+      [operationId, localWorkspaceId],
+    );
     const admittedCorpus = await app.inject({
       method: 'POST',
       url: '/api/v1/corpus/search',
@@ -902,6 +1096,37 @@ describe('Phase 06 explorer and authoring contracts', () => {
         .json<{ items: Array<{ id: string; layer: string }> }>()
         .items.some((item) => item.id === candidateId && item.layer === 'source_lead'),
     ).toBe(false);
+    const admittedCorpusBody = admittedCorpus.json<{
+      corpusCount: number;
+      matchedCount: number;
+      facets: { layers: Array<{ value: string; count: number }> };
+    }>();
+    expect(admittedCorpusBody.corpusCount).toBeLessThan(220);
+    expect(admittedCorpusBody.matchedCount).toBeLessThan(220);
+    expect(admittedCorpusBody.facets.layers).not.toContainEqual(
+      expect.objectContaining({ value: 'source_lead' }),
+    );
+
+    const crowdedLeadReplay = await app.inject({
+      method: 'POST',
+      url: '/api/v1/corpus/search',
+      headers: mutationHeaders,
+      payload: { query: 'controlled discovery', layer: 'source_lead', limit: 50 },
+    });
+    expect(crowdedLeadReplay.statusCode).toBe(200);
+    const crowdedLeadReplayBody = crowdedLeadReplay.json<{
+      corpusCount: number;
+      facets: { layers: Array<{ value: string; count: number }> };
+      items: Array<{ layer: string }>;
+    }>();
+    expect(crowdedLeadReplayBody.corpusCount).toBeGreaterThanOrEqual(220);
+    expect(crowdedLeadReplayBody).toMatchObject({
+      facets: {
+        layers: [expect.objectContaining({ value: 'source_lead' })],
+      },
+      items: expect.arrayContaining([expect.objectContaining({ layer: 'source_lead' })]),
+    });
+    expect(crowdedLeadReplayBody.facets.layers[0]!.count).toBeGreaterThan(0);
     await pool.query(
       `UPDATE ops.source_adapter_configs SET enabled = false WHERE adapter_key = 'github'`,
     );
@@ -1114,6 +1339,13 @@ describe('Phase 06 explorer and authoring contracts', () => {
   it('redacts retained private query text through the supported delete control', async () => {
     const canary = `PRIVATE_QUERY_${randomUUID()}`;
     const session = await createSession(`${canary} ai`);
+    const watch = await app.inject({
+      method: 'POST',
+      url: '/api/v1/watches',
+      headers: mutationHeaders,
+      payload: { querySessionId: session.id, cadence: 'daily', priority: 50 },
+    });
+    expect(watch.statusCode).toBe(201);
     const response = await app.inject({
       method: 'DELETE',
       url: `/api/v1/explorer/sessions/${session.id}`,
@@ -1129,6 +1361,161 @@ describe('Phase 06 explorer and authoring contracts', () => {
     expect(stored.rows[0]).toMatchObject({ query: '[deleted by user]', intent: {} });
     expect(stored.rows[0]!.deletedAt).not.toBeNull();
     expect(JSON.stringify(stored.rows[0])).not.toContain(canary);
+    const disabledWatch = await pool.query<{
+      state: string;
+      nextDueAt: Date | null;
+      errorCode: string | null;
+    }>(
+      `SELECT state, next_due_at AS "nextDueAt", last_error_code AS "errorCode"
+       FROM workspace.watches WHERE id = $1`,
+      [watch.json<{ id: string }>().id],
+    );
+    expect(disabledWatch.rows[0]).toEqual({
+      state: 'disabled',
+      nextDueAt: null,
+      errorCode: 'target_deleted',
+    });
+  });
+
+  it('atomically admits a community lead as a reviewer-corrected document', async () => {
+    await pool.query(
+      `UPDATE ops.source_adapter_configs SET enabled = true, daily_call_limit = 10
+       WHERE adapter_key = 'hacker_news'`,
+    );
+    await pool.query(
+      `DELETE FROM ops.adapter_daily_budgets
+       WHERE adapter_key = 'hacker_news' AND budget_date = current_date`,
+    );
+    const session = await createSession('fungal ecology field research discussion');
+    const requested = await app.inject({
+      method: 'POST',
+      url: `/api/v1/explorer/sessions/${session.id}/discovery`,
+      headers: mutationHeaders,
+      payload: {
+        adapterKey: 'hacker_news',
+        approvedPublicQuery: 'fungal ecology field research discussion',
+        idempotencyKey: `document-${randomUUID()}`,
+      },
+    });
+    expect(requested.statusCode).toBe(202);
+    const operationId = requested.json<{ id: string }>().id;
+    await processDiscoveryOperation(
+      pool,
+      { operationId, workspaceId: localWorkspaceId },
+      {
+        key: 'hacker_news',
+        version: 'controlled-community-v1',
+        async search() {
+          return {
+            state: 'complete',
+            leads: [
+              {
+                externalId: `community-${operationId}`,
+                canonicalUri: `https://example.test/discussions/${operationId}`,
+                title: 'Raw community discussion title',
+                summary: 'A community lead about fungal ecology field research practices.',
+                kindHint: 'community_discussion',
+                payload: { fixture: true },
+                provenance: {
+                  adapter: 'hacker_news',
+                  adapterVersion: 'controlled-community-v1',
+                  source: 'controlled integration fixture',
+                  observedAt: '2026-09-30T12:00:00.000Z',
+                  reviewState: 'lead',
+                },
+              },
+            ],
+            responseBytes: 128,
+            httpStatus: 200,
+            rateLimit: { remaining: null, resetAt: null, retryAfter: null },
+          };
+        },
+      },
+    );
+    const operation = await app.inject({
+      method: 'GET',
+      url: `/api/v1/discovery/operations/${operationId}`,
+      headers: hostHeaders,
+    });
+    const candidateId = operation.json<{ candidates: Array<{ id: string }> }>().candidates[0]!.id;
+    const before = await pool.query<{ providers: number; documents: number }>(
+      `SELECT
+         (SELECT count(*)::int FROM catalog.providers) AS providers,
+         (SELECT count(*)::int FROM catalog.knowledge_documents) AS documents`,
+    );
+    const invalid = await app.inject({
+      method: 'POST',
+      url: `/api/v1/discovery/candidates/${candidateId}/admit`,
+      headers: mutationHeaders,
+      payload: {
+        entityClass: 'document',
+        kind: 'unsupported_document_kind',
+        capabilityKey: `fungal-field-${randomUUID()}`,
+        capabilityName: 'Fungal field research',
+        searchTerms: ['fungal ecology', 'field research'],
+        limitations: ['Controlled fixture only.'],
+        reviewState: 'proposed',
+        rationale: 'The reviewer must be able to correct the record type.',
+      },
+    });
+    expect(invalid.statusCode).toBe(422);
+    const afterInvalid = await pool.query<{ providers: number; documents: number }>(
+      `SELECT
+         (SELECT count(*)::int FROM catalog.providers) AS providers,
+         (SELECT count(*)::int FROM catalog.knowledge_documents) AS documents`,
+    );
+    expect(afterInvalid.rows[0]).toEqual(before.rows[0]);
+    const admitted = await app.inject({
+      method: 'POST',
+      url: `/api/v1/discovery/candidates/${candidateId}/admit`,
+      headers: mutationHeaders,
+      payload: {
+        entityClass: 'document',
+        kind: 'resource',
+        title: 'Reviewed fungal field research discussion',
+        summary: 'A reviewer-curated community resource about fungal ecology field practice.',
+        publisher: 'Example research community',
+        capabilityKey: `fungal-field-${randomUUID()}`,
+        capabilityName: 'Fungal field research',
+        searchTerms: ['fungal ecology', 'field research'],
+        limitations: ['Community discussion; primary-source corroboration is still needed.'],
+        reviewState: 'proposed',
+        rationale: 'Retain the source lead as a document, not as software.',
+      },
+    });
+    expect(admitted.statusCode, admitted.body).toBe(201);
+    expect(admitted.json()).toMatchObject({
+      candidateId,
+      entityClass: 'document',
+      kind: 'resource',
+      providerId: null,
+      documentId: expect.any(String),
+    });
+    const retained = await pool.query<{
+      rawTitle: string;
+      documentTitle: string;
+      bindings: number;
+    }>(
+      `SELECT candidate.title AS "rawTitle", document.title AS "documentTitle",
+              count(binding.id)::int AS bindings
+       FROM ops.discovery_admissions admission
+       JOIN ops.discovery_candidates candidate ON candidate.id = admission.discovery_candidate_id
+       JOIN catalog.knowledge_documents document ON document.id = admission.document_id
+       JOIN catalog.knowledge_entity_evidence_bindings binding
+         ON binding.knowledge_entity_id = admission.knowledge_entity_id
+        AND binding.evidence_item_id = admission.evidence_item_id
+       WHERE admission.discovery_candidate_id = $1
+       GROUP BY candidate.title, document.title`,
+      [candidateId],
+    );
+    expect(retained.rows[0]).toEqual({
+      rawTitle: 'Raw community discussion title',
+      documentTitle: 'Reviewed fungal field research discussion',
+      bindings: 1,
+    });
+    await pool.query(
+      `UPDATE ops.source_adapter_configs SET enabled = false WHERE adapter_key = 'hacker_news'`,
+    );
   });
 
   it('records unchanged, changed, and failed watch checks without inventing evidence', async () => {
@@ -1229,6 +1616,129 @@ describe('Phase 06 explorer and authoring contracts', () => {
     expect(disposition.json()).toMatchObject({ disposition: 'reviewed' });
   });
 
+  it('watches concepts, queries, and canonical entities with explicit refresh policy', async () => {
+    const targets = await pool.query<{
+      conceptId: string;
+      querySessionId: string;
+      entityId: string;
+    }>(
+      `
+      SELECT
+        (SELECT id FROM catalog.concepts WHERE status = 'active' ORDER BY id LIMIT 1) AS "conceptId",
+        (SELECT id FROM workspace.query_sessions
+          WHERE workspace_id = $1 AND deleted_at IS NULL
+          ORDER BY created_at DESC LIMIT 1) AS "querySessionId",
+        (SELECT id FROM catalog.knowledge_entities ORDER BY id LIMIT 1) AS "entityId"
+    `,
+      [localWorkspaceId],
+    );
+    const target = targets.rows[0]!;
+    const concept = await app.inject({
+      method: 'POST',
+      url: '/api/v1/watches',
+      headers: mutationHeaders,
+      payload: { conceptId: target.conceptId, cadence: 'adaptive', priority: 60 },
+    });
+    expect(concept.statusCode).toBe(201);
+    const conceptWatch = concept.json<{ id: string; sourceWatermark: string }>();
+    expect(conceptWatch).toMatchObject({
+      conceptId: target.conceptId,
+      cadence: 'adaptive',
+      cadenceHours: 168,
+      cadencePolicyVersion: 'refresh-cadence-v1',
+      sourceWatermark: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+    const query = await app.inject({
+      method: 'POST',
+      url: '/api/v1/watches',
+      headers: mutationHeaders,
+      payload: { querySessionId: target.querySessionId, cadence: 'manual', priority: 50 },
+    });
+    expect(query.statusCode).toBe(201);
+    expect(query.json()).toMatchObject({ querySessionId: target.querySessionId });
+    const entity = await app.inject({
+      method: 'POST',
+      url: '/api/v1/watches',
+      headers: mutationHeaders,
+      payload: { knowledgeEntityId: target.entityId, cadence: 'manual', priority: 50 },
+    });
+    expect(entity.statusCode).toBe(201);
+    expect(entity.json()).toMatchObject({
+      knowledgeEntityId: target.entityId,
+      sourceWatermark: expect.stringMatching(/^[a-f0-9]{64}$/),
+    });
+
+    const label = `watch refresh ${randomUUID()}`;
+    await pool.query(
+      `INSERT INTO catalog.concept_labels
+         (id, concept_id, label, normalized_label, label_kind, locale)
+       VALUES ($1, $2, $3, $3, 'alternate', 'en')`,
+      [randomUUID(), target.conceptId, label],
+    );
+    let adapterCalls = 0;
+    const unusedAdapter: GitHubMetadataAdapter = {
+      key: 'github-metadata',
+      version: 'github-metadata-v1',
+      async fetch() {
+        adapterCalls += 1;
+        return { kind: 'terminal_failure', code: 'unsupported_type' };
+      },
+    };
+    await processWatchRefresh(
+      pool,
+      { watchId: conceptWatch.id, workspaceId: localWorkspaceId },
+      unusedAdapter,
+    );
+    expect(adapterCalls).toBe(0);
+    const localRefresh = await pool.query<{
+      failureCount: number;
+      lastSucceededAt: Date | null;
+      sourceWatermark: string;
+      leaseToken: string | null;
+    }>(
+      `SELECT failure_count AS "failureCount", last_succeeded_at AS "lastSucceededAt",
+              source_watermark AS "sourceWatermark", lease_token AS "leaseToken"
+       FROM workspace.watches WHERE id = $1`,
+      [conceptWatch.id],
+    );
+    expect(localRefresh.rows[0]).toMatchObject({
+      failureCount: 0,
+      lastSucceededAt: expect.any(Date),
+      sourceWatermark: expect.stringMatching(/^[a-f0-9]{64}$/),
+      leaseToken: null,
+    });
+    expect(localRefresh.rows[0]!.sourceWatermark).not.toBe(conceptWatch.sourceWatermark);
+    const localChange = await pool.query<{
+      predicate: string;
+      oldObservationId: string | null;
+      newObservationId: string | null;
+    }>(
+      `SELECT predicate, old_observation_id AS "oldObservationId",
+              new_observation_id AS "newObservationId"
+       FROM workspace.material_changes WHERE watch_id = $1 ORDER BY created_at DESC LIMIT 1`,
+      [conceptWatch.id],
+    );
+    expect(localChange.rows[0]).toEqual({
+      predicate: 'concept-corpus-snapshot',
+      oldObservationId: null,
+      newObservationId: null,
+    });
+
+    const listed = await app.inject({
+      method: 'GET',
+      url: '/api/v1/watches',
+      headers: hostHeaders,
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.json<{ items: Array<{ targetKind: string }> }>().items).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ targetKind: 'concept' }),
+        expect.objectContaining({ targetKind: 'query' }),
+        expect.objectContaining({ targetKind: 'entity' }),
+      ]),
+    );
+  });
+
   it('recovers due schedules idempotently and preserves explicit disable state', async () => {
     const provider = await pool.query<{ id: string }>(
       `SELECT p.id FROM catalog.providers p
@@ -1270,6 +1780,63 @@ describe('Phase 06 explorer and authoring contracts', () => {
     });
     expect(disabled.statusCode).toBe(200);
     expect(disabled.json()).toMatchObject({ state: 'disabled', nextDueAt: null });
+  });
+
+  it('rejects a stale worker completion without clearing the current watch lease', async () => {
+    const provider = await pool.query<{ id: string }>(
+      `SELECT p.id FROM catalog.providers p
+       WHERE NOT EXISTS (
+         SELECT 1 FROM workspace.watches w
+         WHERE w.workspace_id = $1 AND w.provider_id = p.id AND w.cadence = 'manual'
+       )
+       ORDER BY p.id LIMIT 1`,
+      [localWorkspaceId],
+    );
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/v1/watches',
+      headers: mutationHeaders,
+      payload: { providerId: provider.rows[0]!.id, cadence: 'manual', priority: 50 },
+    });
+    expect(created.statusCode).toBe(201);
+    const watchId = created.json<{ id: string }>().id;
+    const currentLease = randomUUID();
+    await pool.query(
+      `UPDATE workspace.watches
+       SET lease_token = $2, lease_until = now() + interval '5 minutes'
+       WHERE id = $1`,
+      [watchId, currentLease],
+    );
+    await expect(
+      recordWatchCheck(
+        pool,
+        localWorkspaceId,
+        watchId,
+        { outcome: 'failed', reason: 'Stale worker fixture must not commit.' },
+        {
+          actorType: 'system',
+          retrievalMethod: 'github_api',
+          adapterVersion: 'github-metadata-v1',
+          trustBoundary: 'remote_untrusted',
+          expectedLeaseToken: randomUUID(),
+        },
+      ),
+    ).resolves.toMatchObject({ outcome: 'superseded' });
+    const retained = await pool.query<{
+      leaseToken: string | null;
+      lastCheckedAt: Date | null;
+      failureCount: number;
+    }>(
+      `SELECT lease_token AS "leaseToken", last_checked_at AS "lastCheckedAt",
+              failure_count AS "failureCount"
+       FROM workspace.watches WHERE id = $1`,
+      [watchId],
+    );
+    expect(retained.rows[0]).toEqual({
+      leaseToken: currentLease,
+      lastCheckedAt: null,
+      failureCount: 0,
+    });
   });
 
   it('binds new fit evidence relationally and rejects a cross-provider reference', async () => {

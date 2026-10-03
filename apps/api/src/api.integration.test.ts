@@ -656,6 +656,7 @@ describe('local HTTP boundary and critical flows', () => {
         '/api/v1/research/runs/{id}',
         '/api/v1/research/runs/{id}/fallback',
         '/api/v1/score-runs/replay',
+        '/api/v1/taxonomy/facets',
         '/api/v1/verification',
         '/api/v1/watches',
         '/api/v1/watches/{id}/checks',

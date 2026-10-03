@@ -84,6 +84,7 @@ import {
   furnishKnowledgeOption,
   listAdapterStatus,
   listResearchCorpus,
+  listTaxonomyFacets,
   listDomains,
   listExplorerSessions,
   listIntakes,
@@ -176,6 +177,10 @@ export function registerRoutes(app: FastifyInstance, pool: Pool): void {
     items: await listDomains(pool),
   }));
 
+  routes.get('/api/v1/taxonomy/facets', { schema: { tags: ['catalog'] } }, async () =>
+    listTaxonomyFacets(pool),
+  );
+
   routes.get<{ Querystring: Record<string, unknown> }>(
     '/api/v1/providers',
     { schema: { tags: ['catalog'], querystring: CatalogQuerySchema } },
@@ -255,12 +260,13 @@ export function registerRoutes(app: FastifyInstance, pool: Pool): void {
     '/api/v1/corpus',
     { schema: { tags: ['research-corpus'], querystring: CorpusBrowseQuerySchema } },
     async (request) => {
-      const { layer, state, source, kind, cursor, limit } = request.query;
+      const { layer, state, source, kind, entityClass, cursor, limit } = request.query;
       return listResearchCorpus(pool, localWorkspaceId, {
         layer,
         state,
         source,
         kind,
+        entityClass,
         cursor,
         limit,
       });

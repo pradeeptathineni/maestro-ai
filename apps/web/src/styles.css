@@ -1866,6 +1866,7 @@ tbody td small {
 
 .result-controls {
   justify-content: flex-start;
+  flex-wrap: wrap;
   margin: 1rem -1.2rem 0;
   padding: 0.85rem 1.2rem;
   border-block: 1px solid var(--line);
@@ -1875,6 +1876,7 @@ tbody td small {
 .result-controls label {
   grid-template-columns: auto minmax(9rem, 1fr);
   align-items: center;
+  min-width: 13rem;
 }
 
 .result-controls select {
@@ -1998,6 +2000,11 @@ tbody td small {
 .query-signal small {
   color: var(--muted);
   font-size: 0.67rem;
+}
+
+.query-signal.live-lead-score {
+  border-left-color: var(--amber-ink);
+  background: #faf1dd;
 }
 
 .selection-tray {
@@ -2136,6 +2143,11 @@ tbody td small {
   border-top: 2px solid #8ba99a;
 }
 
+.legend-line.relationship {
+  border-top-color: #315b87;
+  border-top-width: 3px;
+}
+
 .map-accessible-tree {
   margin-top: 0;
   padding: 0.8rem;
@@ -2219,8 +2231,36 @@ tbody td small {
   font-size: 0.9rem;
 }
 
+.live-results-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem;
+}
+
+.live-results-heading > span {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.live-route-status {
+  margin: 0.8rem 0;
+}
+
+.live-route-status > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 650;
+}
+
+.live-route-status[open] > summary {
+  margin-bottom: 0.6rem;
+}
+
 .source-results-body {
-  padding: 0 1rem 1rem;
+  padding: 0.8rem 1rem 1rem;
   border-top: 1px solid var(--line);
 }
 
@@ -2261,6 +2301,39 @@ tbody td small {
   align-items: center;
   padding: 1rem 0;
   border-top: 1px solid var(--line);
+}
+
+.source-result-actions {
+  display: grid;
+  gap: 0.55rem;
+  justify-items: stretch;
+  min-width: min(22rem, 100%);
+}
+
+.lead-admission {
+  border: 1px solid var(--line);
+  border-radius: 0.3rem;
+  background: var(--surface);
+}
+
+.lead-admission summary {
+  cursor: pointer;
+  padding: 0.55rem 0.7rem;
+  font-weight: 700;
+  font-size: 0.78rem;
+}
+
+.lead-admission form {
+  display: grid;
+  gap: 0.65rem;
+  padding: 0 0.7rem 0.7rem;
+}
+
+.lead-admission label {
+  display: grid;
+  gap: 0.25rem;
+  font-size: 0.75rem;
+  color: var(--muted);
 }
 
 .source-empty {
@@ -2371,6 +2444,41 @@ tbody td small {
   font-size: 0.72rem;
 }
 
+.signal-callout small {
+  color: #dcebe2;
+  font-size: 0.68rem;
+}
+
+.detail-facets {
+  margin-bottom: 0.85rem;
+}
+
+.signal-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.45rem;
+}
+
+.signal-facts > div {
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 0.55rem;
+  background: #f5f8f6;
+}
+
+.signal-facts > div:last-child {
+  grid-column: 1 / -1;
+}
+
+.signal-facts span,
+.signal-facts small {
+  color: var(--muted);
+  font-size: 0.7rem;
+  line-height: 1.4;
+}
+
 .input-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -2394,6 +2502,42 @@ tbody td small {
   color: var(--muted);
   font-size: 0.67rem;
   line-height: 1.4;
+}
+
+.input-grid .missing-text {
+  color: #793b36;
+}
+
+.relationship-list,
+.missing-evidence-list {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.relationship-list li,
+.missing-evidence-list li {
+  padding: 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 0.45rem;
+  background: #faf9f5;
+  font-size: 0.78rem;
+}
+
+.relationship-list span {
+  display: block;
+  margin-top: 0.2rem;
+  color: var(--muted);
+  font-size: 0.68rem;
+  line-height: 1.4;
+}
+
+.missing-evidence-list li {
+  border-color: #d5b9b6;
+  background: #fff8f7;
+  color: #6f3c37;
 }
 
 .evidence-mini {
@@ -2718,6 +2862,12 @@ tbody td small {
   padding-top: 1rem;
 }
 
+.corpus-filters > label,
+.corpus-filters select {
+  min-width: 0;
+  max-width: 100%;
+}
+
 .corpus-summary {
   display: grid;
   grid-template-columns: repeat(3, minmax(8rem, auto)) minmax(18rem, 1fr);
@@ -2767,6 +2917,15 @@ tbody td small {
   margin-top: 0.55rem;
 }
 
+.corpus-record-main {
+  min-width: 0;
+}
+
+.corpus-record-main .card-topline {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+
 .corpus-record-main > p {
   margin: 0.35rem 0;
   color: #465159;
@@ -2782,6 +2941,11 @@ tbody td small {
 
 .corpus-record-main .matched-terms {
   margin-top: 0.45rem;
+}
+
+.corpus-record-main .signal-explanation {
+  color: #4a5e55;
+  font-size: 0.72rem;
 }
 
 .corpus-record-action {

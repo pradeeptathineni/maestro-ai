@@ -1,265 +1,634 @@
 import { describe, expect, it } from 'vitest';
-import { buildDiscoveryPlan } from './discovery-plan.js';
-import { compileLexicalRelevance, interpretQuery, lexicalRelevance } from './query.js';
+import {
+  assessResearchCoverage,
+  buildDiscoveryPlan,
+  learnResearchVocabulary,
+  type ResearchCandidateSummary,
+} from './discovery-plan.js';
+import {
+  compileLexicalRelevance,
+  interpretQuery,
+  lexicalRelevance,
+  type QueryConceptKnowledge,
+  type QueryKnowledge,
+} from './query.js';
 
-describe('deterministic query interpretation', () => {
-  it('keeps explicit and suggested facets separate for an ambiguous query', () => {
-    const result = interpretQuery('ai github');
-    expect(result.explicitFacets).toContainEqual(
-      expect.objectContaining({ key: 'distribution', value: 'github', origin: 'explicit' }),
+function concept(
+  stableKey: string,
+  facetKey: string,
+  preferredLabel: string,
+  options: Partial<QueryConceptKnowledge> = {},
+): QueryConceptKnowledge {
+  return {
+    conceptId: options.conceptId ?? `concept:${stableKey}`,
+    schemeKey: options.schemeKey ?? 'test-concepts',
+    schemeVersion: options.schemeVersion ?? 1,
+    stableKey,
+    facetKey,
+    preferredLabel,
+    labels: options.labels ?? [preferredLabel],
+    relations: options.relations ?? [],
+  };
+}
+
+const knowledge: QueryKnowledge = {
+  concepts: [
+    concept('entity-class:implementation', 'entity_class', 'Implementation', {
+      labels: ['Implementation', 'Technology', 'Tool', 'Library', 'Framework'],
+    }),
+    concept('entity-class:model', 'entity_class', 'Model', {
+      labels: ['Model', 'Models', 'Model family'],
+    }),
+    concept('entity-class:document', 'entity_class', 'Document', {
+      labels: ['Document', 'Paper', 'Article'],
+    }),
+    concept('entity-class:standard', 'entity_class', 'Standard or protocol', {
+      labels: ['Standard or protocol', 'Standard', 'Protocol', 'Specification'],
+    }),
+    concept('interface:mcp-server', 'interface', 'MCP server', {
+      labels: ['MCP server', 'Model Context Protocol server'],
+    }),
+    concept('interface:library', 'interface', 'Library'),
+    concept('domain:ocean-engineering', 'domain', 'Ocean engineering', {
+      relations: [
+        {
+          conceptId: 'concept:domain:underwater-robotics',
+          relationType: 'narrower',
+          stableKey: 'domain:underwater-robotics',
+          facetKey: 'domain',
+          label: 'Underwater robotics',
+        },
+        {
+          conceptId: 'concept:domain:marine-sensing',
+          relationType: 'related',
+          stableKey: 'domain:marine-sensing',
+          facetKey: 'domain',
+          label: 'Marine sensing',
+        },
+      ],
+    }),
+    concept('domain:underwater-robotics', 'domain', 'Underwater robotics', {
+      labels: ['Underwater robotics', 'Marine robotics'],
+    }),
+    concept('capability:context-compression', 'capability', 'Context compression', {
+      labels: ['Context compression', 'Prompt compression'],
+      relations: [
+        {
+          conceptId: 'concept:capability:selective-context',
+          relationType: 'related',
+          stableKey: 'capability:selective-context',
+          facetKey: 'capability',
+          label: 'Selective context',
+        },
+      ],
+    }),
+    concept('capability:repeatable-workflows', 'capability', 'Repeatable agent workflows', {
+      labels: ['Repeatable agent workflows'],
+    }),
+    concept('entity-class:practice', 'entity_class', 'Practice', {
+      labels: ['Practice', 'Workflow', 'Workflows'],
+    }),
+  ],
+  entities: [
+    {
+      entityId: 'entity:seabed-observer',
+      entityClass: 'implementation',
+      preferredLabel: 'Seabed Observer',
+      aliases: ['Ocean Floor Observer'],
+    },
+  ],
+};
+
+describe('knowledge-driven query interpretation', () => {
+  it('resolves an arbitrary domain and acronym from injected concept data', () => {
+    const full = interpretQuery('ocean engineering', {}, knowledge);
+    const acronym = interpretQuery('oe', {}, knowledge);
+    expect(full).toMatchObject({
+      intentMode: 'broad_landscape',
+      interpretationMethod: 'deterministic-v4',
+      coverageState: 'maintained',
+    });
+    expect(full.canonicalConcepts).toContain('Ocean engineering');
+    expect(full.landscapeFacets).toEqual(['Underwater robotics', 'Marine sensing']);
+    expect(acronym.resolvedConcepts).toContainEqual(
+      expect.objectContaining({
+        stableKey: 'domain:ocean-engineering',
+        matchMethod: 'acronym',
+      }),
     );
-    expect(result.coverageState).toBe('partial');
   });
 
-  it('expands semantic paraphrases without naming products', () => {
-    const result = interpretQuery('ai language better tone');
-    expect(result.capabilityGroups).toContain('Writing and design quality');
-    expect(result.expandedTerms).toEqual(expect.arrayContaining(['editing', 'prose', 'style']));
-  });
-
-  it('recognizes repository self-engineering, verification, and orchestration intents', () => {
+  it('resolves a unique acronym inside a longer landscape query', () => {
+    const artificialIntelligence = concept(
+      'domain:artificial-intelligence',
+      'domain',
+      'Artificial intelligence',
+    );
     const result = interpretQuery(
-      'ai repository runtime verification skills hooks multi-agent orchestration',
+      'map reusable systems in the AI developer tool landscape',
+      {},
+      { ...knowledge, concepts: [...knowledge.concepts, artificialIntelligence] },
     );
-    expect(result.capabilityGroups).toEqual(
+    expect(result).toMatchObject({ intentMode: 'broad_landscape' });
+    expect(result.subjectConcepts).toContainEqual(
+      expect.objectContaining({
+        stableKey: 'domain:artificial-intelligence',
+        matchMethod: 'acronym',
+      }),
+    );
+  });
+
+  it('uses generic morphology when resolving curated alternate concept labels', () => {
+    const localRuntime = concept(
+      'capability:local-model-runtime',
+      'capability',
+      'Local model runtime',
+      { labels: ['Local model runtime', 'Local inference runtime'] },
+    );
+    const result = interpretQuery(
+      'run model inference locally through a developer interface',
+      {},
+      { ...knowledge, concepts: [...knowledge.concepts, localRuntime] },
+    );
+    expect(result.subjectConcepts).toContainEqual(
+      expect.objectContaining({ stableKey: 'capability:local-model-runtime' }),
+    );
+  });
+
+  it('handles unseen knowledge by data injection rather than a code change', () => {
+    const mycology = concept('domain:mycology', 'domain', 'Mycology', {
+      labels: ['Mycology', 'Fungal biology'],
+    });
+    const before = interpretQuery('fungal biology', {}, knowledge);
+    const after = interpretQuery(
+      'fungal biology',
+      {},
+      {
+        ...knowledge,
+        concepts: [...knowledge.concepts, mycology],
+      },
+    );
+    expect(before.coverageState).toBe('outside_maintained_coverage');
+    expect(after).toMatchObject({ coverageState: 'maintained', intentMode: 'broad_landscape' });
+    expect(after.canonicalConcepts).toContain('Mycology');
+  });
+
+  it('keeps unknown domains open-world and still extracts bounded mechanisms', () => {
+    const result = interpretQuery('mycology field notebook comparison');
+    expect(result.coverageState).toBe('outside_maintained_coverage');
+    expect(result.capabilityGroups).toEqual([]);
+    expect(result.mechanismTerms).toEqual(
+      expect.arrayContaining(['mycology field notebook', 'field notebook']),
+    );
+    expect(result.sourceRoutingHints).toEqual(
+      expect.arrayContaining(['local_index', 'general_web', 'implementation_forge']),
+    );
+  });
+
+  it('does not treat a generic entity-class noun as maintained subject coverage', () => {
+    const result = interpretQuery('xylophagous beetle stridulation framework', {}, knowledge);
+    expect(result.resolvedConcepts).toContainEqual(
+      expect.objectContaining({ stableKey: 'entity-class:implementation' }),
+    );
+    expect(result).toMatchObject({
+      coverageState: 'outside_maintained_coverage',
+      initialCoverageState: 'outside_maintained_coverage',
+      coverageBasis: 'outside_maintained_coverage',
+      typedTarget: null,
+      requestedEntityClasses: [],
+    });
+  });
+
+  it('uses generic result types as constraints rather than subject relevance', () => {
+    const result = interpretQuery('xylophagous beetle stridulation framework', {}, knowledge);
+    expect(result.subjectTerms).toEqual(['xylophagous', 'beetle', 'stridulation']);
+    expect(result.subjectConcepts).toEqual([]);
+    expect(
+      lexicalRelevance(result, {
+        name: 'General web framework',
+        aliases: ['Framework library'],
+        capabilities: ['framework'],
+        searchText: 'A framework for web applications.',
+      }).ordinal,
+    ).toBe('no_match');
+  });
+
+  it('keeps problem verbs as intent while sending subject-bearing terms to sources', () => {
+    const interpretation = interpretQuery('reduce flaky browser tests', {}, knowledge);
+    const plan = buildDiscoveryPlan('reduce flaky browser tests', interpretation, {
+      externalSourcesEnabled: true,
+    });
+    expect(interpretation).toMatchObject({
+      intentMode: 'problem_discovery',
+      subjectTerms: ['flaky', 'browser', 'tests'],
+    });
+    expect(plan.routes.find((route) => route.adapterKey === 'github')).toMatchObject({
+      state: 'planned',
+      variant: 'flaky browser tests',
+    });
+    expect(plan.secondPass.routes.filter((route) => route.adapterKey === 'github')).toHaveLength(0);
+  });
+
+  it('preserves source syntax before normalization and distinguishes local-first from locality', () => {
+    const localFirst = interpretQuery('CRDT local-first database research article', {}, knowledge);
+    expect(localFirst.sourceText).toBe('CRDT local-first database research article');
+    expect(localFirst.subjectTerms).toEqual(['crdt', 'local', 'first', 'database']);
+    expect(localFirst.explicitFacets).not.toContainEqual(
+      expect.objectContaining({ key: 'locality' }),
+    );
+
+    const constrained = interpretQuery('local offline vector database without API key');
+    expect(constrained.subjectTerms).toEqual(['vector', 'database']);
+    expect(constrained.explicitFacets).toEqual(
       expect.arrayContaining([
-        'Coding systems',
-        'Evaluation and observability',
-        'Interoperability and discovery',
-        'Agent workflow and orchestration',
+        expect.objectContaining({ key: 'locality', value: 'offline' }),
+        expect.objectContaining({ key: 'network_constraint', value: 'no_network' }),
       ]),
     );
-    expect(result.expandedTerms).toEqual(
-      expect.arrayContaining(['testing', 'integration', 'handoff', 'workflow']),
+  });
+
+  it('does not treat a one-word interface inside an unseen subject as maintained coverage', () => {
+    const result = interpretQuery('xylophagous beetle stridulation library', {}, knowledge);
+    expect(result.resolvedConcepts).toContainEqual(
+      expect.objectContaining({ stableKey: 'interface:library' }),
+    );
+    expect(result.coverageState).toBe('outside_maintained_coverage');
+    expect(result.initialCoverageState).toBe('outside_maintained_coverage');
+    expect(interpretQuery('MCP server interoperability', {}, knowledge).coverageState).toBe(
+      'maintained',
+    );
+    const language = concept('interface:language', 'interface', 'Language');
+    expect(
+      interpretQuery(
+        'agglutinative dialect morphology language',
+        {},
+        {
+          ...knowledge,
+          concepts: [...knowledge.concepts, language],
+        },
+      ).coverageState,
+    ).toBe('outside_maintained_coverage');
+
+    const plugin = concept('interface:plugin', 'interface', 'Plugin');
+    expect(
+      interpretQuery(
+        'plugins',
+        {},
+        {
+          ...knowledge,
+          concepts: [...knowledge.concepts, plugin],
+        },
+      ),
+    ).toMatchObject({
+      subjectTerms: ['plugins'],
+      subjectConcepts: [expect.objectContaining({ stableKey: 'interface:plugin' })],
+      coverageState: 'maintained',
+    });
+  });
+
+  it('separates exact identity, typed, temporal, constrained, and ambiguous intent', () => {
+    expect(interpretQuery('Seabed Observer', {}, knowledge)).toMatchObject({
+      intentMode: 'exact_entity',
+      exactEntities: [expect.objectContaining({ entityId: 'entity:seabed-observer' })],
+    });
+    expect(interpretQuery('marine robotics models', {}, knowledge)).toMatchObject({
+      intentMode: 'typed_discovery',
+      typedTarget: 'model',
+      requestedEntityClasses: ['model'],
+    });
+    expect(interpretQuery('latest marine robotics models', {}, knowledge).intentMode).toBe(
+      'temporal_discovery',
+    );
+    expect(interpretQuery('multi-model routing gateway', {}, knowledge)).toMatchObject({
+      intentMode: 'task_discovery',
+      typedTarget: null,
+      requestedEntityClasses: [],
+    });
+    expect(interpretQuery('repeatable workflows', {}, knowledge)).toMatchObject({
+      intentMode: 'task_discovery',
+      typedTarget: null,
+      requestedEntityClasses: [],
+    });
+    expect(interpretQuery('marine robotics without cloud', {}, knowledge)).toMatchObject({
+      intentMode: 'constrained_discovery',
+      exclusions: ['cloud'],
+    });
+    expect(interpretQuery('xyz')).toMatchObject({
+      intentMode: 'ambiguous',
+      coverageState: 'partial',
+    });
+  });
+
+  it('recognizes document and standard types from taxonomy labels', () => {
+    expect(interpretQuery('papers about marine robotics', {}, knowledge)).toMatchObject({
+      intentMode: 'knowledge_discovery',
+      typedTarget: 'article',
+      requestedEntityClasses: ['document'],
+    });
+    expect(interpretQuery('marine robotics protocol', {}, knowledge)).toMatchObject({
+      intentMode: 'knowledge_discovery',
+      typedTarget: 'standard',
+      requestedEntityClasses: ['standard'],
+    });
+    expect(
+      interpretQuery(
+        'open standard connecting tools to assistants',
+        {},
+        {
+          ...knowledge,
+          concepts: [
+            ...knowledge.concepts,
+            concept('document-type:standard', 'document_type', 'Standard document', {
+              labels: ['Standard document', 'Standard'],
+            }),
+          ],
+        },
+      ),
+    ).toMatchObject({
+      intentMode: 'knowledge_discovery',
+      typedTarget: 'standard',
+      requestedEntityClasses: ['document'],
+    });
+
+    const researchType = concept('document-type:research', 'document_type', 'Research');
+    const withResearch = { ...knowledge, concepts: [...knowledge.concepts, researchType] };
+    expect(
+      interpretQuery('research article about marine robotics', {}, withResearch),
+    ).toMatchObject({
+      intentMode: 'knowledge_discovery',
+      typedTarget: 'article',
+      requestedEntityClasses: ['document'],
+    });
+    expect(interpretQuery('metasearch API for tool research', {}, withResearch)).toMatchObject({
+      typedTarget: null,
+      requestedEntityClasses: [],
+    });
+  });
+
+  it('preserves explicit user facts and authority boundaries', () => {
+    const result = interpretQuery(
+      'install local marine robotics tool without cloud',
+      { operating_system: 'Linux' },
+      knowledge,
+    );
+    expect(result.explicitFacets).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ key: 'locality', origin: 'explicit' }),
+        expect.objectContaining({ key: 'exclusion', value: 'cloud' }),
+        expect.objectContaining({ key: 'operating_system', value: 'Linux' }),
+      ]),
+    );
+    expect(result.missingContext).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ key: 'hardware' }),
+        expect.objectContaining({ key: 'action_authority' }),
+      ]),
     );
   });
 
-  it('marks an unmaintained domain instead of fabricating coverage', () => {
-    expect(interpretQuery('iphone shortcuts').coverageState).toBe('outside_maintained_coverage');
-    expect(interpretQuery('medical diagnosis agent').coverageState).toBe(
-      'outside_maintained_coverage',
-    );
-    expect(interpretQuery('accounting payroll automation').capabilityGroups).toEqual([]);
+  it('uses bounded concept expansion without confusing substrings', () => {
+    const interpretation = interpretQuery('oe', {}, knowledge);
+    expect(
+      lexicalRelevance(interpretation, {
+        name: 'Marine systems handbook',
+        aliases: [],
+        capabilities: ['Underwater robotics'],
+        searchText: 'Ocean engineering and marine sensing.',
+      }).ordinal,
+    ).not.toBe('no_match');
+    expect(
+      lexicalRelevance(interpretation, {
+        name: 'Poetry formatter',
+        aliases: [],
+        capabilities: [],
+        searchText: 'Formatting prose and poems.',
+      }).ordinal,
+    ).toBe('no_match');
   });
 
-  it('requires the named outside-domain term instead of matching a generic agent word', () => {
+  it('requires a material share of explicit unknown-domain terms', () => {
     const interpretation = interpretQuery('medical diagnosis agent');
     expect(
       lexicalRelevance(interpretation, {
         name: 'General coding agent',
         aliases: [],
         capabilities: ['agent'],
-        searchText: 'Agent for software repositories',
+        searchText: 'Agent for software repositories.',
       }).ordinal,
     ).toBe('no_match');
     expect(
       lexicalRelevance(interpretation, {
         name: 'Medical evidence assistant',
         aliases: [],
-        capabilities: ['agent'],
-        searchText: 'Medical diagnosis evidence workflow',
+        capabilities: ['medical diagnosis'],
+        searchText: 'Evidence workflow for diagnosis.',
       }).ordinal,
     ).not.toBe('no_match');
   });
 
-  it('recognizes held-out workflow paraphrases without product-name lookup rules', () => {
+  it('does not let one broad concept satisfy a multi-part subject query', () => {
+    const artificialIntelligence = concept(
+      'domain:artificial-intelligence',
+      'domain',
+      'Artificial intelligence',
+      { labels: ['Artificial intelligence', 'AI'] },
+    );
+    const interpretation = interpretQuery(
+      'AI context reduction',
+      {},
+      {
+        ...knowledge,
+        concepts: [...knowledge.concepts, artificialIntelligence],
+      },
+    );
     expect(
-      interpretQuery('shrink tool output before it reaches a coding assistant').capabilityGroups,
-    ).toEqual(expect.arrayContaining(['Context efficiency', 'Coding systems']));
-    expect(interpretQuery('route several llms behind one api').capabilityGroups).toContain(
-      'Agent workflow and orchestration',
-    );
-    expect(interpretQuery('mature general purpose scripting runtime').capabilityGroups).toContain(
-      'Software foundations',
-    );
-    expect(interpretQuery('no network local search').explicitFacets).toContainEqual(
-      expect.objectContaining({ key: 'network_constraint', value: 'no_network' }),
-    );
-  });
-
-  it('recognizes Codex workflow and capability-configuration language', () => {
-    expect(interpretQuery('repeatable codex workflows').coverageState).toBe('maintained');
-    expect(interpretQuery('ai capability configuration across agents').capabilityGroups).toEqual(
-      expect.arrayContaining(['Coding systems', 'Interoperability and discovery']),
-    );
-  });
-
-  it('marks self-endorsement as a coverage caveat rather than evidence', () => {
-    const result = interpretQuery('selected by Maestro top ai tool');
-    expect(result.coverageState).toBe('partial');
-    expect(result.missingContext).toContainEqual(
-      expect.objectContaining({ key: 'independent_evidence' }),
-    );
-  });
-
-  it('preserves explicit install kind and action authority as separate facts', () => {
-    const result = interpretQuery('install and execute the best plugin automatically');
-    expect(result.explicitFacets).toContainEqual(
-      expect.objectContaining({ key: 'candidate_kind', value: 'plugin' }),
-    );
-    expect(result.missingContext).toContainEqual(
-      expect.objectContaining({ key: 'action_authority' }),
-    );
-  });
-
-  it('keeps a human clarification explicit and adds it to deterministic retrieval terms', () => {
-    const result = interpretQuery('ai github', {
-      user_clarification: 'integration workflow, not distribution',
-    });
-    expect(result.explicitFacets).toContainEqual({
-      key: 'user_clarification',
-      label: 'User Clarification',
-      value: 'integration workflow, not distribution',
-      origin: 'explicit',
-    });
-    expect(result.terms).toEqual(expect.arrayContaining(['integration', 'workflow']));
-
-    const acceptedSuggestion = interpretQuery('ai github', {
-      integration_target: 'github_integration',
-    });
-    expect(acceptedSuggestion.explicitFacets).toContainEqual(
-      expect.objectContaining({ key: 'integration_target', origin: 'explicit' }),
-    );
-    expect(acceptedSuggestion.inferredFacets).not.toContainEqual(
-      expect.objectContaining({ key: 'integration_target' }),
-    );
-  });
-
-  it('uses ordinal rule relevance and preserves matched fields', () => {
-    const interpretation = interpretQuery('ai context reduction github');
-    const result = lexicalRelevance(interpretation, {
-      name: 'Context helper',
-      aliases: ['context optimizer'],
-      capabilities: ['context output reduction'],
-      searchText: 'GitHub repository output filtering',
-    });
-    expect(result.ordinal).toBe('direct');
-    expect(result.value).toBe(100);
-    expect(result.matchedFields).toEqual(expect.arrayContaining(['capability', 'knowledge']));
-  });
-
-  it('does not reward repeated aliases or keyword stuffing', () => {
-    const interpretation = interpretQuery('repository context compression');
-    const concise = lexicalRelevance(interpretation, {
-      name: 'Context helper',
-      aliases: ['repository helper'],
-      capabilities: ['context-compression'],
-      searchText: 'repository context compression',
-    });
-    const repeated = lexicalRelevance(interpretation, {
-      name: 'Context helper',
-      aliases: Array.from({ length: 20 }, () => 'repository helper'),
-      capabilities: ['context-compression'],
-      searchText: Array.from({ length: 20 }, () => 'repository context compression').join(' '),
-    });
-    expect(repeated).toEqual(concise);
+      lexicalRelevance(interpretation, {
+        name: 'Artificial Intelligence Roadmap',
+        aliases: ['AI roadmap'],
+        capabilities: ['Artificial intelligence'],
+        searchText: 'A general collection of artificial intelligence resources.',
+      }).ordinal,
+    ).toBe('no_match');
   });
 
   it('keeps compiled bulk matching identical to one-off matching', () => {
-    const interpretation = interpretQuery('ai context reduction github');
+    const interpretation = interpretQuery('prompt compression tool', {}, knowledge);
     const document = {
       name: 'Context helper',
-      aliases: ['context optimizer'],
-      capabilities: ['context output reduction'],
-      searchText: 'GitHub repository output filtering',
+      aliases: ['prompt optimizer'],
+      capabilities: ['context compression'],
+      searchText: 'Selective context for long prompts.',
     };
     expect(compileLexicalRelevance(interpretation)(document)).toEqual(
       lexicalRelevance(interpretation, document),
     );
   });
 
-  it('treats broad engineering abbreviations as correctable concepts, not substrings', () => {
-    const ai = interpretQuery('ai');
-    expect(
-      lexicalRelevance(ai, {
-        name: 'New AI practice',
-        aliases: [],
-        capabilities: [],
-        searchText: 'A newly authored AI research practice.',
-      }).ordinal,
-    ).not.toBe('no_match');
-    expect(
-      lexicalRelevance(ai, {
-        name: 'Sustainability guide',
-        aliases: [],
-        capabilities: [],
-        searchText: 'A guide to sustainable infrastructure.',
-      }).ordinal,
-    ).toBe('no_match');
-    const ml = interpretQuery('ml');
-    expect(ml).toMatchObject({
-      intentMode: 'broad_landscape',
-      typedTarget: null,
-      interpretationMethod: 'deterministic-v2',
+  it('does not reward repeated aliases or keyword stuffing', () => {
+    const interpretation = interpretQuery('prompt compression', {}, knowledge);
+    const concise = lexicalRelevance(interpretation, {
+      name: 'Context helper',
+      aliases: ['prompt helper'],
+      capabilities: ['context compression'],
+      searchText: 'Selective context.',
     });
-    expect(ml.canonicalConcepts).toContain('Machine learning');
-    expect(
-      lexicalRelevance(ml, {
-        name: 'HTML formatter',
-        aliases: [],
-        capabilities: [],
-        searchText: 'Small markup formatter',
-      }).ordinal,
-    ).toBe('no_match');
-    expect(interpretQuery('cs').canonicalConcepts).toContain('Computer science');
-    expect(interpretQuery('devops').landscapeFacets).toContain('Orchestration');
+    const repeated = lexicalRelevance(interpretation, {
+      name: 'Context helper',
+      aliases: Array.from({ length: 20 }, () => 'prompt helper'),
+      capabilities: ['context compression'],
+      searchText: Array.from({ length: 20 }, () => 'selective context').join(' '),
+    });
+    expect(repeated).toEqual(concise);
   });
+});
 
-  it('uses a type filter only for genuinely typed requests', () => {
-    expect(interpretQuery('ai models').typedTarget).toBe('model');
-    expect(interpretQuery('articles about context engineering').typedTarget).toBe('article');
-    expect(interpretQuery('current model context protocol specification').typedTarget).toBe(
-      'standard',
-    );
-    expect(interpretQuery('local ai model runtime').typedTarget).toBeNull();
-    expect(interpretQuery('structured output typescript model api').typedTarget).toBeNull();
-    expect(interpretQuery('typed typescript model provider adapter').typedTarget).toBeNull();
-  });
-
-  it('does not promote a generic concept label over explicit task terms', () => {
-    const interpretation = interpretQuery('evidence based coding agent benchmark');
-    expect(
-      lexicalRelevance(interpretation, {
-        name: 'Generic coding agent',
-        aliases: [],
-        capabilities: ['Coding systems'],
-        searchText: 'Coding agent for repositories.',
-      }).ordinal,
-    ).not.toBe('direct');
-    expect(
-      lexicalRelevance(interpretation, {
-        name: 'Evaluation harness',
-        aliases: [],
-        capabilities: ['evidence based benchmark'],
-        searchText: 'Evaluation benchmark for coding agents.',
-      }).ordinal,
-    ).toBe('partial');
-  });
-
-  it('matches bounded words across common hyphenation and expands authentication intent', () => {
-    const infrastructure = interpretQuery('infrastructure state planner');
-    expect(
-      lexicalRelevance(infrastructure, {
-        name: 'Infrastructure engine',
-        aliases: [],
-        capabilities: ['infrastructure-as-code'],
-        searchText: 'Declarative infrastructure state tooling.',
-      }).ordinal,
-    ).toBe('partial');
-    const connection = interpretQuery('connect an agent to slack with managed auth');
-    expect(connection.capabilityGroups).toContain('Interoperability and discovery');
-    expect(connection.expandedTerms).toContain('authentication');
-  });
-
-  it('routes one coherent intent with source-specific reasons and no private context', () => {
-    const interpretation = interpretQuery('open standard connecting tools to assistants');
-    const plan = buildDiscoveryPlan('open standard connecting tools to assistants', interpretation);
-    expect(plan.policyVersion).toBe('source-plan-v1');
+describe('bounded research planning', () => {
+  it('builds source-specific routes, budgets, and a private-context-safe disclosure', () => {
+    const interpretation = interpretQuery('MCP server interoperability', {}, knowledge);
+    const plan = buildDiscoveryPlan('MCP server interoperability', interpretation);
+    expect(plan).toMatchObject({
+      policyVersion: 'research-plan-v5',
+      interpretationVersion: 'deterministic-v4',
+      budgets: { maximumPasses: 2, maximumVariantsPerSource: 2 },
+      stopReason: 'planning_complete',
+    });
     expect(plan.routes.find((item) => item.adapterKey === 'mcp_registry')).toMatchObject({
       state: 'planned',
-      callLimit: 1,
+      sourceClass: 'technology_registry',
       disclosure: { privateProjectContextIncluded: false },
     });
-    expect(plan.routes.every((item) => item.callLimit <= 1)).toBe(true);
+    expect(plan.routes.every((item) => item.callLimit <= 1 && item.passIndex === 1)).toBe(true);
+  });
+
+  it('compiles bounded source-native subject queries instead of forwarding every modifier', () => {
+    const supplyChain = interpretQuery('software supply chain SBOM signing and provenance');
+    const supplyPlan = buildDiscoveryPlan(
+      'software supply chain SBOM signing and provenance',
+      supplyChain,
+    );
+    expect(supplyPlan.routes.find((route) => route.adapterKey === 'github')?.variant).toBe(
+      'supply chain sbom',
+    );
+
+    const rust = interpretQuery('Rust async web framework with observability');
+    const rustPlan = buildDiscoveryPlan('Rust async web framework with observability', rust);
+    expect(rustPlan.routes.find((route) => route.adapterKey === 'github')?.variant).toBe(
+      'rust async observability',
+    );
+  });
+
+  it('keeps the original subject when a known entity is only mentioned', () => {
+    const withKubernetes = {
+      concepts: [],
+      entities: [
+        {
+          entityId: 'entity:kubernetes',
+          entityClass: 'implementation',
+          preferredLabel: 'Kubernetes',
+          aliases: ['k8s'],
+          kind: 'platform',
+          capabilities: [],
+          searchText: 'container orchestration',
+        },
+      ],
+    };
+    const interpretation = interpretQuery(
+      'zero trust workload identity for Kubernetes',
+      {},
+      withKubernetes,
+    );
+    expect(interpretation.exactEntities).toEqual([
+      expect.objectContaining({ preferredLabel: 'Kubernetes', matchMethod: 'mentioned' }),
+    ]);
+    const plan = buildDiscoveryPlan(interpretation.sourceText!, interpretation);
+    expect(plan.routes.find((route) => route.adapterKey === 'searxng')?.variant).toBe(
+      'zero trust kubernetes workload identity',
+    );
+  });
+
+  it('plans one bounded targeted second pass from measured gaps', () => {
+    const interpretation = interpretQuery('ocean engineering', {}, knowledge);
+    const candidates: ResearchCandidateSummary[] = [
+      { entityClass: 'implementation', group: 'Marine sensing' },
+      { entityClass: 'implementation', group: 'Marine sensing' },
+      { entityClass: 'implementation', group: 'Marine sensing' },
+      { entityClass: 'implementation', group: 'Marine sensing' },
+      { entityClass: 'implementation', group: 'Marine sensing' },
+    ];
+    const coverage = assessResearchCoverage(interpretation, candidates);
+    const plan = buildDiscoveryPlan('ocean engineering', interpretation, {
+      coverageAssessment: coverage,
+      externalSourcesEnabled: true,
+    });
+    expect(coverage).toMatchObject({
+      needsSecondPass: true,
+      missingBranches: ['Underwater robotics'],
+      dominantEntityClassShare: 1,
+    });
+    expect(plan).toMatchObject({
+      secondPass: { state: 'planned' },
+      stopReason: 'second_pass_planned',
+    });
+    expect(plan.secondPass.routes.length).toBeGreaterThan(0);
+    expect(plan.secondPass.routes.every((route) => route.passIndex === 2)).toBe(true);
+  });
+
+  it('produces a coherent open-world plan for a domain absent from the taxonomy', () => {
+    const interpretation = interpretQuery('mycology field notebooks');
+    const coverage = assessResearchCoverage(interpretation, []);
+    const plan = buildDiscoveryPlan('mycology field notebooks', interpretation, {
+      coverageAssessment: coverage,
+      externalSourcesEnabled: true,
+    });
+    expect(plan.routes.find((route) => route.adapterKey === 'searxng')).toMatchObject({
+      state: 'planned',
+      sourceClass: 'general_web',
+    });
+    expect(plan.secondPass).toMatchObject({
+      state: 'completed',
+      trigger: 'No distinct bounded source variant remained after first-pass gap analysis.',
+      routes: [],
+    });
+    expect(plan.requiredCoverage.sourceClasses).toContain('general_web');
+  });
+
+  it('retains attributed first-pass vocabulary and appends it to an unseen-domain follow-up', () => {
+    const interpretation = interpretQuery('mycology field notebooks');
+    const learnedVocabulary = learnResearchVocabulary(interpretation, [
+      {
+        candidateId: 'lead-1',
+        adapterKey: 'searxng',
+        canonicalUri: 'https://example.test/mycota-ledger',
+        title: 'Mycota Ledger',
+        summary: 'A mycology field notebook for recording fungal specimens.',
+        matchBand: 'Direct',
+        matchScore: 86,
+        rerankPosition: 1,
+      },
+      {
+        candidateId: 'lead-2',
+        adapterKey: 'github',
+        canonicalUri: 'https://github.com/example/mycota-mobile',
+        title: 'example/Mycota Mobile',
+        summary: 'Mobile field notes for mycology specimen collection.',
+        matchBand: 'Strong',
+        matchScore: 68,
+        rerankPosition: 2,
+      },
+    ]);
+    expect(learnedVocabulary[0]).toMatchObject({
+      term: expect.stringContaining('mycota'),
+      sourceCandidateIds: expect.arrayContaining(['lead-1', 'lead-2']),
+      sourceAdapters: ['github', 'searxng'],
+    });
+    const plan = buildDiscoveryPlan('mycology field notebooks', interpretation, {
+      coverageAssessment: assessResearchCoverage(interpretation, []),
+      externalSourcesEnabled: true,
+      learnedVocabulary,
+    });
+    expect(plan.policyVersion).toBe('research-plan-v5');
+    expect(plan.secondPass.learnedVocabulary).toEqual(learnedVocabulary);
+    expect(plan.secondPass.routes[0]?.variant).toContain('mycota');
+    expect(plan.secondPass.routes[0]?.variant).toContain('mycology');
   });
 });

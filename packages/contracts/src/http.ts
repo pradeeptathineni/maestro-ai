@@ -150,6 +150,7 @@ const CorpusFilterSchema = Type.Object({
   ),
   source: Type.Optional(Type.String({ maxLength: 120 })),
   kind: Type.Optional(Type.String({ maxLength: 80 })),
+  entityClass: Type.Optional(Type.String({ maxLength: 80 })),
   cursor: Type.Optional(Type.String({ maxLength: 800 })),
   limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
 });
@@ -167,6 +168,7 @@ export const ResultPageQuerySchema = Type.Object({
   sort: Type.Optional(
     Type.Union([
       Type.Literal('recommended'),
+      Type.Literal('match'),
       Type.Literal('signal'),
       Type.Literal('relevance'),
       Type.Literal('evidence'),
@@ -176,7 +178,16 @@ export const ResultPageQuerySchema = Type.Object({
     ]),
   ),
   kind: Type.Optional(Type.String({ maxLength: 80 })),
+  entityClass: Type.Optional(Type.String({ maxLength: 80 })),
   capability: Type.Optional(Type.String({ maxLength: 120 })),
+  matchBand: Type.Optional(
+    Type.Union([
+      Type.Literal('Direct'),
+      Type.Literal('Strong'),
+      Type.Literal('Related'),
+      Type.Literal('Peripheral'),
+    ]),
+  ),
   evidenceState: Type.Optional(
     Type.Union([
       Type.Literal('available'),
@@ -297,6 +308,13 @@ export type ResearchRunBody = Static<typeof ResearchRunBodySchema>;
 
 export const DiscoveryAdmissionBodySchema = Type.Object({
   ...KnowledgeReviewFields,
+  entityClass: Type.Optional(
+    Type.Union([Type.Literal('implementation'), Type.Literal('document')]),
+  ),
+  kind: Type.Optional(Type.String({ minLength: 1, maxLength: 80 })),
+  title: Type.Optional(Type.String({ minLength: 1, maxLength: 500 })),
+  summary: Type.Optional(Type.String({ minLength: 1, maxLength: 2000 })),
+  publisher: Type.Optional(Type.String({ minLength: 1, maxLength: 240 })),
   rationale: Type.String({ minLength: 1, maxLength: 2000 }),
 });
 export type DiscoveryAdmissionBody = Static<typeof DiscoveryAdmissionBodySchema>;
@@ -322,11 +340,47 @@ export const BundleExportBodySchema = Type.Object({
 });
 export type BundleExportBody = Static<typeof BundleExportBodySchema>;
 
-export const WatchBodySchema = Type.Object({
-  providerId: Type.String({ format: 'uuid' }),
-  cadence: Type.Union([Type.Literal('manual'), Type.Literal('daily'), Type.Literal('weekly')]),
-  priority: Type.Optional(Type.Integer({ minimum: 0, maximum: 100 })),
-});
+const WatchCadenceSchema = Type.Union([
+  Type.Literal('manual'),
+  Type.Literal('daily'),
+  Type.Literal('weekly'),
+  Type.Literal('adaptive'),
+]);
+const WatchPrioritySchema = Type.Optional(Type.Integer({ minimum: 0, maximum: 100 }));
+export const WatchBodySchema = Type.Union([
+  Type.Object(
+    {
+      providerId: Type.String({ format: 'uuid' }),
+      cadence: WatchCadenceSchema,
+      priority: WatchPrioritySchema,
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      querySessionId: Type.String({ format: 'uuid' }),
+      cadence: WatchCadenceSchema,
+      priority: WatchPrioritySchema,
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      conceptId: Type.String({ format: 'uuid' }),
+      cadence: WatchCadenceSchema,
+      priority: WatchPrioritySchema,
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      knowledgeEntityId: Type.String({ format: 'uuid' }),
+      cadence: WatchCadenceSchema,
+      priority: WatchPrioritySchema,
+    },
+    { additionalProperties: false },
+  ),
+]);
 export type WatchBody = Static<typeof WatchBodySchema>;
 
 export const WatchStateBodySchema = Type.Object({

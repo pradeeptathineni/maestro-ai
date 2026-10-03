@@ -61,6 +61,13 @@ literal constraints, candidate generation, must-find checks, and model-output au
 semantic quality should be attributed to the model protocol rather than silently credited to the
 fallback.
 
+The retained Phase 08 fallback substrate adds faceted entity/document metadata, inspectable
+retrieval lineage, typed intrinsic Signal inputs, source reliability and corroboration evidence,
+and append-only current views. Its query grammar and rank fusion remain bounded deterministic
+comparators; they do not displace the model-led protocol or turn seeded vocabulary into an
+open-world completeness claim. The superseded spike is documented as an
+[experiment](docs/architecture/phase-08-deterministic-refoundation-experiment.md).
+
 ## Signal is not one opaque score
 
 The product must keep these questions separate:

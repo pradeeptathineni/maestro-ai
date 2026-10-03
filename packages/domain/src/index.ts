@@ -1,4 +1,5 @@
 export * from './canonical.js';
+export * from './corpus-intelligence.js';
 export * from './bundle.js';
 export * from './decision.js';
 export * from './discovery-plan.js';
@@ -7,5 +8,6 @@ export * from './ids.js';
 export * from './jobs.js';
 export * from './query.js';
 export * from './research.js';
+export * from './retrieval.js';
 export * from './types.js';
 export * from './url.js';

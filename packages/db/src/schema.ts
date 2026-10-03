@@ -1,6 +1,7 @@
 import { sql } from 'drizzle-orm';
 import {
   boolean,
+  customType,
   integer,
   jsonb,
   numeric,
@@ -15,6 +16,12 @@ import {
 export const catalog = pgSchema('catalog');
 export const workspace = pgSchema('workspace');
 export const ops = pgSchema('ops');
+
+const tsvector = customType<{ data: string }>({
+  dataType() {
+    return 'tsvector';
+  },
+});
 
 export const domainTaxonomyVersions = catalog.table(
   'domain_taxonomy_versions',
@@ -759,6 +766,7 @@ export const knowledgeProjections = catalog.table('knowledge_projections', {
   preferredLabel: text('preferred_label').notNull(),
   summary: text().notNull(),
   searchText: text('search_text').notNull(),
+  retrievalSearchVector: tsvector('retrieval_search_vector'),
   aliases: text().array().notNull().default([]),
   capabilityKeys: text('capability_keys').array().notNull().default([]),
   valueProfile: jsonb('value_profile').notNull(),
@@ -791,6 +799,7 @@ export const knowledgeDocuments = catalog.table('knowledge_documents', {
     .notNull()
     .references(() => sourceObservations.id),
   searchText: text('search_text').notNull(),
+  retrievalSearchVector: tsvector('retrieval_search_vector'),
   aliases: text().array().notNull().default([]),
   mechanismKeys: text('mechanism_keys').array().notNull().default([]),
   valueProfile: jsonb('value_profile').notNull(),
@@ -824,6 +833,395 @@ export const knowledgeDocumentSubjects = catalog.table(
       .on(table.documentId, table.capabilityDefinitionId, table.relationType)
       .where(sql`${table.capabilityDefinitionId} IS NOT NULL`),
   ],
+);
+
+export const facetDefinitions = catalog.table('facet_definitions', {
+  facetKey: text('facet_key').primaryKey(),
+  label: text().notNull(),
+  description: text().notNull(),
+  selectionMode: text('selection_mode').notNull(),
+  displayOrder: integer('display_order').notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const conceptSchemes = catalog.table(
+  'concept_schemes',
+  {
+    id: uuid().primaryKey(),
+    schemeKey: text('scheme_key').notNull(),
+    version: integer().notNull(),
+    title: text().notNull(),
+    status: text().notNull(),
+    sourceUri: text('source_uri'),
+    supersedesId: uuid('supersedes_id'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.schemeKey, table.version)],
+);
+
+export const concepts = catalog.table(
+  'concepts',
+  {
+    id: uuid().primaryKey(),
+    conceptSchemeId: uuid('concept_scheme_id')
+      .notNull()
+      .references(() => conceptSchemes.id),
+    facetKey: text('facet_key')
+      .notNull()
+      .references(() => facetDefinitions.facetKey),
+    stableKey: text('stable_key').notNull(),
+    preferredLabel: text('preferred_label').notNull(),
+    definition: text().notNull(),
+    status: text().notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.conceptSchemeId, table.stableKey)],
+);
+
+export const conceptLabels = catalog.table(
+  'concept_labels',
+  {
+    id: uuid().primaryKey(),
+    conceptId: uuid('concept_id')
+      .notNull()
+      .references(() => concepts.id),
+    label: text().notNull(),
+    normalizedLabel: text('normalized_label').notNull(),
+    labelKind: text('label_kind').notNull(),
+    locale: text().notNull().default('en'),
+    sourceObservationId: uuid('source_observation_id').references(() => sourceObservations.id),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.conceptId, table.normalizedLabel, table.labelKind, table.locale)],
+);
+
+export const conceptRelations = catalog.table('concept_relations', {
+  id: uuid().primaryKey(),
+  conceptSchemeId: uuid('concept_scheme_id')
+    .notNull()
+    .references(() => conceptSchemes.id),
+  subjectConceptId: uuid('subject_concept_id')
+    .notNull()
+    .references(() => concepts.id),
+  relationType: text('relation_type').notNull(),
+  objectConceptId: uuid('object_concept_id')
+    .notNull()
+    .references(() => concepts.id),
+  sourceObservationId: uuid('source_observation_id').references(() => sourceObservations.id),
+  evidenceBasis: jsonb('evidence_basis').notNull(),
+  confidence: numeric({ precision: 5, scale: 4 }).notNull(),
+  validFrom: timestamp('valid_from', { withTimezone: true }).notNull(),
+  validTo: timestamp('valid_to', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const knowledgeEntities = catalog.table('knowledge_entities', {
+  id: uuid().primaryKey(),
+  sourceKind: text('source_kind').notNull(),
+  providerId: uuid('provider_id').references(() => providers.id),
+  documentId: uuid('document_id').references(() => knowledgeDocuments.id),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const knowledgeEntityRevisions = catalog.table(
+  'knowledge_entity_revisions',
+  {
+    id: uuid().primaryKey(),
+    entityId: uuid('entity_id')
+      .notNull()
+      .references(() => knowledgeEntities.id),
+    revision: integer().notNull(),
+    entityClassConceptId: uuid('entity_class_concept_id')
+      .notNull()
+      .references(() => concepts.id),
+    entityClassFacetKey: text('entity_class_facet_key').notNull().default('entity_class'),
+    preferredLabel: text('preferred_label').notNull(),
+    summary: text().notNull(),
+    lifecycleState: text('lifecycle_state').notNull(),
+    sourceObservationId: uuid('source_observation_id').references(() => sourceObservations.id),
+    predecessorId: uuid('predecessor_id'),
+    contentHash: text('content_hash').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.entityId, table.revision)],
+);
+
+export const intrinsicSignalRuns = catalog.table(
+  'intrinsic_signal_runs',
+  {
+    id: uuid().primaryKey(),
+    knowledgeEntityId: uuid('knowledge_entity_id')
+      .notNull()
+      .references(() => knowledgeEntities.id),
+    entityRevisionId: uuid('entity_revision_id')
+      .notNull()
+      .references(() => knowledgeEntityRevisions.id),
+    policyId: uuid('policy_id')
+      .notNull()
+      .references(() => scorePolicies.id),
+    policyVersion: text('policy_version').notNull(),
+    profile: text().notNull(),
+    inputHash: text('input_hash').notNull(),
+    dimensionInputs: jsonb('dimension_inputs').notNull(),
+    central: numeric({ precision: 9, scale: 6 }).notNull(),
+    uncertainty: numeric({ precision: 9, scale: 6 }).notNull(),
+    conservative: numeric({ precision: 9, scale: 6 }).notNull(),
+    signalDisplay: integer('signal_display').notNull(),
+    displayState: text('display_state').notNull(),
+    band: text().notNull(),
+    evidenceConfidence: numeric('evidence_confidence', { precision: 9, scale: 6 }).notNull(),
+    evidenceConfidenceDetail: jsonb('evidence_confidence_detail').notNull(),
+    trendPolicyVersion: text('trend_policy_version').notNull(),
+    trendState: text('trend_state').notNull(),
+    trendWindowStart: timestamp('trend_window_start', { withTimezone: true }).notNull(),
+    trendWindowEnd: timestamp('trend_window_end', { withTimezone: true }).notNull(),
+    trendDetail: jsonb('trend_detail').notNull(),
+    evidenceIds: uuid('evidence_ids').array().notNull().default([]),
+    inputReferences: jsonb('input_references').notNull(),
+    generatedAt: timestamp('generated_at', { withTimezone: true }).notNull(),
+    supersededBy: uuid('superseded_by'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    unique().on(table.knowledgeEntityId, table.entityRevisionId, table.policyId, table.inputHash),
+  ],
+);
+
+export const sourceReliabilityAssessments = catalog.table(
+  'source_reliability_assessments',
+  {
+    id: uuid().primaryKey(),
+    sourceId: uuid('source_id')
+      .notNull()
+      .references(() => sources.id),
+    policyVersion: text('policy_version').notNull(),
+    authorityClass: text('authority_class').notNull(),
+    availabilityState: text('availability_state').notNull(),
+    rightsState: text('rights_state').notNull(),
+    reliabilityScore: numeric('reliability_score', { precision: 5, scale: 4 }),
+    evidenceBasis: jsonb('evidence_basis').notNull(),
+    sourceObservationIds: uuid('source_observation_ids').array().notNull().default([]),
+    observedAt: timestamp('observed_at', { withTimezone: true }).notNull(),
+    predecessorId: uuid('predecessor_id'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.sourceId, table.policyVersion, table.observedAt)],
+);
+
+export const entityMetricObservations = catalog.table(
+  'entity_metric_observations',
+  {
+    id: uuid().primaryKey(),
+    knowledgeEntityId: uuid('knowledge_entity_id')
+      .notNull()
+      .references(() => knowledgeEntities.id),
+    metricKey: text('metric_key').notNull(),
+    intrinsicDimension: text('intrinsic_dimension'),
+    metricDirection: text('metric_direction'),
+    entityRevisionId: uuid('entity_revision_id'),
+    metricAggregation: text('metric_aggregation'),
+    rawValue: numeric('raw_value'),
+    rawUnit: text('raw_unit').notNull(),
+    comparisonValue: numeric('comparison_value'),
+    comparisonUnit: text('comparison_unit'),
+    normalizedValue: numeric('normalized_value', { precision: 9, scale: 6 }),
+    cohortKey: text('cohort_key').notNull(),
+    normalizationPolicyVersion: text('normalization_policy_version').notNull(),
+    normalizationDetail: jsonb('normalization_detail').notNull(),
+    windowStart: timestamp('window_start', { withTimezone: true }).notNull(),
+    windowEnd: timestamp('window_end', { withTimezone: true }).notNull(),
+    independenceGroup: text('independence_group').notNull(),
+    sourceObservationId: uuid('source_observation_id')
+      .notNull()
+      .references(() => sourceObservations.id),
+    sourceId: uuid('source_id').references(() => sources.id),
+    sourceReliabilityAssessmentId: uuid('source_reliability_assessment_id').references(
+      () => sourceReliabilityAssessments.id,
+    ),
+    cohortPolicyVersion: text('cohort_policy_version'),
+    normalizationInputHash: text('normalization_input_hash'),
+    observedAt: timestamp('observed_at', { withTimezone: true }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    unique().on(
+      table.knowledgeEntityId,
+      table.metricKey,
+      table.sourceObservationId,
+      table.windowStart,
+      table.windowEnd,
+    ),
+  ],
+);
+
+export const corroborationAssessments = catalog.table(
+  'corroboration_assessments',
+  {
+    id: uuid().primaryKey(),
+    knowledgeEntityId: uuid('knowledge_entity_id')
+      .notNull()
+      .references(() => knowledgeEntities.id),
+    policyVersion: text('policy_version').notNull(),
+    predicate: text().notNull(),
+    applicabilityScope: text('applicability_scope').notNull(),
+    state: text().notNull(),
+    primarySourceCount: integer('primary_source_count').notNull(),
+    independentSourceCount: integer('independent_source_count').notNull(),
+    communitySourceCount: integer('community_source_count').notNull(),
+    sourceObservationIds: uuid('source_observation_ids').array().notNull().default([]),
+    evidenceItemIds: uuid('evidence_item_ids').array().notNull().default([]),
+    rationale: text().notNull(),
+    observedAt: timestamp('observed_at', { withTimezone: true }).notNull(),
+    predecessorId: uuid('predecessor_id'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    unique().on(
+      table.knowledgeEntityId,
+      table.predicate,
+      table.applicabilityScope,
+      table.observedAt,
+    ),
+  ],
+);
+
+export const sourceReliabilityObservationBindings = catalog.table(
+  'source_reliability_observation_bindings',
+  {
+    assessmentId: uuid('assessment_id').notNull(),
+    sourceId: uuid('source_id').notNull(),
+    sourceObservationId: uuid('source_observation_id').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.assessmentId, table.sourceObservationId)],
+);
+
+export const corroborationSourceBindings = catalog.table(
+  'corroboration_source_bindings',
+  {
+    assessmentId: uuid('assessment_id').notNull(),
+    sourceObservationId: uuid('source_observation_id').notNull(),
+    sourceId: uuid('source_id').notNull(),
+    sourceReliabilityAssessmentId: uuid('source_reliability_assessment_id').notNull(),
+    sourceRole: text('source_role').notNull(),
+    independenceGroup: text('independence_group').notNull(),
+    direction: text().notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.assessmentId, table.sourceObservationId, table.direction)],
+);
+
+export const corroborationEvidenceBindings = catalog.table(
+  'corroboration_evidence_bindings',
+  {
+    assessmentId: uuid('assessment_id').notNull(),
+    evidenceItemId: uuid('evidence_item_id').notNull(),
+    sourceObservationId: uuid('source_observation_id').notNull(),
+    direction: text().notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.assessmentId, table.evidenceItemId, table.direction)],
+);
+
+export const knowledgeEntityEvidenceBindings = catalog.table(
+  'knowledge_entity_evidence_bindings',
+  {
+    id: uuid().primaryKey(),
+    knowledgeEntityId: uuid('knowledge_entity_id')
+      .notNull()
+      .references(() => knowledgeEntities.id),
+    entityRevisionId: uuid('entity_revision_id').notNull(),
+    evidenceItemId: uuid('evidence_item_id')
+      .notNull()
+      .references(() => evidenceItems.id),
+    predicate: text().notNull(),
+    applicabilityScope: text('applicability_scope').notNull(),
+    bindingBasis: text('binding_basis').notNull(),
+    reviewedAt: timestamp('reviewed_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    unique().on(
+      table.knowledgeEntityId,
+      table.entityRevisionId,
+      table.evidenceItemId,
+      table.predicate,
+    ),
+  ],
+);
+
+export const entityFacetAssignments = catalog.table(
+  'entity_facet_assignments',
+  {
+    id: uuid().primaryKey(),
+    entityId: uuid('entity_id')
+      .notNull()
+      .references(() => knowledgeEntities.id),
+    conceptId: uuid('concept_id')
+      .notNull()
+      .references(() => concepts.id),
+    facetKey: text('facet_key')
+      .notNull()
+      .references(() => facetDefinitions.facetKey),
+    origin: text().notNull(),
+    confidence: numeric({ precision: 5, scale: 4 }).notNull(),
+    rationale: text().notNull(),
+    sourceObservationId: uuid('source_observation_id').references(() => sourceObservations.id),
+    evidenceItemIds: uuid('evidence_item_ids').array().notNull().default([]),
+    validFrom: timestamp('valid_from', { withTimezone: true }).notNull(),
+    validTo: timestamp('valid_to', { withTimezone: true }),
+    supersedesId: uuid('supersedes_id'),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.entityId, table.conceptId, table.validFrom)],
+);
+
+export const knowledgeRelationships = catalog.table('knowledge_relationships', {
+  id: uuid().primaryKey(),
+  subjectEntityId: uuid('subject_entity_id')
+    .notNull()
+    .references(() => knowledgeEntities.id),
+  relationType: text('relation_type').notNull(),
+  objectEntityId: uuid('object_entity_id').references(() => knowledgeEntities.id),
+  objectConceptId: uuid('object_concept_id').references(() => concepts.id),
+  direction: text().notNull(),
+  sourceObservationId: uuid('source_observation_id').references(() => sourceObservations.id),
+  evidenceItemIds: uuid('evidence_item_ids').array().notNull().default([]),
+  evidenceBasis: jsonb('evidence_basis').notNull(),
+  confidence: numeric({ precision: 5, scale: 4 }).notNull(),
+  revisionScope: jsonb('revision_scope').notNull(),
+  validFrom: timestamp('valid_from', { withTimezone: true }).notNull(),
+  validTo: timestamp('valid_to', { withTimezone: true }),
+  state: text().notNull(),
+  supersedesId: uuid('supersedes_id'),
+  legacySourceTable: text('legacy_source_table'),
+  legacySourceKey: text('legacy_source_key'),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const knowledgeDocumentRevisions = catalog.table(
+  'knowledge_document_revisions',
+  {
+    id: uuid().primaryKey(),
+    documentId: uuid('document_id')
+      .notNull()
+      .references(() => knowledgeDocuments.id),
+    revision: integer().notNull(),
+    predecessorId: uuid('predecessor_id'),
+    supersedesDocumentId: uuid('supersedes_document_id').references(() => knowledgeDocuments.id),
+    title: text().notNull(),
+    summary: text().notNull(),
+    canonicalUri: text('canonical_uri').notNull(),
+    publicationState: text('publication_state').notNull(),
+    contentDigest: text('content_digest').notNull(),
+    sourceObservationId: uuid('source_observation_id')
+      .notNull()
+      .references(() => sourceObservations.id),
+    observedAt: timestamp('observed_at', { withTimezone: true }).notNull(),
+    changeKind: text('change_kind').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.documentId, table.revision)],
 );
 
 export const projectDisplayRevisions = workspace.table('project_display_revisions', {
@@ -895,10 +1293,110 @@ export const queryResultSets = workspace.table('query_result_sets', {
   availableCount: integer('available_count').notNull(),
   truncatedCount: integer('truncated_count').notNull(),
   diagnostics: jsonb().notNull().default({}),
+  fusionPolicyVersion: text('fusion_policy_version'),
+  rerankPolicyVersion: text('rerank_policy_version'),
+  candidatePoolHash: text('candidate_pool_hash'),
+  retrievalPasses: integer('retrieval_passes'),
+  stopReason: text('stop_reason'),
+  coverageAssessment: jsonb('coverage_assessment'),
   resultHash: text('result_hash').notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
 });
+
+export const queryRetrievalRuns = workspace.table(
+  'query_retrieval_runs',
+  {
+    id: uuid().primaryKey(),
+    workspaceId: uuid('workspace_id').notNull(),
+    resultSetId: uuid('result_set_id').notNull(),
+    passIndex: integer('pass_index').notNull(),
+    retrieverKey: text('retriever_key').notNull(),
+    retrieverVersion: integer('retriever_version').notNull(),
+    sourceClass: text('source_class').notNull(),
+    sourceIdentity: text('source_identity').notNull(),
+    planRouteId: text('plan_route_id'),
+    outboundQuery: text('outbound_query').notNull(),
+    nativeResultCount: integer('native_result_count').notNull(),
+    returnedCount: integer('returned_count').notNull(),
+    responseLimitations: text('response_limitations').notNull(),
+    rightsRetentionNotes: text('rights_retention_notes').notNull(),
+    startedAt: timestamp('started_at', { withTimezone: true }).notNull(),
+    completedAt: timestamp('completed_at', { withTimezone: true }).notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.resultSetId, table.passIndex, table.retrieverKey)],
+);
+
+export const queryRetrievalHits = workspace.table(
+  'query_retrieval_hits',
+  {
+    id: uuid().primaryKey(),
+    workspaceId: uuid('workspace_id').notNull(),
+    retrievalRunId: uuid('retrieval_run_id').notNull(),
+    candidateKey: text('candidate_key').notNull(),
+    providerId: uuid('provider_id'),
+    documentId: uuid('document_id'),
+    nativeRank: integer('native_rank').notNull(),
+    nativeScore: numeric('native_score', { precision: 18, scale: 9 }).notNull(),
+    matchedTerms: text('matched_terms').array().notNull().default([]),
+    matchedConceptIds: uuid('matched_concept_ids').array().notNull().default([]),
+    explanation: text().notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    unique().on(table.retrievalRunId, table.nativeRank),
+    unique().on(table.retrievalRunId, table.candidateKey),
+  ],
+);
+
+export const queryCandidateFusions = workspace.table(
+  'query_candidate_fusions',
+  {
+    id: uuid().primaryKey(),
+    workspaceId: uuid('workspace_id').notNull(),
+    resultSetId: uuid('result_set_id').notNull(),
+    candidateKey: text('candidate_key').notNull(),
+    providerId: uuid('provider_id'),
+    documentId: uuid('document_id'),
+    candidatePoolPosition: integer('candidate_pool_position').notNull(),
+    reciprocalRank: integer('reciprocal_rank').notNull(),
+    reciprocalScore: numeric('reciprocal_score', { precision: 18, scale: 12 }).notNull(),
+    reciprocalContributions: jsonb('reciprocal_contributions').notNull(),
+    reciprocalRerankPosition: integer('reciprocal_rerank_position').notNull(),
+    reciprocalRerankScore: numeric('reciprocal_rerank_score', {
+      precision: 12,
+      scale: 6,
+    }).notNull(),
+    normalizedWeightedRank: integer('normalized_weighted_rank').notNull(),
+    normalizedWeightedScore: numeric('normalized_weighted_score', {
+      precision: 18,
+      scale: 12,
+    }).notNull(),
+    normalizedWeightedContributions: jsonb('normalized_weighted_contributions').notNull(),
+    normalizedWeightedRerankPosition: integer('normalized_weighted_rerank_position').notNull(),
+    normalizedWeightedRerankScore: numeric('normalized_weighted_rerank_score', {
+      precision: 12,
+      scale: 6,
+    }).notNull(),
+    selectedFusionPolicy: text('selected_fusion_policy').notNull(),
+    selectedFusionRank: integer('selected_fusion_rank').notNull(),
+    rerankPolicy: text('rerank_policy').notNull(),
+    rerankPosition: integer('rerank_position').notNull(),
+    rerankScore: numeric('rerank_score', { precision: 12, scale: 6 }).notNull(),
+    matchScore: integer('match_score').notNull(),
+    matchBand: text('match_band'),
+    matchedTerms: text('matched_terms').array().notNull().default([]),
+    matchedConceptIds: uuid('matched_concept_ids').array().notNull().default([]),
+    entityResolution: jsonb('entity_resolution').notNull(),
+    explanation: text().notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    unique().on(table.resultSetId, table.candidateKey),
+    unique().on(table.resultSetId, table.rerankPosition),
+  ],
+);
 
 export const queryPlans = workspace.table(
   'query_plans',
@@ -910,6 +1408,11 @@ export const queryPlans = workspace.table(
     intentMode: text('intent_mode').notNull(),
     plan: jsonb().notNull(),
     planHash: text('plan_hash').notNull(),
+    budgets: jsonb(),
+    stopPolicy: jsonb('stop_policy'),
+    stopReason: text('stop_reason'),
+    coverageAssessment: jsonb('coverage_assessment'),
+    plannedPasses: integer('planned_passes'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [unique().on(table.querySessionId, table.policyVersion)],
@@ -941,6 +1444,7 @@ export const queryDocumentResults = workspace.table(
     caveats: text().array().notNull().default([]),
     missing: text().array().notNull().default([]),
     inputHash: text('input_hash').notNull(),
+    intrinsicSignalRunId: uuid('intrinsic_signal_run_id').references(() => intrinsicSignalRuns.id),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => [unique().on(table.resultSetId, table.documentId)],
@@ -989,6 +1493,7 @@ export const queryResultItems = workspace.table('query_result_items', {
   workspaceId: uuid('workspace_id').notNull(),
   resultSetId: uuid('result_set_id').notNull(),
   querySignalRunId: uuid('query_signal_run_id').notNull(),
+  intrinsicSignalRunId: uuid('intrinsic_signal_run_id').references(() => intrinsicSignalRuns.id),
   providerId: uuid('provider_id').notNull(),
   providerRevision: integer('provider_revision').notNull(),
   position: integer().notNull(),
@@ -1054,6 +1559,39 @@ export const adapterDailyBudgets = ops.table('adapter_daily_budgets', {
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
+export const researchRuns = ops.table('research_runs', {
+  id: uuid().primaryKey(),
+  workspaceId: uuid('workspace_id').notNull(),
+  querySessionId: uuid('query_session_id').notNull(),
+  resultSetId: uuid('result_set_id').notNull(),
+  idempotencyKey: text('idempotency_key').notNull(),
+  mode: text().notNull(),
+  strategy: text().notNull(),
+  state: text().notNull(),
+  skillVersion: text('skill_version').notNull(),
+  protocolVersion: text('protocol_version').notNull(),
+  queryHash: text('query_hash').notNull(),
+  policyHash: text('policy_hash').notNull(),
+  modelAdapterKey: text('model_adapter_key'),
+  modelIdentifier: text('model_identifier'),
+  modelConfigHash: text('model_config_hash'),
+  allowedSourceKeys: text('allowed_source_keys').array().notNull(),
+  budget: jsonb().notNull(),
+  disclosure: jsonb().notNull(),
+  reservedModelCalls: integer('reserved_model_calls').notNull().default(0),
+  consumedModelCalls: integer('consumed_model_calls').notNull().default(0),
+  stopReason: text('stop_reason'),
+  receipt: jsonb(),
+  errorCode: text('error_code'),
+  safeDetail: text('safe_detail').notNull(),
+  leaseToken: uuid('lease_token'),
+  leaseUntil: timestamp('lease_until', { withTimezone: true }),
+  startedAt: timestamp('started_at', { withTimezone: true }),
+  finishedAt: timestamp('finished_at', { withTimezone: true }),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const discoveryOperations = ops.table('discovery_operations', {
   id: uuid().primaryKey(),
   workspaceId: uuid('workspace_id').notNull(),
@@ -1103,32 +1641,48 @@ export const discoveryAttempts = ops.table('discovery_attempts', {
   finishedAt: timestamp('finished_at', { withTimezone: true }),
 });
 
-export const discoveryCandidates = ops.table('discovery_candidates', {
-  id: uuid().primaryKey(),
+export const discoveryCandidates = ops.table(
+  'discovery_candidates',
+  {
+    id: uuid().primaryKey(),
+    operationId: uuid('operation_id').notNull(),
+    workspaceId: uuid('workspace_id').notNull(),
+    adapterKey: text('adapter_key').notNull(),
+    externalId: text('external_id').notNull(),
+    canonicalUri: text('canonical_uri').notNull(),
+    title: text().notNull(),
+    summary: text().notNull(),
+    kindHint: text('kind_hint'),
+    sourcePayloadHash: text('source_payload_hash').notNull(),
+    sourcePayload: jsonb('source_payload').notNull(),
+    provenance: jsonb().notNull(),
+    reviewState: text('review_state').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    unique().on(table.workspaceId, table.adapterKey, table.externalId, table.sourcePayloadHash),
+  ],
+);
+
+export const discoveryOperationCandidates = ops.table('discovery_operation_candidates', {
   operationId: uuid('operation_id').notNull(),
+  discoveryCandidateId: uuid('discovery_candidate_id').notNull(),
   workspaceId: uuid('workspace_id').notNull(),
-  adapterKey: text('adapter_key').notNull(),
-  externalId: text('external_id').notNull(),
-  canonicalUri: text('canonical_uri').notNull(),
-  title: text().notNull(),
-  summary: text().notNull(),
-  kindHint: text('kind_hint'),
-  sourcePayloadHash: text('source_payload_hash').notNull(),
-  sourcePayload: jsonb('source_payload').notNull(),
-  provenance: jsonb().notNull(),
-  reviewState: text('review_state').notNull(),
-  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  linkedAt: timestamp('linked_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
 export const discoveryAdmissions = ops.table('discovery_admissions', {
   id: uuid().primaryKey(),
   discoveryCandidateId: uuid('discovery_candidate_id').notNull(),
   workspaceId: uuid('workspace_id').notNull(),
-  providerId: uuid('provider_id').notNull(),
-  providerRevision: integer('provider_revision').notNull(),
+  providerId: uuid('provider_id'),
+  providerRevision: integer('provider_revision'),
+  documentId: uuid('document_id'),
+  documentRevision: integer('document_revision'),
+  knowledgeEntityId: uuid('knowledge_entity_id').notNull(),
   sourceObservationId: uuid('source_observation_id').notNull(),
   evidenceItemId: uuid('evidence_item_id').notNull(),
-  projectionId: uuid('projection_id').notNull(),
+  projectionId: uuid('projection_id'),
   actorType: text('actor_type').notNull(),
   rationale: text().notNull(),
   inputHash: text('input_hash').notNull(),
@@ -1160,46 +1714,6 @@ export const semanticProposals = ops.table('semantic_proposals', {
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
-export const researchRuns = ops.table('research_runs', {
-  id: uuid().primaryKey(),
-  workspaceId: uuid('workspace_id').notNull(),
-  querySessionId: uuid('query_session_id').notNull(),
-  resultSetId: uuid('result_set_id').notNull(),
-  idempotencyKey: text('idempotency_key').notNull(),
-  mode: text().notNull(),
-  strategy: text().notNull(),
-  state: text().notNull(),
-  skillVersion: text('skill_version').notNull(),
-  protocolVersion: text('protocol_version').notNull(),
-  queryHash: text('query_hash').notNull(),
-  policyHash: text('policy_hash').notNull(),
-  modelAdapterKey: text('model_adapter_key'),
-  modelIdentifier: text('model_identifier'),
-  modelConfigHash: text('model_config_hash'),
-  allowedSourceKeys: text('allowed_source_keys').array().notNull(),
-  budget: jsonb().notNull(),
-  disclosure: jsonb().notNull(),
-  reservedModelCalls: integer('reserved_model_calls').notNull().default(0),
-  consumedModelCalls: integer('consumed_model_calls').notNull().default(0),
-  stopReason: text('stop_reason'),
-  receipt: jsonb(),
-  errorCode: text('error_code'),
-  safeDetail: text('safe_detail').notNull(),
-  leaseToken: uuid('lease_token'),
-  leaseUntil: timestamp('lease_until', { withTimezone: true }),
-  startedAt: timestamp('started_at', { withTimezone: true }),
-  finishedAt: timestamp('finished_at', { withTimezone: true }),
-  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
-  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
-});
-
-export const discoveryOperationCandidates = ops.table('discovery_operation_candidates', {
-  operationId: uuid('operation_id').notNull(),
-  discoveryCandidateId: uuid('discovery_candidate_id').notNull(),
-  workspaceId: uuid('workspace_id').notNull(),
-  linkedAt: timestamp('linked_at', { withTimezone: true }).notNull().defaultNow(),
-});
-
 export const researchRunEvents = ops.table('research_run_events', {
   id: uuid().primaryKey(),
   researchRunId: uuid('research_run_id').notNull(),
@@ -1217,7 +1731,12 @@ export const watches = workspace.table('watches', {
   providerId: uuid('provider_id'),
   sourceId: uuid('source_id'),
   querySessionId: uuid('query_session_id'),
+  conceptId: uuid('concept_id'),
+  knowledgeEntityId: uuid('knowledge_entity_id'),
   cadence: text().notNull(),
+  cadenceHours: integer('cadence_hours'),
+  cadencePolicyVersion: text('cadence_policy_version').notNull().default('legacy-fixed-v1'),
+  cadenceReason: text('cadence_reason').notNull().default('Historical fixed-cadence watch.'),
   priority: integer().notNull().default(50),
   state: text().notNull(),
   lastCheckedAt: timestamp('last_checked_at', { withTimezone: true }),
@@ -1267,3 +1786,40 @@ export const sourceHealthEvents = ops.table('source_health_events', {
   checkedAt: timestamp('checked_at', { withTimezone: true }).notNull(),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
+
+export const adapterYieldObservations = ops.table('adapter_yield_observations', {
+  id: uuid().primaryKey(),
+  adapterKey: text('adapter_key').notNull(),
+  sourceValuePolicyVersion: text('source_value_policy_version').notNull(),
+  intent: text().notNull(),
+  attemptedCalls: integer('attempted_calls').notNull(),
+  successfulCalls: integer('successful_calls').notNull(),
+  returnedCandidates: integer('returned_candidates').notNull(),
+  uniqueCandidates: integer('unique_candidates').notNull(),
+  admittedCandidates: integer('admitted_candidates').notNull().default(0),
+  corroboratedCandidates: integer('corroborated_candidates').notNull().default(0),
+  durationMs: integer('duration_ms').notNull(),
+  costState: text('cost_state').notNull(),
+  costAmount: numeric('cost_amount', { precision: 12, scale: 6 }),
+  healthState: text('health_state').notNull(),
+  windowStart: timestamp('window_start', { withTimezone: true }).notNull(),
+  windowEnd: timestamp('window_end', { withTimezone: true }).notNull(),
+  createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const discoveryCandidateOrigins = ops.table(
+  'discovery_candidate_origins',
+  {
+    id: uuid().primaryKey(),
+    discoveryCandidateId: uuid('discovery_candidate_id').notNull(),
+    workspaceId: uuid('workspace_id').notNull(),
+    originClass: text('origin_class').notNull(),
+    retrievedVia: text('retrieved_via').notNull(),
+    originUri: text('origin_uri').notNull(),
+    primarySourceUri: text('primary_source_uri'),
+    corroborationState: text('corroboration_state').notNull(),
+    provenanceDetail: jsonb('provenance_detail').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.discoveryCandidateId, table.originUri, table.retrievedVia)],
+);

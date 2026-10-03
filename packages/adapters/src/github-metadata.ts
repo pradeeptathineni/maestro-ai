@@ -1,4 +1,5 @@
 import { hashCanonical } from '../../domain/src/index.js';
+import { fetchFixedPublicResource } from './network-policy.js';
 
 export type MetadataAdapterResult =
   | {
@@ -55,7 +56,7 @@ async function readBoundedBody(response: Response, maximumBytes: number): Promis
 export function createGitHubMetadataAdapter(
   options: GitHubMetadataAdapterOptions = {},
 ): GitHubMetadataAdapter {
-  const fetchImpl = options.fetchImpl ?? fetch;
+  const fetchImpl = options.fetchImpl ?? fetchFixedPublicResource;
   const timeoutMs = options.timeoutMs ?? 4_000;
   const maximumBytes = options.maximumBytes ?? 256_000;
   return {

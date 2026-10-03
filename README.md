@@ -97,7 +97,9 @@ Useful individual commands:
 | `npm run build`             | Type-check and produce the React plus Node production build                  |
 | `npm run test:e2e`          | Start the built local stack and run Chromium plus axe checks                 |
 | `npm run eval:phase06`      | Run the frozen 50-query proxy retrieval/signal evaluation                    |
+| `npm run eval:phase08`      | Run stratified fallback retrieval evaluation with explicit label provenance  |
 | `npm run benchmark:phase06` | Run the disposable 10k-row cached-query benchmark                            |
+| `npm run benchmark:phase08` | Run the Phase 08 retrieval and scoring benchmark                             |
 | `npm run context:pack`      | Create a secret-scanned, bounded disposable repository map                   |
 
 ## Production-like local run

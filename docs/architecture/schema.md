@@ -36,10 +36,28 @@ research acquisition to its declared result limit and hardens research-run histo
 transitions. Migration `0018` prevents late proposals, source operations, source links, or events
 from extending a terminal research history. Migration `0019` requires every research source
 operation to match the active run's exact workspace, query session, and immutable result-set
-snapshot. Migration `0020` serializes research child inserts and source-operation updates with
-parent finalization, so recovery cannot be crossed by a late evidence or attempt commit. The
-readiness gate requires all twenty repository migrations; catalog cardinality is diagnostic data,
-not readiness.
+snapshot. Migration `0020_research_child_serialization.sql` serializes research child inserts and
+source-operation updates with parent finalization, so recovery cannot be crossed by a late evidence
+or attempt commit.
+
+The additive intelligence substrate uses parallel, fully named Phase 08 migrations; numeric
+prefixes alone are not identifiers. `0016_faceted_knowledge.sql` through
+`0023_ai_development_tools_domain.sql` add versioned facets and relationships, two-pass retrieval
+lineage, query-independent intrinsic Signal, evidence confidence, source reliability,
+corroboration, append-only current views, and a current-scheme bridge for retained entities.
+`0024_shared_match_and_discovery_links.sql` deliberately reuses the model-led
+`ops.discovery_operation_candidates` table and only admits the shared Match policy version.
+`0025_typed_signal_normalization.sql`, `0026_evidence_bound_corroboration.sql`, and
+`0028_typed_discovery_admission.sql` add typed normalization, exact evidence bindings, and atomic
+human-reviewed admission as either an implementation or a document. The discarded duplicate
+research-run and operation-lease migrations were never released and are not part of the contract.
+`0030_precomputed_search_vectors.sql` stores the exact existing full-text expressions so bounded
+candidate ranking does not re-tokenize every matching row. `0031_corroboration_entity_binding.sql`
+requires every corroboration item to support the exact applicable entity revision, predicate, and
+scope at the database boundary.
+
+The readiness gate requires all 34 repository migration files by exact filename; catalog
+cardinality is diagnostic data, not readiness.
 
 Drizzle declarations mirror queryable concepts but do not replace reviewed SQL. Startup never uses
 schema push. Corrections to immutable evidence, score, context, and decision records require a new

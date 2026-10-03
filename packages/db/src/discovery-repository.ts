@@ -6,18 +6,18 @@ import type {
   KnowledgeOptionBody,
 } from '../../contracts/src/index.js';
 import {
+  assessRetrievalMatch,
   hashCanonical,
   buildDiscoveryPlan,
   interpretQuery,
-  lexicalRelevance,
   newOpaqueId,
   type DiscoveryPlan,
   type DiscoveryRouteState,
   type QueryInterpretation,
+  type RetrievalDocument,
 } from '../../domain/src/index.js';
 import {
-  calculateQuerySignalV2,
-  querySignalKindProfile,
+  calculateCompatibilityIntrinsicSignal,
   type QueryValueInput,
 } from '../../scoring/src/index.js';
 import {
@@ -28,7 +28,10 @@ import {
   validateExplicitLocalEndpoint,
   type DiscoveryAdapter,
 } from '../../adapters/src/index.js';
-import { furnishKnowledgeOption } from './authoring-repository.js';
+import {
+  furnishKnowledgeDocumentWithClient,
+  furnishKnowledgeOptionWithClient,
+} from './authoring-repository.js';
 import { ConflictError, DomainValidationError, NotFoundError } from './errors.js';
 import { inTransaction } from './transaction.js';
 
@@ -127,6 +130,73 @@ export function discoveryLeadValueProfile(input: {
   ];
 }
 
+function discoveryLeadType(candidate: { adapterKey?: string; kindHint: string | null }): {
+  subjectType: 'implementation' | 'document';
+  entityClass: string;
+} {
+  const kind = candidate.kindHint?.trim().toLocaleLowerCase('en-US') ?? '';
+  if (
+    new Set([
+      'article',
+      'community_discussion',
+      'documentation',
+      'paper',
+      'research',
+      'specification',
+      'standard',
+    ]).has(kind)
+  ) {
+    return { subjectType: 'document', entityClass: kind };
+  }
+  if (
+    new Set([
+      'agent',
+      'framework',
+      'library',
+      'mcp_server',
+      'model',
+      'oss_project',
+      'platform',
+      'plugin',
+      'repository',
+      'runtime',
+      'service',
+      'tool',
+    ]).has(kind) ||
+    candidate.adapterKey === 'github' ||
+    candidate.adapterKey === 'mcp_registry'
+  ) {
+    return { subjectType: 'implementation', entityClass: 'implementation' };
+  }
+  if (candidate.adapterKey === 'hacker_news') {
+    return { subjectType: 'document', entityClass: 'community_discussion' };
+  }
+  return { subjectType: 'document', entityClass: 'unknown' };
+}
+
+export function discoveryLeadRetrievalDocument(candidate: {
+  id: string;
+  title: string;
+  summary: string;
+  kindHint: string | null;
+  adapterKey?: string;
+  canonicalUri?: string;
+}): RetrievalDocument {
+  const leadType = discoveryLeadType(candidate);
+  return {
+    candidateKey: `lead:${candidate.id}`,
+    subjectType: leadType.subjectType,
+    entityId: candidate.id,
+    entityClass: leadType.entityClass,
+    kind: candidate.kindHint ?? 'other',
+    name: candidate.title,
+    aliases: [],
+    searchText: `${candidate.title} ${candidate.summary}`,
+    strongIdentityKeys: candidate.canonicalUri ? [`uri:${candidate.canonicalUri}`] : [],
+    concepts: [],
+  };
+}
+
 export function scoreDiscoveryCandidate(
   query: string | QueryInterpretation,
   candidate: JsonRow & {
@@ -135,37 +205,56 @@ export function scoreDiscoveryCandidate(
     summary: string;
     kindHint: string | null;
     sourcePayload: unknown;
+    adapterKey?: string;
+    canonicalUri?: string;
+    createdAt?: string;
   },
 ): JsonRow {
   const interpretation = typeof query === 'string' ? interpretQuery(query) : query;
-  const relevance = lexicalRelevance(interpretation, {
-    name: candidate.title,
-    aliases: [],
-    capabilities: candidate.kindHint ? [candidate.kindHint] : [],
-    searchText: `${candidate.title} ${candidate.summary}`,
-  });
-  const signal = calculateQuerySignalV2({
-    relevanceOrdinal: relevance.ordinal,
-    relevanceMethod: 'rule',
-    dimensions: discoveryLeadValueProfile(candidate),
-    kindProfile: querySignalKindProfile(candidate.kindHint ?? 'other'),
+  const match = assessRetrievalMatch(discoveryLeadRetrievalDocument(candidate), interpretation);
+  const relevance = match
+    ? match.band === 'Direct'
+      ? { ordinal: 'direct' as const, value: 100 as const }
+      : match.band === 'Strong'
+        ? { ordinal: 'partial' as const, value: 75 as const }
+        : match.band === 'Related'
+          ? { ordinal: 'complementary' as const, value: 50 as const }
+          : { ordinal: 'incidental' as const, value: 25 as const }
+    : { ordinal: 'no_match' as const, value: 0 as const };
+  const observedAt =
+    candidate.createdAt && Number.isFinite(Date.parse(candidate.createdAt))
+      ? candidate.createdAt
+      : '1970-01-01T00:00:00.000Z';
+  const signal = calculateCompatibilityIntrinsicSignal({
+    kind: candidate.kindHint ?? 'other',
+    valueProfile: discoveryLeadValueProfile(candidate),
+    observedAt,
+    evidenceSourceGroups: [candidate.adapterKey ?? 'unreviewed_source_lead'],
+    freshness: candidate.createdAt ? 0.7 : 0.3,
     provisional: true,
   });
   const publicCandidate = { ...candidate };
   delete publicCandidate.sourcePayload;
   return {
     ...publicCandidate,
-    matchedTerms: relevance.matchedTerms,
+    matchedTerms: match?.matchedTerms ?? [],
     relevanceOrdinal: relevance.ordinal,
     relevanceValue: relevance.value,
-    signalDisplay: signal.signalDisplay,
-    signalUnrounded: signal.signalUnrounded,
-    evidenceCoverage: signal.evidenceCoverage,
+    matchScore: match?.score ?? 0,
+    matchBand: match?.band ?? null,
+    matchReasons: match?.reasons ?? [],
+    matchPolicyVersion: match?.policyVersion ?? 'retrieval-match-v1',
+    signalDisplay: signal.display,
+    signalUnrounded: signal.conservative,
+    evidenceCoverage: signal.evidenceConfidence.coverage,
+    evidenceConfidence: signal.evidenceConfidence.score,
+    evidenceConfidenceDetail: signal.evidenceConfidence,
     displayState: signal.displayState,
     signalBand: signal.band,
     signalPolicyVersion: signal.policyVersion,
+    trend: signal.trend,
     signalExplanation:
-      'Preliminary query signal from source metadata. Review, project fit, and deeper evidence remain separate.',
+      'Query-independent preliminary Signal from attributed source metadata. Review, Match, project fit, and deeper evidence remain separate.',
   };
 }
 
@@ -426,6 +515,7 @@ export async function requestDiscovery(
       reservedCalls,
       duplicate: false,
       planRouteId: route?.planRouteId ?? null,
+      variantIndex: route?.variantIndex ?? 1,
       routingReason: route?.routingReason ?? null,
       sourcePlanState: route?.sourcePlanState ?? 'planned',
       resultLimit: route?.resultLimit ?? 20,
@@ -683,7 +773,7 @@ export async function processDiscoveryOperation(
            (id, operation_id, workspace_id, adapter_key, external_id, canonical_uri,
             title, summary, kind_hint, source_payload_hash, source_payload, provenance, review_state)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'lead')
-         ON CONFLICT (adapter_key, external_id, source_payload_hash) DO NOTHING`,
+         ON CONFLICT (workspace_id, adapter_key, external_id, source_payload_hash) DO NOTHING`,
         [
           candidateId,
           payload.operationId,
@@ -796,68 +886,158 @@ export async function admitDiscoveryCandidate(
   candidateId: string,
   input: DiscoveryAdmissionBody,
 ): Promise<unknown> {
-  const candidate = await pool.query<{
-    title: string;
-    summary: string;
-    canonicalUri: string;
-    kindHint: string | null;
-    admissionId: string | null;
-  }>(
-    `SELECT dc.title, dc.summary, dc.canonical_uri AS "canonicalUri",
-            dc.kind_hint AS "kindHint", da.id AS "admissionId"
-     FROM ops.discovery_candidates dc
-     LEFT JOIN ops.discovery_admissions da ON da.discovery_candidate_id = dc.id
-     WHERE dc.id = $1 AND dc.workspace_id = $2`,
-    [candidateId, workspaceId],
-  );
-  if (!candidate.rowCount) throw new NotFoundError('Discovery candidate not found.');
-  if (candidate.rows[0]!.admissionId) throw new ConflictError('Candidate is already admitted.');
-  const optionInput: KnowledgeOptionBody = {
-    name: candidate.rows[0]!.title,
-    kind: candidate.rows[0]!.kindHint ?? 'other',
-    description: candidate.rows[0]!.summary,
-    canonicalUrl: candidate.rows[0]!.canonicalUri,
-    sourceTitle: `${candidate.rows[0]!.title} discovery source`,
-    sourceOwner: 'External source publisher',
-    capabilityKey: input.capabilityKey,
-    capabilityName: input.capabilityName,
-    searchTerms: input.searchTerms,
-    limitations: input.limitations,
-    reviewState: input.reviewState,
-  };
-  const furnished = (await furnishKnowledgeOption(pool, workspaceId, optionInput)) as {
-    id: string;
-    revision: number;
-    projectionId: string;
-    evidenceId: string;
-  };
-  const observation = await pool.query<{ id: string }>(
-    `SELECT source_observation_id AS id FROM catalog.evidence_items WHERE id = $1`,
-    [furnished.evidenceId],
-  );
-  const admissionId = newOpaqueId();
-  await pool.query(
-    `INSERT INTO ops.discovery_admissions
-       (id, discovery_candidate_id, workspace_id, provider_id, provider_revision,
-        source_observation_id, evidence_item_id, projection_id, actor_type, rationale, input_hash)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'human', $9, $10)`,
-    [
-      admissionId,
+  return inTransaction(pool, async (client) => {
+    const candidate = await client.query<{
+      adapterKey: string;
+      title: string;
+      summary: string;
+      canonicalUri: string;
+      kindHint: string | null;
+      admissionId: string | null;
+    }>(
+      `SELECT dc.adapter_key AS "adapterKey", dc.title, dc.summary,
+              dc.canonical_uri AS "canonicalUri", dc.kind_hint AS "kindHint",
+              da.id AS "admissionId"
+       FROM ops.discovery_candidates dc
+       LEFT JOIN ops.discovery_admissions da ON da.discovery_candidate_id = dc.id
+       WHERE dc.id = $1 AND dc.workspace_id = $2
+       FOR UPDATE OF dc`,
+      [candidateId, workspaceId],
+    );
+    if (!candidate.rowCount) throw new NotFoundError('Discovery candidate not found.');
+    if (candidate.rows[0]!.admissionId) {
+      throw new ConflictError('Candidate is already admitted.');
+    }
+
+    const row = candidate.rows[0]!;
+    const inferred = discoveryLeadType(row);
+    const entityClass = input.entityClass ?? inferred.subjectType;
+    const title = input.title ?? row.title;
+    const summary = input.summary ?? row.summary;
+    const publisher = input.publisher ?? new URL(row.canonicalUri).hostname;
+    const inferredImplementationKind =
+      row.kindHint === 'repository' || row.kindHint === 'tool'
+        ? 'oss_project'
+        : (row.kindHint ?? 'other');
+    const inferredDocumentKind =
+      row.kindHint === 'article'
+        ? 'article'
+        : row.kindHint === 'paper' || row.kindHint === 'research'
+          ? 'research'
+          : row.kindHint === 'specification'
+            ? 'specification'
+            : row.kindHint === 'standard'
+              ? 'standard'
+              : 'resource';
+    const kind =
+      input.kind ??
+      (entityClass === 'document' ? inferredDocumentKind : inferredImplementationKind);
+
+    let furnished:
+      | {
+          subjectType: 'implementation';
+          id: string;
+          revision: number;
+          projectionId: string;
+          evidenceId: string;
+          knowledgeEntityId: string;
+        }
+      | {
+          subjectType: 'document';
+          id: string;
+          revision: number;
+          projectionId: null;
+          evidenceId: string;
+          knowledgeEntityId: string;
+        };
+    if (entityClass === 'document') {
+      const document = await furnishKnowledgeDocumentWithClient(client, workspaceId, {
+        title,
+        summary,
+        documentKind: kind,
+        canonicalUrl: row.canonicalUri,
+        sourceTitle: `${row.title} discovery source`,
+        publisher,
+        capabilityKey: input.capabilityKey,
+        capabilityName: input.capabilityName,
+        searchTerms: input.searchTerms,
+        limitations: input.limitations,
+        reviewState: input.reviewState,
+      });
+      furnished = { ...document, subjectType: 'document', projectionId: null };
+    } else {
+      const optionInput: KnowledgeOptionBody = {
+        name: title,
+        kind,
+        description: summary,
+        canonicalUrl: row.canonicalUri,
+        sourceTitle: `${row.title} discovery source`,
+        sourceOwner: publisher,
+        capabilityKey: input.capabilityKey,
+        capabilityName: input.capabilityName,
+        searchTerms: input.searchTerms,
+        limitations: input.limitations,
+        reviewState: input.reviewState,
+      };
+      const implementation = (await furnishKnowledgeOptionWithClient(
+        client,
+        workspaceId,
+        optionInput,
+      )) as {
+        id: string;
+        revision: number;
+        projectionId: string;
+        evidenceId: string;
+        knowledgeEntityId: string;
+      };
+      furnished = { ...implementation, subjectType: 'implementation' };
+    }
+
+    const observation = await client.query<{ id: string }>(
+      `SELECT source_observation_id AS id FROM catalog.evidence_items WHERE id = $1`,
+      [furnished.evidenceId],
+    );
+    const admissionId = newOpaqueId();
+    await client.query(
+      `INSERT INTO ops.discovery_admissions
+         (id, discovery_candidate_id, workspace_id, provider_id, provider_revision,
+          document_id, document_revision, knowledge_entity_id, source_observation_id,
+          evidence_item_id, projection_id, actor_type, rationale, input_hash)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'human', $12, $13)`,
+      [
+        admissionId,
+        candidateId,
+        workspaceId,
+        furnished.subjectType === 'implementation' ? furnished.id : null,
+        furnished.subjectType === 'implementation' ? furnished.revision : null,
+        furnished.subjectType === 'document' ? furnished.id : null,
+        furnished.subjectType === 'document' ? furnished.revision : null,
+        furnished.knowledgeEntityId,
+        observation.rows[0]!.id,
+        furnished.evidenceId,
+        furnished.projectionId,
+        input.rationale,
+        hashCanonical({ candidateId, input, entityClass, kind, entityId: furnished.id }),
+      ],
+    );
+    await client.query(
+      `INSERT INTO ops.adapter_yield_observations
+         (id, adapter_key, source_value_policy_version, intent, attempted_calls,
+          successful_calls, returned_candidates, unique_candidates, admitted_candidates,
+          duration_ms, cost_state, health_state, window_start, window_end)
+       VALUES ($1, $2, 'source-value-v1', 'deepen', 0, 0, 0, 0, 1,
+               0, 'zero', 'unknown', now(), now())`,
+      [newOpaqueId(), row.adapterKey],
+    );
+    return {
+      id: admissionId,
       candidateId,
-      workspaceId,
-      furnished.id,
-      furnished.revision,
-      observation.rows[0]!.id,
-      furnished.evidenceId,
-      furnished.projectionId,
-      input.rationale,
-      hashCanonical({ candidateId, input, providerId: furnished.id }),
-    ],
-  );
-  return {
-    id: admissionId,
-    candidateId,
-    providerId: furnished.id,
-    projectionId: furnished.projectionId,
-  };
+      entityClass,
+      kind,
+      knowledgeEntityId: furnished.knowledgeEntityId,
+      providerId: furnished.subjectType === 'implementation' ? furnished.id : null,
+      documentId: furnished.subjectType === 'document' ? furnished.id : null,
+      projectionId: furnished.projectionId,
+    };
+  });
 }

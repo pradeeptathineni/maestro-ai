@@ -7,7 +7,7 @@ import {
   getExplorerResultPage,
   migrate,
 } from '../packages/db/src/index.js';
-import { hashCanonical } from '../packages/domain/src/index.js';
+import { hashCanonical, type RetrievalFusionPolicy } from '../packages/domain/src/index.js';
 import { calculateQuerySignalV1, type QueryValueInput } from '../packages/scoring/src/index.js';
 import {
   phase06QueryEvaluationV1,
@@ -85,6 +85,12 @@ interface QueryMeasurement {
   elapsedMs: number;
   rankings: Record<BaselineKey, Ranking & RankingJudgment>;
 }
+
+const requestedFusionPolicy = process.env.MAESTRO_EVALUATION_FUSION_POLICY;
+const fusionPolicy: RetrievalFusionPolicy =
+  requestedFusionPolicy === 'normalized-weighted-fusion-v1'
+    ? requestedFusionPolicy
+    : 'reciprocal-rank-fusion-v1';
 
 const broadAnchors = [
   {
@@ -255,9 +261,12 @@ function fromPage(page: ResultPage): Ranking {
 
 async function getRankings(pool: Pool, query: string) {
   const started = performance.now();
-  const session = (await createExplorerSession(pool, localWorkspaceId, {
-    query,
-  })) as SessionResult;
+  const session = (await createExplorerSession(
+    pool,
+    localWorkspaceId,
+    { query },
+    { fusionPolicy },
+  )) as SessionResult;
   const [relevancePage, recommendedPage, rows] = await Promise.all([
     getExplorerResultPage(pool, localWorkspaceId, session.resultSetId, {
       limit: 50,
@@ -395,8 +404,10 @@ async function main(): Promise<void> {
       candidatePoolControl:
         'All three policies are replayed over each query result set identified by one candidate-pool hash.',
       configuration: {
-        retrieval: 'deterministic-v2 interpretation + typed lexical expansion',
-        currentSignalPolicy: 'query-signal-v2',
+        retrieval: `deterministic-v4 + retrieval-fabric-v6 + ${fusionPolicy} + structured-rerank-v1`,
+        fusionPolicy,
+        currentSignalPolicy: 'intrinsic-signal-v3',
+        compatibilityQuerySignalPolicy: 'query-signal-v2',
         historicalReplayPolicy: 'query-signal-v1',
         resultCutoff: 20,
         database: version.rows[0]!.version,
@@ -430,7 +441,7 @@ async function main(): Promise<void> {
       semanticMechanism: {
         state: 'not_configured',
         implementedCandidate:
-          'Typed deterministic interpretation, synonym expansion, heterogeneous documents, and diversity-aware ranking.',
+          'Versioned concept and alias resolution, bounded taxonomy-relation expansion, heterogeneous documents, and diversity-aware ranking.',
         limitation:
           'No approved local embedding or reranking endpoint was configured, so semantic-model benefit remains unmeasured.',
       },

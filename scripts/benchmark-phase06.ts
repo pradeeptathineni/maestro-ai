@@ -1,75 +1,24 @@
-import os from 'node:os';
 import { performance } from 'node:perf_hooks';
-import { initializeWorker } from '../apps/worker/src/initialize.js';
 import {
   createExplorerSession,
   createPool,
   getExplorerResultPage,
   listResearchCorpus,
-  migrate,
 } from '../packages/db/src/index.js';
-import { importSeed, localWorkspaceId } from '../packages/seed/src/import.js';
+import { localWorkspaceId } from '../packages/seed/src/import.js';
+import { testDatabaseUrl } from '../packages/test-fixtures/src/database.js';
 import {
-  ensureTestDatabase,
-  resetTestSchemas,
-  testDatabaseUrl,
-} from '../packages/test-fixtures/src/database.js';
+  benchmarkEnvironment,
+  ensureDedicatedBenchmarkDatabase,
+  percentile,
+  rebuildBenchmarkDatabase,
+  syntheticBenchmarkValueProfile,
+} from './benchmark-utils.js';
 import { emitJsonReport } from './write-json-report.js';
 
 const syntheticCount = 10_000;
 
-function percentile(values: number[], fraction: number): number {
-  const ordered = [...values].sort((left, right) => left - right);
-  return Number(ordered[Math.ceil(ordered.length * fraction) - 1]!.toFixed(2));
-}
-
 async function insertSyntheticCorpus(pool: ReturnType<typeof createPool>): Promise<void> {
-  const valueProfile = JSON.stringify([
-    {
-      key: 'reuse_leverage',
-      raw: 50,
-      confidence: 0.35,
-      coverage: 1,
-      applicability: 'applicable',
-      state: 'present',
-      reasons: ['Synthetic performance fixture; not knowledge evidence.'],
-      missing: [],
-      evidenceIds: [],
-    },
-    {
-      key: 'adoption_ease',
-      raw: null,
-      confidence: 0,
-      coverage: 0,
-      applicability: 'applicable',
-      state: 'missing',
-      reasons: [],
-      missing: ['Synthetic fixture.'],
-      evidenceIds: [],
-    },
-    {
-      key: 'maturity',
-      raw: null,
-      confidence: 0,
-      coverage: 0,
-      applicability: 'applicable',
-      state: 'missing',
-      reasons: [],
-      missing: ['Synthetic fixture.'],
-      evidenceIds: [],
-    },
-    {
-      key: 'provenance_clarity',
-      raw: 50,
-      confidence: 0.35,
-      coverage: 1,
-      applicability: 'applicable',
-      state: 'present',
-      reasons: ['Synthetic performance fixture; not knowledge evidence.'],
-      missing: [],
-      evidenceIds: [],
-    },
-  ]);
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -114,7 +63,7 @@ async function insertSyntheticCorpus(pool: ReturnType<typeof createPool>): Promi
               md5('phase06-perf-projection:' || n::text) || md5('phase06-perf-projection-2:' || n::text),
               now()
        FROM generate_series(1, $1) AS fixture(n)`,
-      [syntheticCount, valueProfile],
+      [syntheticCount, syntheticBenchmarkValueProfile],
     );
     await client.query('COMMIT');
   } catch (error) {
@@ -127,15 +76,8 @@ async function insertSyntheticCorpus(pool: ReturnType<typeof createPool>): Promi
 
 async function main(): Promise<void> {
   const databaseUrl = testDatabaseUrl();
-  const databaseName = decodeURIComponent(new URL(databaseUrl).pathname.slice(1));
-  if (!databaseName.endsWith('_test')) {
-    throw new Error('Discovery benchmark only resets a dedicated database ending in _test.');
-  }
-  await ensureTestDatabase();
-  await resetTestSchemas();
-  await migrate(databaseUrl);
-  await initializeWorker(databaseUrl);
-  await importSeed(databaseUrl);
+  await ensureDedicatedBenchmarkDatabase(databaseUrl);
+  await rebuildBenchmarkDatabase(databaseUrl);
   const pool = createPool(databaseUrl);
   try {
     const realKnowledgeCount = await pool.query<{ count: string }>(
@@ -190,14 +132,7 @@ async function main(): Promise<void> {
         statement:
           'Synthetic rows measure local query mechanics only and are not evidence or knowledge-quality data.',
       },
-      environment: {
-        platform: `${os.platform()} ${os.release()} ${os.arch()}`,
-        cpu: os.cpus()[0]?.model ?? 'unavailable',
-        logicalCpus: os.cpus().length,
-        memoryBytes: os.totalmem(),
-        node: process.version,
-        postgresql: postgresql.rows[0]!.version,
-      },
+      environment: benchmarkEnvironment(postgresql.rows[0]!.version),
       path: 'create immutable cached query snapshot and serialize first 50 results',
       samples: latencies.length,
       coldMs: Number(latencies[0]!.toFixed(2)),

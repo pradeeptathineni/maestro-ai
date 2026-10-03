@@ -13,10 +13,21 @@ import {
 import { testDatabaseUrl } from '../../test-fixtures/src/database.js';
 import { listProviders, replayStoredScores } from './catalog-repository.js';
 import { createPool } from './client.js';
+import {
+  recordCorroboration,
+  recordEntityMetricObservation,
+  recordSourceReliability,
+} from './corpus-intelligence-repository.js';
 import { migrate } from './migrate.js';
 import { checkSchemaDefinitions } from './schema-check.js';
 import { requestDiscovery } from './discovery-repository.js';
+import { ConflictError, DomainValidationError } from './errors.js';
 import { createExplorerSession } from './explorer-repository.js';
+import {
+  furnishKnowledgeDocumentWithClient,
+  furnishKnowledgeOption,
+} from './authoring-repository.js';
+import { inTransaction } from './transaction.js';
 import {
   addCandidate,
   createNeed,
@@ -58,11 +69,25 @@ describe('reviewed PostgreSQL contract', () => {
       '0013_query_value_projection_cache.sql',
       '0014_semantic_adapter_configuration.sql',
       '0015_discovery_intelligence.sql',
+      '0016_faceted_knowledge.sql',
       '0016_research_skill_v1.sql',
+      '0017_research_planner.sql',
       '0017_research_run_integrity.sql',
       '0018_research_child_terminal_guard.sql',
+      '0018_retrieval_fabric.sql',
+      '0019_intrinsic_signal.sql',
       '0019_research_result_set_binding.sql',
+      '0020_corpus_intelligence.sql',
       '0020_research_child_serialization.sql',
+      '0021_history_chain_integrity.sql',
+      '0022_current_knowledge_views.sql',
+      '0023_ai_development_tools_domain.sql',
+      '0024_shared_match_and_discovery_links.sql',
+      '0025_typed_signal_normalization.sql',
+      '0026_evidence_bound_corroboration.sql',
+      '0028_typed_discovery_admission.sql',
+      '0030_precomputed_search_vectors.sql',
+      '0031_corroboration_entity_binding.sql',
     ]);
     expect(migrations.rows.every((row) => /^[a-f0-9]{64}$/.test(row.sha256))).toBe(true);
   });
@@ -173,7 +198,376 @@ describe('reviewed PostgreSQL contract', () => {
   });
 
   it('keeps reviewed SQL and Drizzle table/column declarations aligned', async () => {
-    expect(await checkSchemaDefinitions(pool)).toEqual({ checkedTables: 80, errors: [] });
+    expect(await checkSchemaDefinitions(pool)).toEqual({ checkedTables: 103, errors: [] });
+  });
+
+  it('keeps JIT disabled for bounded local request queries', async () => {
+    const result = await pool.query<{ jit: string }>('SHOW jit');
+    expect(result.rows).toEqual([{ jit: 'off' }]);
+  });
+
+  it('keeps capability metadata immutable within one schema version', async () => {
+    const suffix = randomUUID();
+    const capabilityKey = `immutable-capability-${suffix}`;
+    const base = {
+      kind: 'practice' as const,
+      description: 'A stable capability definition used by multiple attributed options.',
+      sourceTitle: 'Capability immutability fixture',
+      sourceOwner: 'Maestro integration fixture',
+      capabilityKey,
+      capabilityName: 'Stable fixture capability',
+      searchTerms: ['stable', 'capability'],
+      limitations: ['Integration fixture only.'],
+      reviewState: 'proposed' as const,
+    };
+    await furnishKnowledgeOption(pool, localWorkspaceId, {
+      ...base,
+      name: `First immutable option ${suffix}`,
+      canonicalUrl: `https://example.com/immutable-capability/${suffix}/first`,
+    });
+    await furnishKnowledgeOption(pool, localWorkspaceId, {
+      ...base,
+      name: `Second immutable option ${suffix}`,
+      canonicalUrl: `https://example.com/immutable-capability/${suffix}/second`,
+    });
+    await expect(
+      furnishKnowledgeOption(pool, localWorkspaceId, {
+        ...base,
+        name: `Conflicting immutable option ${suffix}`,
+        canonicalUrl: `https://example.com/immutable-capability/${suffix}/conflict`,
+        capabilityName: 'Rewritten fixture capability',
+      }),
+    ).rejects.toBeInstanceOf(ConflictError);
+
+    const stored = await pool.query<{
+      name: string;
+      description: string;
+      preferredLabel: string;
+      labels: string[];
+      providerCount: number;
+    }>(
+      `SELECT definition.name, definition.description,
+              concept.preferred_label AS "preferredLabel",
+              array_agg(DISTINCT label.label ORDER BY label.label) AS labels,
+              count(DISTINCT capability.provider_id)::int AS "providerCount"
+       FROM catalog.capability_definitions definition
+       JOIN catalog.concepts concept ON concept.id = definition.id
+       JOIN catalog.concept_labels label ON label.concept_id = concept.id
+       JOIN catalog.provider_capabilities capability
+         ON capability.capability_definition_id = definition.id
+       WHERE definition.stable_key = $1 AND definition.schema_version = 1
+       GROUP BY definition.id, concept.id`,
+      [capabilityKey],
+    );
+    expect(stored.rows).toEqual([
+      {
+        name: base.capabilityName,
+        description: base.description,
+        preferredLabel: base.capabilityName,
+        labels: [base.capabilityName],
+        providerCount: 2,
+      },
+    ]);
+
+    const documentCapabilityKey = `immutable-document-capability-${suffix}`;
+    const documentBase = {
+      summary: 'A stable document capability definition reused without mutation.',
+      documentKind: 'article',
+      sourceTitle: 'Document capability immutability fixture',
+      publisher: 'Maestro integration fixture',
+      capabilityKey: documentCapabilityKey,
+      capabilityName: 'Stable document fixture capability',
+      searchTerms: ['stable', 'document', 'capability'],
+      limitations: ['Integration fixture only.'],
+      reviewState: 'proposed' as const,
+    };
+    const furnishDocument = (input: Parameters<typeof furnishKnowledgeDocumentWithClient>[2]) =>
+      inTransaction(pool, (client) =>
+        furnishKnowledgeDocumentWithClient(client, localWorkspaceId, input),
+      );
+    await furnishDocument({
+      ...documentBase,
+      title: `First immutable document ${suffix}`,
+      canonicalUrl: `https://example.com/immutable-document-capability/${suffix}/first`,
+    });
+    await furnishDocument({
+      ...documentBase,
+      title: `Second immutable document ${suffix}`,
+      canonicalUrl: `https://example.com/immutable-document-capability/${suffix}/second`,
+    });
+    const countsBeforeConflict = await pool.query<{ documents: number; providers: number }>(
+      `SELECT (SELECT count(*)::int FROM catalog.knowledge_documents) AS documents,
+              (SELECT count(*)::int FROM catalog.providers) AS providers`,
+    );
+    await expect(
+      furnishDocument({
+        ...documentBase,
+        title: `Conflicting-name document ${suffix}`,
+        canonicalUrl: `https://example.com/immutable-document-capability/${suffix}/name-conflict`,
+        capabilityName: 'Rewritten document fixture capability',
+      }),
+    ).rejects.toBeInstanceOf(ConflictError);
+    await expect(
+      furnishDocument({
+        ...documentBase,
+        title: `Conflicting-description document ${suffix}`,
+        canonicalUrl: `https://example.com/immutable-document-capability/${suffix}/description-conflict`,
+        summary: 'A conflicting rewrite of immutable capability metadata.',
+      }),
+    ).rejects.toBeInstanceOf(ConflictError);
+
+    const documentStored = await pool.query<{
+      name: string;
+      description: string;
+      preferredLabel: string;
+      labels: string[];
+      documentCount: number;
+    }>(
+      `SELECT definition.name, definition.description,
+              concept.preferred_label AS "preferredLabel",
+              array_agg(DISTINCT label.label ORDER BY label.label) AS labels,
+              count(DISTINCT subject.document_id)::int AS "documentCount"
+       FROM catalog.capability_definitions definition
+       JOIN catalog.concepts concept ON concept.id = definition.id
+       JOIN catalog.concept_labels label ON label.concept_id = concept.id
+       JOIN catalog.knowledge_document_subjects subject
+         ON subject.capability_definition_id = definition.id
+       WHERE definition.stable_key = $1 AND definition.schema_version = 1
+       GROUP BY definition.id, concept.id`,
+      [documentCapabilityKey],
+    );
+    expect(documentStored.rows).toEqual([
+      {
+        name: documentBase.capabilityName,
+        description: documentBase.summary,
+        preferredLabel: documentBase.capabilityName,
+        labels: [documentBase.capabilityName],
+        documentCount: 2,
+      },
+    ]);
+    const countsAfterConflict = await pool.query<{ documents: number; providers: number }>(
+      `SELECT (SELECT count(*)::int FROM catalog.knowledge_documents) AS documents,
+              (SELECT count(*)::int FROM catalog.providers) AS providers`,
+    );
+    expect(countsAfterConflict.rows).toEqual(countsBeforeConflict.rows);
+  });
+
+  it('makes metric retries idempotent only for identical immutable inputs', async () => {
+    const binding = await pool.query<{
+      knowledgeEntityId: string;
+      sourceObservationId: string;
+      observationAt: Date;
+    }>(
+      `SELECT binding.knowledge_entity_id AS "knowledgeEntityId",
+              evidence.source_observation_id AS "sourceObservationId",
+              observation.observed_at AS "observationAt"
+       FROM catalog.knowledge_entity_evidence_bindings binding
+       JOIN catalog.evidence_items evidence ON evidence.id = binding.evidence_item_id
+       JOIN catalog.source_observations observation ON observation.id = evidence.source_observation_id
+       ORDER BY binding.created_at, binding.id
+       LIMIT 1`,
+    );
+    const row = binding.rows[0]!;
+    const observedAt = new Date(
+      Math.max(Date.now(), row.observationAt.getTime() + 24 * 60 * 60 * 1000),
+    );
+    const input = {
+      knowledgeEntityId: row.knowledgeEntityId,
+      metricKey: `idempotent-fixture-${randomUUID()}`,
+      intrinsicDimension: 'reach' as const,
+      direction: 'higher_is_better' as const,
+      rawValue: 42,
+      rawUnit: 'events',
+      aggregation: 'snapshot' as const,
+      windowStart: new Date(observedAt.getTime() - 2 * 24 * 60 * 60 * 1000),
+      windowEnd: new Date(observedAt.getTime() - 24 * 60 * 60 * 1000),
+      sourceObservationId: row.sourceObservationId,
+      observedAt,
+    };
+    const [first, concurrentRetry] = await Promise.all([
+      recordEntityMetricObservation(pool, input),
+      recordEntityMetricObservation(pool, input),
+    ]);
+    expect(concurrentRetry).toBe(first);
+    await expect(recordEntityMetricObservation(pool, input)).resolves.toBe(first);
+
+    const conflictingInputs = [
+      { ...input, intrinsicDimension: 'impact' as const },
+      { ...input, direction: 'lower_is_better' as const },
+      { ...input, rawValue: 43 },
+      { ...input, rawUnit: 'occurrences' },
+      { ...input, aggregation: 'total' as const },
+      { ...input, observedAt: new Date(observedAt.getTime() + 1_000) },
+    ];
+    for (const conflict of conflictingInputs) {
+      await expect(recordEntityMetricObservation(pool, conflict)).rejects.toBeInstanceOf(
+        ConflictError,
+      );
+    }
+    const persisted = await pool.query<{ count: number }>(
+      `SELECT count(*)::int AS count
+       FROM catalog.entity_metric_observations
+       WHERE knowledge_entity_id = $1 AND metric_key = $2 AND source_observation_id = $3
+         AND window_start = $4 AND window_end = $5`,
+      [
+        input.knowledgeEntityId,
+        input.metricKey,
+        input.sourceObservationId,
+        input.windowStart,
+        input.windowEnd,
+      ],
+    );
+    expect(persisted.rows[0]!.count).toBe(1);
+  });
+
+  it('binds corroboration to the exact current entity revision, predicate, and scope', async () => {
+    const bindings = await pool.query<{
+      knowledgeEntityId: string;
+      entityRevisionId: string;
+      evidenceItemId: string;
+      predicate: string;
+      applicabilityScope: string;
+      sourceObservationId: string;
+      sourceId: string;
+      sourceOwner: string;
+      observationAt: Date;
+    }>(
+      `SELECT binding.knowledge_entity_id AS "knowledgeEntityId",
+              binding.entity_revision_id AS "entityRevisionId",
+              binding.evidence_item_id AS "evidenceItemId", binding.predicate,
+              binding.applicability_scope AS "applicabilityScope",
+              evidence.source_observation_id AS "sourceObservationId",
+              observation.source_id AS "sourceId", source.owner AS "sourceOwner",
+              observation.observed_at AS "observationAt"
+       FROM catalog.knowledge_entity_evidence_bindings binding
+       JOIN catalog.evidence_items evidence ON evidence.id = binding.evidence_item_id
+       JOIN catalog.source_observations observation ON observation.id = evidence.source_observation_id
+       JOIN catalog.sources source ON source.id = observation.source_id
+       WHERE binding.entity_revision_id = (
+         SELECT revision.id FROM catalog.knowledge_entity_revisions revision
+         WHERE revision.entity_id = binding.knowledge_entity_id
+         ORDER BY revision.revision DESC, revision.created_at DESC, revision.id DESC
+         LIMIT 1
+       )
+       ORDER BY binding.created_at, binding.id`,
+    );
+    const supported = bindings.rows[0]!;
+    const other = bindings.rows.find(
+      (row) => row.knowledgeEntityId !== supported.knowledgeEntityId,
+    )!;
+    const observedAt = new Date(
+      Math.max(Date.now(), supported.observationAt.getTime() + 24 * 60 * 60 * 1000),
+    );
+    const reliabilityAssessmentId = await recordSourceReliability(pool, {
+      sourceId: supported.sourceId,
+      authorityClass: 'primary',
+      availabilityState: 'available',
+      rightsState: 'allowed',
+      reliabilityScore: 0.9,
+      evidenceBasis: { fixture: 'exact-entity-corroboration' },
+      sourceObservationIds: [supported.sourceObservationId],
+      observedAt,
+    });
+    const exact = {
+      knowledgeEntityId: supported.knowledgeEntityId,
+      predicate: supported.predicate,
+      applicabilityScope: supported.applicabilityScope,
+      evidence: [
+        {
+          sourceObservationId: supported.sourceObservationId,
+          evidenceItemId: supported.evidenceItemId,
+          direction: 'supports' as const,
+        },
+      ],
+      observedAt,
+    };
+    await expect(recordCorroboration(pool, exact)).resolves.toMatchObject({
+      state: 'primary_only',
+    });
+    await expect(
+      recordCorroboration(pool, { ...exact, knowledgeEntityId: other.knowledgeEntityId }),
+    ).rejects.toBeInstanceOf(DomainValidationError);
+    await expect(
+      recordCorroboration(pool, {
+        ...exact,
+        applicabilityScope: `${exact.applicabilityScope}:other`,
+      }),
+    ).rejects.toBeInstanceOf(DomainValidationError);
+
+    await pool.query(
+      `INSERT INTO catalog.knowledge_entity_revisions
+         (id, entity_id, revision, entity_class_concept_id, entity_class_facet_key,
+          preferred_label, summary, lifecycle_state, source_observation_id, predecessor_id,
+          content_hash, created_at)
+       SELECT $1, entity_id, revision + 1, entity_class_concept_id, entity_class_facet_key,
+              preferred_label, summary, lifecycle_state, source_observation_id, id,
+              $2, $3
+       FROM catalog.knowledge_entity_revisions
+       WHERE id = $4`,
+      [
+        randomUUID(),
+        hashCanonical({ supersedes: supported.entityRevisionId }),
+        new Date(),
+        supported.entityRevisionId,
+      ],
+    );
+    await expect(
+      recordCorroboration(pool, { ...exact, observedAt: new Date(Date.now() + 1_000) }),
+    ).rejects.toBeInstanceOf(DomainValidationError);
+
+    const tamperedAssessmentId = randomUUID();
+    const independenceGroup = `owner:${supported.sourceOwner
+      .normalize('NFKC')
+      .trim()
+      .toLocaleLowerCase('en-US')
+      .replace(/\s+/g, '-')}`;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `INSERT INTO catalog.corroboration_assessments
+           (id, knowledge_entity_id, policy_version, predicate, applicability_scope, state,
+            primary_source_count, independent_source_count, community_source_count,
+            source_observation_ids, evidence_item_ids, rationale, observed_at)
+         VALUES ($1, $2, 'corroboration-v2', $3, $4, 'primary_only', 1, 0, 0,
+                 ARRAY[$5]::uuid[], ARRAY[$6]::uuid[], 'Tampering fixture.', $7)`,
+        [
+          tamperedAssessmentId,
+          other.knowledgeEntityId,
+          supported.predicate,
+          supported.applicabilityScope,
+          supported.sourceObservationId,
+          supported.evidenceItemId,
+          new Date(Date.now() + 2_000),
+        ],
+      );
+      await client.query(
+        `INSERT INTO catalog.corroboration_source_bindings
+           (assessment_id, source_observation_id, source_id,
+            source_reliability_assessment_id, source_role, independence_group, direction)
+         VALUES ($1, $2, $3, $4, 'primary', $5, 'supports')`,
+        [
+          tamperedAssessmentId,
+          supported.sourceObservationId,
+          supported.sourceId,
+          reliabilityAssessmentId,
+          independenceGroup,
+        ],
+      );
+      await client.query(
+        `INSERT INTO catalog.corroboration_evidence_bindings
+           (assessment_id, evidence_item_id, source_observation_id, direction)
+         VALUES ($1, $2, $3, 'supports')`,
+        [tamperedAssessmentId, supported.evidenceItemId, supported.sourceObservationId],
+      );
+      await expect(client.query('SET CONSTRAINTS ALL IMMEDIATE')).rejects.toMatchObject({
+        code: '23514',
+        constraint: 'corroboration_entity_evidence_binding',
+      });
+    } finally {
+      await client.query('ROLLBACK').catch(() => undefined);
+      client.release();
+    }
   });
 
   it('keeps first-class knowledge documents and their query results immutable', async () => {
