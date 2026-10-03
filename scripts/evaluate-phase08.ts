@@ -268,7 +268,7 @@ async function runLocalEvaluation(pool: Pool) {
         .filter((route) => route.state === 'planned')
         .map((route) => route.adapterKey),
       coherentPlan:
-        plan.policyVersion === 'research-plan-v3' &&
+        plan.policyVersion === 'research-plan-v5' &&
         result.page.resultSet.interpretation.coverageState === item.expectedPlan.expectedCoverage &&
         result.page.resultSet.retrievalPasses >= item.expectedPlan.minimumPasses &&
         plan.routes.some((route) => route.state === 'planned'),

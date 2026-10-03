@@ -8,6 +8,7 @@ export * from './corpus-intelligence-repository.js';
 export * from './discovery-repository.js';
 export * from './errors.js';
 export * from './explorer-repository.js';
+export * from './intrinsic-signal-repository.js';
 export * from './intake-repository.js';
 export * from './migrate.js';
 export * from './schema.js';

@@ -2231,8 +2231,36 @@ tbody td small {
   font-size: 0.9rem;
 }
 
+.live-results-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem;
+}
+
+.live-results-heading > span {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.live-route-status {
+  margin: 0.8rem 0;
+}
+
+.live-route-status > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 650;
+}
+
+.live-route-status[open] > summary {
+  margin-bottom: 0.6rem;
+}
+
 .source-results-body {
-  padding: 0 1rem 1rem;
+  padding: 0.8rem 1rem 1rem;
   border-top: 1px solid var(--line);
 }
 
@@ -2273,6 +2301,39 @@ tbody td small {
   align-items: center;
   padding: 1rem 0;
   border-top: 1px solid var(--line);
+}
+
+.source-result-actions {
+  display: grid;
+  gap: 0.55rem;
+  justify-items: stretch;
+  min-width: min(22rem, 100%);
+}
+
+.lead-admission {
+  border: 1px solid var(--line);
+  border-radius: 0.3rem;
+  background: var(--surface);
+}
+
+.lead-admission summary {
+  cursor: pointer;
+  padding: 0.55rem 0.7rem;
+  font-weight: 700;
+  font-size: 0.78rem;
+}
+
+.lead-admission form {
+  display: grid;
+  gap: 0.65rem;
+  padding: 0 0.7rem 0.7rem;
+}
+
+.lead-admission label {
+  display: grid;
+  gap: 0.25rem;
+  font-size: 0.75rem;
+  color: var(--muted);
 }
 
 .source-empty {

@@ -1,6 +1,7 @@
 export const refreshCadencePolicyVersion = 'refresh-cadence-v1' as const;
 export const sourceValuePolicyVersion = 'source-value-v1' as const;
-export const corroborationPolicyVersion = 'corroboration-v1' as const;
+export const legacyCorroborationPolicyVersion = 'corroboration-v1' as const;
+export const corroborationPolicyVersion = 'corroboration-v2' as const;
 
 export type WatchTargetKind = 'provider' | 'query' | 'concept' | 'entity';
 
@@ -88,7 +89,12 @@ export function assessCorroboration(evidence: CorroborationEvidence[]): Corrobor
       .map((item) => item.independenceGroup),
   );
   const independentGroups = new Set(
-    supporting.filter((item) => item.role === 'independent').map((item) => item.independenceGroup),
+    supporting
+      .filter(
+        (item) =>
+          item.role === 'independent' && !primaryGroups.has(item.independenceGroup),
+      )
+      .map((item) => item.independenceGroup),
   );
   const communityGroups = new Set(
     supporting.filter((item) => item.role === 'community').map((item) => item.independenceGroup),

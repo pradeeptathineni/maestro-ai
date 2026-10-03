@@ -1,25 +1,28 @@
 import type { Pool } from 'pg';
 import type { CorpusBrowseQuery, CorpusSearchBody } from '../../contracts/src/index.js';
 import {
-  compileLexicalRelevance,
+  assessResearchCoverage,
   hashCanonical,
   interpretQuery,
   querySubjectConcepts,
   querySubjectTerms,
+  runRetrievalPipeline,
   type QueryInterpretation,
+  type RerankedRetrievalCandidate,
+  type RetrievalDocument,
 } from '../../domain/src/index.js';
 import {
-  calculateCompatibilityIntrinsicSignal,
-  calculateQuerySignalV2,
-  querySignalKindProfile,
-  querySignalPolicyV2,
   type IntrinsicSignalResult,
   type QuerySignalResult,
   type QueryValueInput,
 } from '../../scoring/src/index.js';
 import { postgresPrefixTsQuery, uniqueCandidateTerms } from './candidate-search.js';
-import { scoreDiscoveryCandidate } from './discovery-repository.js';
+import {
+  discoveryLeadRetrievalDocument,
+  scoreDiscoveryCandidate,
+} from './discovery-repository.js';
 import { DomainValidationError } from './errors.js';
+import { loadIntrinsicSignals } from './intrinsic-signal-repository.js';
 import { loadQueryKnowledge } from './taxonomy-repository.js';
 
 type CorpusLayer = 'indexed_knowledge' | 'knowledge_document' | 'source_lead';
@@ -34,6 +37,7 @@ interface CorpusRow {
   entityClass: string;
   providerId: string | null;
   documentId: string | null;
+  entityId: string;
   name: string;
   summary: string;
   kind: string;
@@ -48,12 +52,19 @@ interface CorpusRow {
   cachedValueConservative: number | null;
   cachedEvidenceCoverage: number | null;
   sourcePayload: unknown;
+  strongIdentityKeys: string[];
+  concepts: RetrievalDocument['concepts'];
 }
 
 interface ScoredCorpusRow extends CorpusRow {
+  retrievalRank: number | null;
   matchedTerms: string[];
   relevanceOrdinal: QuerySignalResult['relevanceOrdinal'] | null;
   relevanceValue: number | null;
+  matchScore: number | null;
+  matchBand: 'Direct' | 'Strong' | 'Related' | 'Peripheral' | null;
+  matchReasons: string[];
+  matchPolicyVersion: 'retrieval-match-v1' | null;
   signalDisplay: number | null;
   signalUnrounded: number | null;
   evidenceCoverage: number | null;
@@ -61,10 +72,52 @@ interface ScoredCorpusRow extends CorpusRow {
   signalBand: QuerySignalResult['band'] | IntrinsicSignalResult['band'] | null;
   signalPolicyVersion:
     QuerySignalResult['policyVersion'] | IntrinsicSignalResult['policyVersion'] | null;
+  signalBasis: 'typed_cohort_metrics' | 'legacy_compatibility_projection' | 'source_metadata_estimate' | null;
   evidenceConfidence: number | null;
   evidenceConfidenceDetail: IntrinsicSignalResult['evidenceConfidence'] | null;
   trend: IntrinsicSignalResult['trend'] | null;
   signalExplanation: string | null;
+}
+
+function corpusRetrievalDocument(row: CorpusRow): RetrievalDocument {
+  if (row.layer === 'source_lead') {
+    return discoveryLeadRetrievalDocument({
+      id: row.id,
+      title: row.name,
+      summary: row.summary,
+      kindHint: row.kind,
+      adapterKey: row.sources[0],
+      canonicalUri: row.canonicalUri ?? undefined,
+    });
+  }
+  return {
+    candidateKey:
+      row.layer === 'indexed_knowledge'
+        ? `implementation:${row.providerId ?? row.id}`
+        : `document:${row.documentId ?? row.id}`,
+    subjectType: row.layer === 'indexed_knowledge' ? 'implementation' : 'document',
+    entityId: row.entityId,
+    entityClass: row.entityClass,
+    kind: row.kind,
+    name: row.name,
+    aliases: row.aliases,
+    searchText: row.searchText,
+    strongIdentityKeys: row.strongIdentityKeys,
+    concepts: row.concepts,
+  };
+}
+
+function corpusCoverageSummary(document: RetrievalDocument): {
+  entityClass: string;
+  group: string | null;
+} {
+  return {
+    entityClass: document.entityClass,
+    group:
+      document.concepts.find((concept) => concept.facetKey === 'domain')?.label ??
+      document.concepts.find((concept) => concept.facetKey === 'capability')?.label ??
+      null,
+  };
 }
 
 function encodeCursor(offset: number, viewHash: string): string {
@@ -96,55 +149,6 @@ function valueProfile(value: unknown): QueryValueInput[] {
   return value as QueryValueInput[];
 }
 
-function cachedImplementationSignal(
-  row: CorpusRow,
-  relevanceValue: number,
-): Pick<
-  QuerySignalResult,
-  | 'signalDisplay'
-  | 'signalUnrounded'
-  | 'evidenceCoverage'
-  | 'displayState'
-  | 'band'
-  | 'policyVersion'
-> | null {
-  if (
-    row.layer !== 'indexed_knowledge' ||
-    querySignalKindProfile(row.kind) !== 'implementation' ||
-    row.cachedValueConservative === null ||
-    row.cachedEvidenceCoverage === null
-  ) {
-    return null;
-  }
-  const signalUnrounded =
-    Math.round(
-      ((relevanceValue / 100) * row.cachedValueConservative + Number.EPSILON) * 1_000_000,
-    ) / 1_000_000;
-  const displayState =
-    row.state !== 'reviewed'
-      ? 'provisional'
-      : row.cachedEvidenceCoverage <= querySignalPolicyV2.coverageThreshold
-        ? 'insufficient_evidence'
-        : 'available';
-  const signalDisplay = Math.floor(signalUnrounded + 0.5);
-  const band =
-    signalDisplay >= 75
-      ? 'Strong consideration'
-      : signalDisplay >= 60
-        ? 'Promising'
-        : signalDisplay >= 40
-          ? 'Investigate'
-          : 'Weak consideration';
-  return {
-    signalDisplay,
-    signalUnrounded,
-    evidenceCoverage: row.cachedEvidenceCoverage,
-    displayState,
-    band,
-    policyVersion: querySignalPolicyV2.version,
-  };
-}
-
 function countFacets(
   rows: ScoredCorpusRow[],
   key: 'entityClass' | 'kind' | 'state',
@@ -171,48 +175,49 @@ function sourceFacets(rows: ScoredCorpusRow[]): Array<{ value: string; count: nu
     .sort((left, right) => right.count - left.count || left.value.localeCompare(right.value));
 }
 
-function intrinsicCorpusSignal(row: CorpusRow): IntrinsicSignalResult {
-  const values = valueProfile(row.valueProfile);
-  const observedAt = new Date(row.observedAt);
-  const windowEnd = Number.isFinite(observedAt.valueOf()) ? observedAt : new Date(0);
-  return calculateCompatibilityIntrinsicSignal({
-    kind: row.kind,
-    valueProfile: values,
-    observedAt: windowEnd.toISOString(),
-    evidenceSourceGroups: row.sources,
-    freshness: row.state === 'stale' ? 0.2 : 0.8,
-    provisional: row.state !== 'reviewed',
-  });
-}
-
 function assessRow(
   row: CorpusRow,
   interpretation: QueryInterpretation | null,
-  assessRelevance: ReturnType<typeof compileLexicalRelevance> | null,
+  intrinsic: IntrinsicSignalResult | null,
+  retrieval: RerankedRetrievalCandidate | null,
 ): ScoredCorpusRow | null {
   if (!interpretation) {
-    const intrinsic = row.layer === 'source_lead' ? null : intrinsicCorpusSignal(row);
     return {
       ...row,
+      retrievalRank: null,
       matchedTerms: [],
       relevanceOrdinal: null,
       relevanceValue: null,
+      matchScore: null,
+      matchBand: null,
+      matchReasons: [],
+      matchPolicyVersion: null,
       signalDisplay: intrinsic?.display ?? null,
       signalUnrounded: intrinsic?.conservative ?? null,
       evidenceCoverage: intrinsic?.evidenceConfidence.coverage ?? null,
       displayState: intrinsic?.displayState ?? null,
       signalBand: intrinsic?.band ?? null,
       signalPolicyVersion: intrinsic?.policyVersion ?? null,
+      signalBasis: intrinsic
+        ? intrinsic.dimensions.some(
+            (dimension) => dimension.normalization.method === 'cohort_percentile',
+          )
+          ? 'typed_cohort_metrics'
+          : 'legacy_compatibility_projection'
+        : null,
       evidenceConfidence: intrinsic?.evidenceConfidence.score ?? null,
       evidenceConfidenceDetail: intrinsic?.evidenceConfidence ?? null,
       trend: intrinsic?.trend ?? null,
       signalExplanation: intrinsic
-        ? row.state === 'reviewed'
-          ? 'Query-independent intrinsic estimate from the current type-aware value profile and bound evidence.'
-          : `Query-independent intrinsic estimate from a ${row.state} index record; review state qualifies confidence.`
+        ? intrinsic.dimensions.some(
+            (dimension) => dimension.normalization.method === 'cohort_percentile',
+          )
+          ? `Query-independent Signal from source-bound, cohort-normalized metrics; the ${row.state} review state still qualifies confidence.`
+          : `Query-independent compatibility estimate projected from the historical value profile; typed source-bound cohort metrics are not yet recorded for this ${row.state} item.`
         : null,
     };
   }
+  if (!retrieval) return null;
   if (row.layer === 'source_lead') {
     const scored = scoreDiscoveryCandidate(interpretation, {
       id: row.id,
@@ -220,61 +225,85 @@ function assessRow(
       summary: row.summary,
       kindHint: row.kind,
       sourcePayload: row.sourcePayload,
+      adapterKey: row.sources[0],
+      canonicalUri: row.canonicalUri ?? undefined,
+      createdAt: row.observedAt,
     });
     if (scored.relevanceOrdinal === 'no_match') return null;
     return {
       ...row,
-      matchedTerms: scored.matchedTerms as string[],
-      relevanceOrdinal: scored.relevanceOrdinal as QuerySignalResult['relevanceOrdinal'],
-      relevanceValue: Number(scored.relevanceValue),
+      retrievalRank: retrieval.rerankPosition,
+      matchedTerms: retrieval.matchedTerms,
+      relevanceOrdinal:
+        retrieval.matchBand === 'Direct'
+          ? 'direct'
+          : retrieval.matchBand === 'Strong'
+            ? 'partial'
+            : retrieval.matchBand === 'Related'
+              ? 'complementary'
+              : 'incidental',
+      relevanceValue:
+        retrieval.matchBand === 'Direct'
+          ? 100
+          : retrieval.matchBand === 'Strong'
+            ? 75
+            : retrieval.matchBand === 'Related'
+              ? 50
+              : 25,
+      matchScore: retrieval.matchScore,
+      matchBand: retrieval.matchBand,
+      matchReasons: retrieval.reasons,
+      matchPolicyVersion: scored.matchPolicyVersion as 'retrieval-match-v1',
       signalDisplay: Number(scored.signalDisplay),
       signalUnrounded: Number(scored.signalUnrounded),
       evidenceCoverage: Number(scored.evidenceCoverage),
       displayState: scored.displayState as QuerySignalResult['displayState'],
-      signalBand: scored.signalBand as QuerySignalResult['band'],
-      signalPolicyVersion: scored.signalPolicyVersion as QuerySignalResult['policyVersion'],
-      evidenceConfidence: Number(scored.evidenceCoverage),
-      evidenceConfidenceDetail: null,
-      trend: null,
-      signalExplanation:
-        'Preliminary estimate from query relevance and attributed source metadata. It is not reviewed knowledge.',
+      signalBand: scored.signalBand as IntrinsicSignalResult['band'],
+      signalPolicyVersion: scored.signalPolicyVersion as IntrinsicSignalResult['policyVersion'],
+      signalBasis: 'source_metadata_estimate',
+      evidenceConfidence: Number(scored.evidenceConfidence),
+      evidenceConfidenceDetail:
+        scored.evidenceConfidenceDetail as IntrinsicSignalResult['evidenceConfidence'],
+      trend: scored.trend as IntrinsicSignalResult['trend'],
+      signalExplanation: String(scored.signalExplanation),
     };
   }
-  const relevance = assessRelevance!({
-    name: row.name,
-    aliases: row.aliases,
-    capabilities: row.capabilities,
-    searchText: row.searchText,
-  });
-  if (relevance.ordinal === 'no_match') return null;
-  const legacyValue =
-    cachedImplementationSignal(row, relevance.value) ??
-    calculateQuerySignalV2({
-      relevanceOrdinal: relevance.ordinal,
-      relevanceMethod: 'rule',
-      dimensions: valueProfile(row.valueProfile),
-      kindProfile: querySignalKindProfile(row.kind),
-      provisional: row.state !== 'reviewed',
-    });
-  const intrinsic = intrinsicCorpusSignal(row);
+  const match = retrieval;
+  const relevance =
+    match.matchBand === 'Direct'
+      ? { ordinal: 'direct' as const, value: 100 as const }
+      : match.matchBand === 'Strong'
+        ? { ordinal: 'partial' as const, value: 75 as const }
+        : match.matchBand === 'Related'
+          ? { ordinal: 'complementary' as const, value: 50 as const }
+          : { ordinal: 'incidental' as const, value: 25 as const };
+  if (!intrinsic) throw new DomainValidationError('Indexed Corpus Signal is unavailable.');
+  const typedSignal = intrinsic.dimensions.some(
+    (dimension) => dimension.normalization.method === 'cohort_percentile',
+  );
   return {
     ...row,
-    matchedTerms: relevance.matchedTerms,
+    retrievalRank: retrieval.rerankPosition,
+    matchedTerms: match.matchedTerms,
     relevanceOrdinal: relevance.ordinal,
     relevanceValue: relevance.value,
+    matchScore: match.matchScore,
+    matchBand: match.matchBand,
+    matchReasons: match.reasons,
+    matchPolicyVersion: 'retrieval-match-v1',
     signalDisplay: intrinsic.display,
     signalUnrounded: intrinsic.conservative,
-    evidenceCoverage: legacyValue.evidenceCoverage,
+    evidenceCoverage: intrinsic.evidenceConfidence.coverage,
     displayState: intrinsic.displayState,
     signalBand: intrinsic.band,
     signalPolicyVersion: intrinsic.policyVersion,
+    signalBasis: typedSignal ? 'typed_cohort_metrics' : 'legacy_compatibility_projection',
     evidenceConfidence: intrinsic.evidenceConfidence.score,
     evidenceConfidenceDetail: intrinsic.evidenceConfidence,
     trend: intrinsic.trend,
-    signalExplanation:
-      row.state === 'reviewed'
-        ? 'Query-independent intrinsic estimate from the current type-aware value profile and bound evidence.'
-        : `Query-independent intrinsic estimate from a ${row.state} index record; review state qualifies confidence.`,
+    signalExplanation: typedSignal
+      ? `Query-independent Signal from source-bound, cohort-normalized metrics; the ${row.state} review state still qualifies confidence.`
+      : `Query-independent compatibility estimate projected from the historical value profile; typed source-bound cohort metrics are not yet recorded for this ${row.state} item.`,
   };
 }
 
@@ -351,7 +380,15 @@ async function loadCorpus(
                 kp.preferred_label || ' ' || kp.summary || ' ' || kp.search_text
               ) @@ to_tsquery('simple'::regconfig, NULLIF($3, ''))
          )
-       ORDER BY kp.id
+       ORDER BY
+         ts_rank_cd(
+           to_tsvector(
+             'simple'::regconfig,
+             kp.preferred_label || ' ' || kp.summary || ' ' || kp.search_text
+           ),
+           to_tsquery('simple'::regconfig, NULLIF($3, ''))
+         ) DESC,
+         kp.preferred_label, kp.id
        LIMIT $8
      ), all_projection_ids AS (
        SELECT kp.id, 2 AS selection_priority
@@ -386,6 +423,20 @@ async function loadCorpus(
        WHERE kd.publication_state <> 'withdrawn'
          AND (
            NOT $2::boolean
+           OR EXISTS (
+             SELECT 1
+             FROM catalog.knowledge_entities selected_entity
+             WHERE selected_entity.document_id = kd.id
+               AND (
+                 selected_entity.id = ANY($6::uuid[])
+                 OR EXISTS (
+                   SELECT 1
+                   FROM catalog.current_entity_facet_assignments selected_assignment
+                   WHERE selected_assignment.entity_id = selected_entity.id
+                     AND selected_assignment.concept_id = ANY($7::uuid[])
+                 )
+               )
+           )
            OR kd.aliases && $4::text[]
            OR kd.mechanism_keys && $4::text[]
            OR to_tsvector(
@@ -394,6 +445,20 @@ async function loadCorpus(
               ) @@ to_tsquery('simple'::regconfig, NULLIF($3, ''))
          )
        ORDER BY
+         CASE WHEN EXISTS (
+           SELECT 1
+           FROM catalog.knowledge_entities selected_entity
+           WHERE selected_entity.document_id = kd.id
+             AND (
+               selected_entity.id = ANY($6::uuid[])
+               OR EXISTS (
+                 SELECT 1
+                 FROM catalog.current_entity_facet_assignments selected_assignment
+                 WHERE selected_assignment.entity_id = selected_entity.id
+                   AND selected_assignment.concept_id = ANY($7::uuid[])
+               )
+             )
+         ) THEN 0 ELSE 1 END,
          ts_rank_cd(
            to_tsvector(
              'simple'::regconfig,
@@ -425,16 +490,39 @@ async function loadCorpus(
             kp.provider_id::text AS "providerId", NULL::text AS "documentId",
             kp.preferred_label AS name,
             kp.summary, kp.kind_profile AS kind, kp.publication_state AS state,
-            kp.aliases, kp.capability_keys AS capabilities, kp.search_text AS "searchText",
+            kp.aliases, kp.capability_keys AS capabilities,
+            concat_ws(' ', kp.search_text, kp.summary, identity_data.identities) AS "searchText",
             COALESCE(source_data.sources, ARRAY['local_catalog']::text[]) AS sources,
             source_data."canonicalUri", COALESCE(source_data."observedAt", kp.indexed_at)::text AS "observedAt",
             kp.value_profile AS "valueProfile",
             kp.query_value_conservative::float8 AS "cachedValueConservative",
             kp.query_evidence_coverage::float8 AS "cachedEvidenceCoverage",
+            entity.id::text AS "entityId",
+            COALESCE(identity_data.identity_keys, '{}') AS "strongIdentityKeys",
+            COALESCE(facet_data.concepts, '[]'::jsonb) AS concepts,
             NULL::jsonb AS "sourcePayload"
      FROM catalog.knowledge_projections kp
      JOIN selected_projections selected ON selected.id = kp.id
      LEFT JOIN catalog.knowledge_entities entity ON entity.provider_id = kp.provider_id
+     LEFT JOIN LATERAL (
+       SELECT string_agg(identity.normalized_value, ' ' ORDER BY identity.normalized_value)
+                AS identities,
+              array_agg(identity.scheme || ':' || identity.normalized_value
+                        ORDER BY identity.scheme, identity.normalized_value) AS identity_keys
+       FROM catalog.provider_identities identity
+       WHERE identity.provider_id = kp.provider_id AND identity.valid_to IS NULL
+     ) identity_data ON true
+     LEFT JOIN LATERAL (
+       SELECT jsonb_agg(jsonb_build_object(
+                'conceptId', concept.id,
+                'stableKey', concept.stable_key,
+                'facetKey', concept.facet_key,
+                'label', concept.preferred_label
+              ) ORDER BY concept.facet_key, concept.stable_key, concept.id) AS concepts
+       FROM catalog.current_entity_facet_assignments assignment
+       JOIN catalog.concepts concept ON concept.id = assignment.concept_id
+       WHERE assignment.entity_id = entity.id
+     ) facet_data ON true
      LEFT JOIN LATERAL (
        SELECT replace(class_concept.stable_key, 'entity-class:', '') AS "entityClass"
        FROM catalog.knowledge_entity_revisions entity_revision
@@ -468,11 +556,27 @@ async function loadCorpus(
             kd.observed_at::text AS "observedAt", kd.value_profile AS "valueProfile",
             NULL::float8 AS "cachedValueConservative",
             NULL::float8 AS "cachedEvidenceCoverage",
+            entity.id::text AS "entityId",
+            ARRAY['uri:' || kd.canonical_uri, 'digest:' || kd.content_digest]::text[]
+              AS "strongIdentityKeys",
+            COALESCE(facet_data.concepts, '[]'::jsonb) AS concepts,
             NULL::jsonb AS "sourcePayload"
      FROM catalog.knowledge_documents kd
      JOIN selected_documents selected ON selected.id = kd.id
+     JOIN catalog.knowledge_entities entity ON entity.document_id = kd.id
      JOIN catalog.source_observations so ON so.id = kd.source_observation_id
      JOIN catalog.sources s ON s.id = so.source_id
+     LEFT JOIN LATERAL (
+       SELECT jsonb_agg(jsonb_build_object(
+                'conceptId', concept.id,
+                'stableKey', concept.stable_key,
+                'facetKey', concept.facet_key,
+                'label', concept.preferred_label
+              ) ORDER BY concept.facet_key, concept.stable_key, concept.id) AS concepts
+       FROM catalog.current_entity_facet_assignments assignment
+       JOIN catalog.concepts concept ON concept.id = assignment.concept_id
+       WHERE assignment.entity_id = entity.id
+     ) facet_data ON true
      WHERE kd.publication_state <> 'withdrawn'
      UNION ALL
      SELECT lead.id::text AS id, 'source_lead'::text AS layer,
@@ -492,6 +596,9 @@ async function loadCorpus(
             NULL::jsonb AS "valueProfile",
             NULL::float8 AS "cachedValueConservative",
             NULL::float8 AS "cachedEvidenceCoverage",
+            lead.id::text AS "entityId",
+            ARRAY['uri:' || lead.canonical_uri]::text[] AS "strongIdentityKeys",
+            '[]'::jsonb AS concepts,
             jsonb_build_object(
               'stars', lead.source_payload->'stars',
               'archived', lead.source_payload->'archived',
@@ -536,9 +643,67 @@ export async function listResearchCorpus(
     : null;
   const corpusSelection = await loadCorpus(pool, workspaceId, interpretation);
   const corpus = corpusSelection.rows;
-  const assessRelevance = interpretation ? compileLexicalRelevance(interpretation) : null;
-  const matched = corpus
-    .map((row) => assessRow(row, interpretation, assessRelevance))
+  const asOf = new Date();
+  const intrinsicByEntity = await loadIntrinsicSignals(
+    pool,
+    corpus
+      .filter((row) => row.layer !== 'source_lead')
+      .map((row) => ({
+        entityId: row.entityId,
+        kind: row.kind,
+        valueProfile: valueProfile(row.valueProfile),
+        observedAt: new Date(row.observedAt),
+        asOf,
+        evidenceSourceGroups: row.sources,
+        freshness: row.state === 'stale' ? 0.2 : 0.8,
+        provisional: row.state !== 'reviewed',
+      })),
+  );
+  const rowByCandidate = new Map(
+    corpus.map((row) => [corpusRetrievalDocument(row).candidateKey, row] as const),
+  );
+  const pipeline = interpretation
+    ? runRetrievalPipeline(
+        corpus.map(corpusRetrievalDocument),
+        interpretation,
+        {
+          fusionPolicy: 'normalized-weighted-fusion-v1',
+          maximumCandidates: 200,
+          shouldRunSecondPass: (firstPassCandidates, resolvedDocuments) => {
+            const documentByCandidate = new Map(
+              resolvedDocuments.map((document) => [document.candidateKey, document] as const),
+            );
+            return assessResearchCoverage(
+              interpretation,
+              firstPassCandidates
+                .slice(0, 100)
+                .map((candidate) => documentByCandidate.get(candidate.candidateKey))
+                .filter((document): document is RetrievalDocument => Boolean(document))
+                .map(corpusCoverageSummary),
+            ).needsSecondPass;
+          },
+        },
+      )
+    : null;
+  const retrievalByCandidate = new Map(
+    pipeline?.selected.map((candidate) => [candidate.candidateKey, candidate] as const) ?? [],
+  );
+  const orderedCorpus = pipeline
+    ? pipeline.selected
+        .map((candidate) => rowByCandidate.get(candidate.candidateKey))
+        .filter((row): row is CorpusRow => Boolean(row))
+    : corpus;
+  const matched = orderedCorpus
+    .map((row) =>
+      assessRow(
+        row,
+        interpretation,
+        intrinsicByEntity.get(row.entityId) ?? null,
+        interpretation
+          ? (retrievalByCandidate.get(corpusRetrievalDocument(row).candidateKey) ?? null)
+          : null,
+      ),
+    )
     .filter((row): row is ScoredCorpusRow => row !== null);
   const facets = {
     layers: [
@@ -569,7 +734,8 @@ export async function listResearchCorpus(
     .sort((left, right) => {
       if (normalizedQuery) {
         return (
-          (right.relevanceValue ?? -1) - (left.relevanceValue ?? -1) ||
+          (left.retrievalRank ?? Number.MAX_SAFE_INTEGER) -
+            (right.retrievalRank ?? Number.MAX_SAFE_INTEGER) ||
           (right.signalUnrounded ?? -1) - (left.signalUnrounded ?? -1) ||
           left.name.localeCompare(right.name) ||
           left.id.localeCompare(right.id)
@@ -587,6 +753,7 @@ export async function listResearchCorpus(
     delete (publicRow as Partial<ScoredCorpusRow>).valueProfile;
     delete (publicRow as Partial<ScoredCorpusRow>).cachedValueConservative;
     delete (publicRow as Partial<ScoredCorpusRow>).cachedEvidenceCoverage;
+    delete (publicRow as Partial<ScoredCorpusRow>).retrievalRank;
     return publicRow;
   });
   const nextOffset = offset + items.length;
@@ -598,6 +765,18 @@ export async function listResearchCorpus(
     },
     query: normalizedQuery,
     scoringApplied: normalizedQuery !== null,
+    matchPolicyVersion: normalizedQuery ? 'retrieval-match-v1' : null,
+    retrievalMethod: pipeline
+      ? {
+          policyVersion: 'retrieval-pipeline-v1',
+          fusionPolicy: pipeline.fusionPolicy,
+          rerankPolicy: 'structured-rerank-v2',
+          passes: pipeline.retrievalPasses,
+          duplicateResolutionCount: pipeline.duplicateResolutions.filter(
+            (resolution) => resolution.method !== 'distinct',
+          ).length,
+        }
+      : null,
     corpusCount: corpusSelection.total,
     candidateSelection: {
       policyVersion: 'postgres-lexical-candidates-v2',

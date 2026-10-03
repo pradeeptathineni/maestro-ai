@@ -968,6 +968,7 @@ export const intrinsicSignalRuns = catalog.table(
     trendWindowEnd: timestamp('trend_window_end', { withTimezone: true }).notNull(),
     trendDetail: jsonb('trend_detail').notNull(),
     evidenceIds: uuid('evidence_ids').array().notNull().default([]),
+    inputReferences: jsonb('input_references').notNull(),
     generatedAt: timestamp('generated_at', { withTimezone: true }).notNull(),
     supersededBy: uuid('superseded_by'),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -1006,8 +1007,14 @@ export const entityMetricObservations = catalog.table(
       .notNull()
       .references(() => knowledgeEntities.id),
     metricKey: text('metric_key').notNull(),
+    intrinsicDimension: text('intrinsic_dimension'),
+    metricDirection: text('metric_direction'),
+    entityRevisionId: uuid('entity_revision_id'),
+    metricAggregation: text('metric_aggregation'),
     rawValue: numeric('raw_value'),
     rawUnit: text('raw_unit').notNull(),
+    comparisonValue: numeric('comparison_value'),
+    comparisonUnit: text('comparison_unit'),
     normalizedValue: numeric('normalized_value', { precision: 9, scale: 6 }),
     cohortKey: text('cohort_key').notNull(),
     normalizationPolicyVersion: text('normalization_policy_version').notNull(),
@@ -1018,6 +1025,12 @@ export const entityMetricObservations = catalog.table(
     sourceObservationId: uuid('source_observation_id')
       .notNull()
       .references(() => sourceObservations.id),
+    sourceId: uuid('source_id').references(() => sources.id),
+    sourceReliabilityAssessmentId: uuid('source_reliability_assessment_id').references(
+      () => sourceReliabilityAssessments.id,
+    ),
+    cohortPolicyVersion: text('cohort_policy_version'),
+    normalizationInputHash: text('normalization_input_hash'),
     observedAt: timestamp('observed_at', { withTimezone: true }).notNull(),
     createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -1059,6 +1072,71 @@ export const corroborationAssessments = catalog.table(
       table.predicate,
       table.applicabilityScope,
       table.observedAt,
+    ),
+  ],
+);
+
+export const sourceReliabilityObservationBindings = catalog.table(
+  'source_reliability_observation_bindings',
+  {
+    assessmentId: uuid('assessment_id').notNull(),
+    sourceId: uuid('source_id').notNull(),
+    sourceObservationId: uuid('source_observation_id').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.assessmentId, table.sourceObservationId)],
+);
+
+export const corroborationSourceBindings = catalog.table(
+  'corroboration_source_bindings',
+  {
+    assessmentId: uuid('assessment_id').notNull(),
+    sourceObservationId: uuid('source_observation_id').notNull(),
+    sourceId: uuid('source_id').notNull(),
+    sourceReliabilityAssessmentId: uuid('source_reliability_assessment_id').notNull(),
+    sourceRole: text('source_role').notNull(),
+    independenceGroup: text('independence_group').notNull(),
+    direction: text().notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.assessmentId, table.sourceObservationId, table.direction)],
+);
+
+export const corroborationEvidenceBindings = catalog.table(
+  'corroboration_evidence_bindings',
+  {
+    assessmentId: uuid('assessment_id').notNull(),
+    evidenceItemId: uuid('evidence_item_id').notNull(),
+    sourceObservationId: uuid('source_observation_id').notNull(),
+    direction: text().notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [unique().on(table.assessmentId, table.evidenceItemId, table.direction)],
+);
+
+export const knowledgeEntityEvidenceBindings = catalog.table(
+  'knowledge_entity_evidence_bindings',
+  {
+    id: uuid().primaryKey(),
+    knowledgeEntityId: uuid('knowledge_entity_id')
+      .notNull()
+      .references(() => knowledgeEntities.id),
+    entityRevisionId: uuid('entity_revision_id').notNull(),
+    evidenceItemId: uuid('evidence_item_id')
+      .notNull()
+      .references(() => evidenceItems.id),
+    predicate: text().notNull(),
+    applicabilityScope: text('applicability_scope').notNull(),
+    bindingBasis: text('binding_basis').notNull(),
+    reviewedAt: timestamp('reviewed_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    unique().on(
+      table.knowledgeEntityId,
+      table.entityRevisionId,
+      table.evidenceItemId,
+      table.predicate,
     ),
   ],
 );
@@ -1472,6 +1550,29 @@ export const adapterDailyBudgets = ops.table('adapter_daily_budgets', {
   updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
+export const researchRuns = ops.table('research_runs', {
+  id: uuid().primaryKey(),
+  workspaceId: uuid('workspace_id').notNull(),
+  querySessionId: uuid('query_session_id').notNull(),
+  initialPlanHash: text('initial_plan_hash').notNull(),
+  state: text().notNull(),
+  maximumExternalCalls: integer('maximum_external_calls').notNull(),
+  maximumCandidates: integer('maximum_candidates').notNull(),
+  maximumElapsedMs: integer('maximum_elapsed_ms').notNull(),
+  firstPassCoverage: jsonb('first_pass_coverage'),
+  finalCoverage: jsonb('final_coverage'),
+  observedPlan: jsonb('observed_plan'),
+  observedPlanHash: text('observed_plan_hash'),
+  completedPassCount: integer('completed_pass_count'),
+  retrievalReceipt: jsonb('retrieval_receipt'),
+  retrievalReceiptHash: text('retrieval_receipt_hash'),
+  stopReason: text('stop_reason'),
+  startedAt: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
+  deadlineAt: timestamp('deadline_at', { withTimezone: true }).notNull(),
+  finishedAt: timestamp('finished_at', { withTimezone: true }),
+  updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const discoveryOperations = ops.table('discovery_operations', {
   id: uuid().primaryKey(),
   workspaceId: uuid('workspace_id').notNull(),
@@ -1493,6 +1594,10 @@ export const discoveryOperations = ops.table('discovery_operations', {
   variantIndex: integer('variant_index').notNull().default(1),
   routingReason: text('routing_reason'),
   sourcePlanState: text('source_plan_state').notNull().default('planned'),
+  researchRunId: uuid('research_run_id'),
+  passIndex: integer('pass_index').notNull().default(1),
+  leaseToken: uuid('lease_token'),
+  leaseUntil: timestamp('lease_until', { withTimezone: true }),
   startedAt: timestamp('started_at', { withTimezone: true }),
   finishedAt: timestamp('finished_at', { withTimezone: true }),
   createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -1540,15 +1645,25 @@ export const discoveryCandidates = ops.table(
   ],
 );
 
+export const discoveryOperationCandidates = ops.table('discovery_operation_candidates', {
+  operationId: uuid('operation_id').notNull(),
+  candidateId: uuid('candidate_id').notNull(),
+  workspaceId: uuid('workspace_id').notNull(),
+  observedAt: timestamp('observed_at', { withTimezone: true }).notNull().defaultNow(),
+});
+
 export const discoveryAdmissions = ops.table('discovery_admissions', {
   id: uuid().primaryKey(),
   discoveryCandidateId: uuid('discovery_candidate_id').notNull(),
   workspaceId: uuid('workspace_id').notNull(),
-  providerId: uuid('provider_id').notNull(),
-  providerRevision: integer('provider_revision').notNull(),
+  providerId: uuid('provider_id'),
+  providerRevision: integer('provider_revision'),
+  documentId: uuid('document_id'),
+  documentRevision: integer('document_revision'),
+  knowledgeEntityId: uuid('knowledge_entity_id').notNull(),
   sourceObservationId: uuid('source_observation_id').notNull(),
   evidenceItemId: uuid('evidence_item_id').notNull(),
-  projectionId: uuid('projection_id').notNull(),
+  projectionId: uuid('projection_id'),
   actorType: text('actor_type').notNull(),
   rationale: text().notNull(),
   inputHash: text('input_hash').notNull(),

@@ -15,6 +15,10 @@ export interface NormalizationProvenance {
   observedAt: string;
   window?: string;
   sourceMetric?: string;
+  policyVersion?: string;
+  cohortPolicyVersion?: string;
+  inputHash?: string;
+  referenceIds?: string[];
 }
 
 export interface IntrinsicDimensionInput {
@@ -87,6 +91,13 @@ export interface IntrinsicSignalResult {
   evidenceConfidence: EvidenceConfidenceResult;
   trend: TrendResult;
   inputEvidenceIds: string[];
+  inputReferences: {
+    evidenceItemIds: string[];
+    metricObservationIds: string[];
+    sourceObservationIds: string[];
+    normalizationInputHashes: string[];
+    asOf: string;
+  };
 }
 
 export interface CompatibilityIntrinsicSignalInput {
@@ -381,6 +392,10 @@ export function calculateIntrinsicSignalV3(input: {
         evidenceConfidence.band === 'Insufficient'
       ? 'insufficient_evidence'
       : 'available';
+  const inputEvidenceIds = unique([
+    ...results.flatMap((item) => item.evidenceIds),
+    ...evidenceConfidence.evidenceIds,
+  ]);
   return {
     policyVersion: intrinsicSignalPolicyV3.version,
     profile: input.profile,
@@ -400,10 +415,14 @@ export function calculateIntrinsicSignalV3(input: {
             : 'Weak signal',
     evidenceConfidence,
     trend: input.trend,
-    inputEvidenceIds: unique([
-      ...results.flatMap((item) => item.evidenceIds),
-      ...evidenceConfidence.evidenceIds,
-    ]),
+    inputEvidenceIds,
+    inputReferences: {
+      evidenceItemIds: inputEvidenceIds,
+      metricObservationIds: [],
+      sourceObservationIds: [],
+      normalizationInputHashes: [],
+      asOf: input.trend.windowEnd,
+    },
   };
 }
 

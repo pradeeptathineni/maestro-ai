@@ -302,6 +302,13 @@ export type SemanticProposalRequestBody = Static<typeof SemanticProposalRequestB
 
 export const DiscoveryAdmissionBodySchema = Type.Object({
   ...KnowledgeReviewFields,
+  entityClass: Type.Optional(
+    Type.Union([Type.Literal('implementation'), Type.Literal('document')]),
+  ),
+  kind: Type.Optional(Type.String({ minLength: 1, maxLength: 80 })),
+  title: Type.Optional(Type.String({ minLength: 1, maxLength: 500 })),
+  summary: Type.Optional(Type.String({ minLength: 1, maxLength: 2000 })),
+  publisher: Type.Optional(Type.String({ minLength: 1, maxLength: 240 })),
   rationale: Type.String({ minLength: 1, maxLength: 2000 }),
 });
 export type DiscoveryAdmissionBody = Static<typeof DiscoveryAdmissionBodySchema>;

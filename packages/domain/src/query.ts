@@ -139,7 +139,6 @@ const STOP_WORDS = new Set([
   'on',
   'or',
   'please',
-  'several',
   'that',
   'the',
   'these',
@@ -177,6 +176,8 @@ const PROBLEM_WORDS = new Set([
 
 const AUTHORITY_WORDS = new Set(['deploy', 'execute', 'install', 'invoke', 'run']);
 const EXCLUSION_WORDS = new Set(['except', 'exclude', 'excluding', 'not', 'without']);
+const LEADING_REQUEST_VERBS = new Set(['compare', 'find', 'list', 'rank', 'recommend', 'show']);
+const COMPARISON_CONNECTORS = new Set(['versus', 'vs']);
 
 // These tokens describe the shape of a desired result, not its subject. They remain available in
 // `terms`, resolved type facets, and typedTarget; removing them from `subjectTerms` prevents a
@@ -225,57 +226,7 @@ const GENERIC_RESULT_TYPE_WORDS = new Set([
   'workflows',
 ]);
 
-const QUERY_FORM_WORDS = new Set([
-  'about',
-  'automatic',
-  'automatically',
-  'best',
-  'compare',
-  'comparison',
-  'find',
-  'good',
-  'locate',
-  'map',
-  'operate',
-  'recommend',
-  'rank',
-  'ranks',
-  'show',
-  'top',
-  'versus',
-  'vs',
-  'which',
-  'whichever',
-]);
-
-// These words commonly frame a request or describe how it was phrased. They are intentionally
-// separate from STOP_WORDS because they remain useful in the preserved public query and outbound
-// source variants, but they must not force every local candidate to match conversational grammar.
-const REQUEST_SCAFFOLD_WORDS = new Set([
-  'aimed',
-  'around',
-  'backed',
-  'designed',
-  'despite',
-  'doing',
-  'explicitly',
-  'first',
-  'inside',
-  'more',
-  'published',
-  'source',
-  'toward',
-  'understand',
-]);
-
-const GENERIC_CONCEPT_QUALIFIERS = new Set([
-  ...GENERIC_RESULT_TYPE_WORDS,
-  'cloud',
-  'hosted',
-  'local',
-  'managed',
-  'offline',
-]);
+const GENERIC_CONCEPT_QUALIFIERS = GENERIC_RESULT_TYPE_WORDS;
 
 function unique<T>(values: T[]): T[] {
   return [...new Set(values)];
@@ -346,10 +297,9 @@ function extractSubjectTerms(input: {
   meaningfulTerms: string[];
   exclusions: string[];
   explicitFacets: QueryFacet[];
-  protectedCompoundTerms: string[];
+  sourceWords: string[];
 }): string[] {
   const excludedTerms = new Set(input.exclusions.flatMap(normalizedWords));
-  const protectedCompoundTerms = new Set(input.protectedCompoundTerms);
   const constrainedTerms = new Set<string>();
   for (const facet of input.explicitFacets) {
     if (facet.key === 'locality') {
@@ -366,15 +316,23 @@ function extractSubjectTerms(input: {
       constrainedTerms.add('no');
     }
   }
+  const firstMeaningfulWord = input.sourceWords.find((word) => !STOP_WORDS.has(word));
+  const leadingRequestVerb = firstMeaningfulWord && LEADING_REQUEST_VERBS.has(firstMeaningfulWord)
+    ? firstMeaningfulWord
+    : null;
+  const leadingRequestIndex = leadingRequestVerb
+    ? input.meaningfulTerms.indexOf(leadingRequestVerb)
+    : -1;
   const subjectFrameTerms = input.meaningfulTerms.filter(
-    (word) =>
+    (word, index) =>
+      index !== leadingRequestIndex &&
+      !(leadingRequestVerb && index === leadingRequestIndex + 1 && word === 'about') &&
+      !COMPARISON_CONNECTORS.has(word) &&
       !TEMPORAL_WORDS.has(word) &&
       !COMMUNITY_WORDS.has(word) &&
       !EXCLUSION_WORDS.has(word) &&
       !AUTHORITY_WORDS.has(word) &&
       !PROBLEM_WORDS.has(word) &&
-      (!QUERY_FORM_WORDS.has(word) || protectedCompoundTerms.has(word)) &&
-      (!REQUEST_SCAFFOLD_WORDS.has(word) || protectedCompoundTerms.has(word)) &&
       !excludedTerms.has(word),
   );
   const subjectTerms = unique(
@@ -774,11 +732,6 @@ export function interpretQuery(
   // Syntax-sensitive qualifiers are read before phrase normalization. `local-first`, for example,
   // is a subject phrase rather than the standalone `local` deployment constraint.
   const sourceWords = normalizedWords(sourceText);
-  const protectedCompoundTerms = unique(
-    sourceWords
-      .filter((word) => word.includes('-'))
-      .flatMap((word) => normalizedWords(word.replaceAll('-', ' '))),
-  );
   const meaningfulTerms = words.filter((word) => !STOP_WORDS.has(word));
   const supplied = suppliedFacets(suppliedFacetValues);
   const suppliedTerms = supplied.flatMap((facet) => normalizedWords(facet.value));
@@ -846,7 +799,7 @@ export function interpretQuery(
     meaningfulTerms,
     exclusions,
     explicitFacets,
-    protectedCompoundTerms,
+    sourceWords,
   });
   const subjectConcepts = selectSubjectConcepts(
     resolvedConcepts,

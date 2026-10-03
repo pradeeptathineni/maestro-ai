@@ -12,6 +12,7 @@ const sourceRoots = [
   'packages/db/src',
   'packages/domain/src',
   'packages/scoring/src',
+  'packages/seed/src',
 ];
 const runtimeExtensions = new Set(['.ts', '.tsx', '.js', '.mjs']);
 
@@ -24,7 +25,8 @@ async function filesUnder(directory) {
     else if (
       runtimeExtensions.has(extname(entry.name)) &&
       !entry.name.includes('.test.') &&
-      !entry.name.includes('.spec.')
+      !entry.name.includes('.spec.') &&
+      !entry.name.includes('evaluation.')
     ) {
       files.push(path);
     }
@@ -54,6 +56,10 @@ const forbidden = [
     id: 'expected-answer-map',
     pattern: /\b(?:expectedCandidates|acceptableCandidates|prohibitedCandidates)\b/,
   },
+  {
+    id: 'query-derived-scaffold-filter',
+    pattern: /\bREQUEST_SCAFFOLD_WORDS\b/,
+  },
 ];
 
 const files = (await Promise.all(sourceRoots.map(filesUnder))).flat();
@@ -69,7 +75,7 @@ for (const file of files) {
 }
 
 const report = {
-  policy: 'query-special-case-check-v1',
+  policy: 'query-special-case-check-v2',
   scannedFiles: files.length,
   violations,
 };

@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { QueryInterpretation } from './query.js';
 import {
   fuseRetrievalRankings,
+  assessRetrievalMatch,
   resolveRetrievalDuplicates,
   retrieveFirstPass,
   retrieveSecondPass,
@@ -234,10 +235,30 @@ describe('retrieval fabric', () => {
     const reranked = structuredRerank(fused, documents, interpretation());
     expect(reranked[0]).toMatchObject({
       candidateKey: 'implementation:alpha',
-      rerankPolicy: 'structured-rerank-v1',
+      rerankPolicy: 'structured-rerank-v2',
     });
     expect(reranked[0]!.matchScore).toBeGreaterThan(0);
     expect(reranked[0]!.reasons.join(' ')).toMatch(/retriever|assigned|query terms/i);
+  });
+
+  it('makes explicit entity-class compatibility part of the shared Match result', () => {
+    const implementationQuery = interpretation({ requestedEntityClasses: ['implementation'] });
+    const documentVersion = {
+      ...documents[0]!,
+      candidateKey: 'document:alpha-guide',
+      subjectType: 'document' as const,
+      entityClass: 'document',
+      kind: 'documentation',
+    };
+    const mismatched = assessRetrievalMatch(documentVersion, implementationQuery);
+    expect(mismatched).toMatchObject({ typeCompatibility: 'incompatible', typeCompatible: false });
+    expect(mismatched!.score).toBeLessThan(45);
+
+    const documentQuery = interpretation({ requestedEntityClasses: ['document'] });
+    expect(assessRetrievalMatch(documentVersion, documentQuery)).toMatchObject({
+      typeCompatibility: 'compatible',
+      typeCompatible: true,
+    });
   });
 
   it('deduplicates only canonical entities or strong identities and preserves name ambiguity', () => {
@@ -263,6 +284,32 @@ describe('retrieval fabric', () => {
     expect(
       resolved.resolutions.find((row) => row.candidateKey === 'implementation:alpha-copy'),
     ).toMatchObject({ method: 'strong_identity' });
+    expect(
+      resolved.documents.find((document) => document.candidateKey === 'implementation:alpha'),
+    ).toMatchObject({ aliases: expect.arrayContaining(['Different display name']) });
+  });
+
+  it('merges stronger duplicate retrieval text before matching', () => {
+    const sparse = {
+      ...documents[0]!,
+      candidateKey: 'implementation:sparse',
+      name: 'Myco',
+      aliases: [],
+      searchText: 'fungi',
+      concepts: [],
+    };
+    const informative = {
+      ...sparse,
+      candidateKey: 'implementation:informative',
+      entityId: 'informative',
+      name: 'Myco Knowledge Engine',
+      searchText: 'mycology taxonomy knowledge graph for fungal sequence classification research',
+    };
+    const resolved = resolveRetrievalDuplicates([sparse, informative]);
+    expect(resolved.documents).toHaveLength(1);
+    expect(resolved.documents[0]!.searchText).toContain('mycology taxonomy knowledge graph');
+    expect(resolved.documents[0]!.aliases).toContain('Myco');
+    expect(assessRetrievalMatch(resolved.documents[0]!, interpretation())).not.toBeNull();
   });
 
   it('rejects explicit exclusions during reranking', () => {

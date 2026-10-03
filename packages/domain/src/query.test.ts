@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   assessResearchCoverage,
   buildDiscoveryPlan,
+  learnResearchVocabulary,
   type ResearchCandidateSummary,
 } from './discovery-plan.js';
 import {
@@ -486,7 +487,7 @@ describe('bounded research planning', () => {
     const interpretation = interpretQuery('MCP server interoperability', {}, knowledge);
     const plan = buildDiscoveryPlan('MCP server interoperability', interpretation);
     expect(plan).toMatchObject({
-      policyVersion: 'research-plan-v3',
+      policyVersion: 'research-plan-v5',
       interpretationVersion: 'deterministic-v4',
       budgets: { maximumPasses: 2, maximumVariantsPerSource: 2 },
       stopReason: 'planning_complete',
@@ -513,6 +514,35 @@ describe('bounded research planning', () => {
     const rustPlan = buildDiscoveryPlan('Rust async web framework with observability', rust);
     expect(rustPlan.routes.find((route) => route.adapterKey === 'github')?.variant).toBe(
       'rust async observability',
+    );
+  });
+
+  it('keeps the original subject when a known entity is only mentioned', () => {
+    const withKubernetes = {
+      concepts: [],
+      entities: [
+        {
+          entityId: 'entity:kubernetes',
+          entityClass: 'implementation',
+          preferredLabel: 'Kubernetes',
+          aliases: ['k8s'],
+          kind: 'platform',
+          capabilities: [],
+          searchText: 'container orchestration',
+        },
+      ],
+    };
+    const interpretation = interpretQuery(
+      'zero trust workload identity for Kubernetes',
+      {},
+      withKubernetes,
+    );
+    expect(interpretation.exactEntities).toEqual([
+      expect.objectContaining({ preferredLabel: 'Kubernetes', matchMethod: 'mentioned' }),
+    ]);
+    const plan = buildDiscoveryPlan(interpretation.sourceText!, interpretation);
+    expect(plan.routes.find((route) => route.adapterKey === 'searxng')?.variant).toBe(
+      'zero trust kubernetes workload identity',
     );
   });
 
@@ -560,5 +590,45 @@ describe('bounded research planning', () => {
       routes: [],
     });
     expect(plan.requiredCoverage.sourceClasses).toContain('general_web');
+  });
+
+  it('retains attributed first-pass vocabulary and appends it to an unseen-domain follow-up', () => {
+    const interpretation = interpretQuery('mycology field notebooks');
+    const learnedVocabulary = learnResearchVocabulary(interpretation, [
+      {
+        candidateId: 'lead-1',
+        adapterKey: 'searxng',
+        canonicalUri: 'https://example.test/mycota-ledger',
+        title: 'Mycota Ledger',
+        summary: 'A mycology field notebook for recording fungal specimens.',
+        matchBand: 'Direct',
+        matchScore: 86,
+        rerankPosition: 1,
+      },
+      {
+        candidateId: 'lead-2',
+        adapterKey: 'github',
+        canonicalUri: 'https://github.com/example/mycota-mobile',
+        title: 'example/Mycota Mobile',
+        summary: 'Mobile field notes for mycology specimen collection.',
+        matchBand: 'Strong',
+        matchScore: 68,
+        rerankPosition: 2,
+      },
+    ]);
+    expect(learnedVocabulary[0]).toMatchObject({
+      term: expect.stringContaining('mycota'),
+      sourceCandidateIds: expect.arrayContaining(['lead-1', 'lead-2']),
+      sourceAdapters: ['github', 'searxng'],
+    });
+    const plan = buildDiscoveryPlan('mycology field notebooks', interpretation, {
+      coverageAssessment: assessResearchCoverage(interpretation, []),
+      externalSourcesEnabled: true,
+      learnedVocabulary,
+    });
+    expect(plan.policyVersion).toBe('research-plan-v5');
+    expect(plan.secondPass.learnedVocabulary).toEqual(learnedVocabulary);
+    expect(plan.secondPass.routes[0]?.variant).toContain('mycota');
+    expect(plan.secondPass.routes[0]?.variant).toContain('mycology');
   });
 });

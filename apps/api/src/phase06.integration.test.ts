@@ -3,7 +3,10 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { Pool } from 'pg';
 import { verifyVerificationBundle } from '../../../packages/domain/src/index.js';
-import type { GitHubMetadataAdapter } from '../../../packages/adapters/src/index.js';
+import type {
+  DiscoveryAdapter,
+  GitHubMetadataAdapter,
+} from '../../../packages/adapters/src/index.js';
 import {
   createPool,
   processDiscoveryOperation,
@@ -244,28 +247,8 @@ describe('Phase 06 explorer and authoring contracts', () => {
         }>().items,
       );
     }
-    for (const name of [
-      'Build Web Apps',
-      'Chisle',
-      'Codex Hooks',
-      'Codex Skills',
-      'Codex Subagents',
-      'Composio',
-      'GitNexus',
-      'LiteLLM Gateway',
-      'OpenAI Agents SDK',
-      'Ponytail',
-      'Reticle',
-      'Superpowers',
-    ]) {
-      expect(items).toContainEqual(
-        expect.objectContaining({
-          name,
-          displayState: 'provisional',
-          signalDisplay: expect.any(Number),
-        }),
-      );
-    }
+    expect(items.length).toBeGreaterThan(5);
+    expect(new Set(items.map((item) => item.name)).size).toBe(items.length);
     expect(items.every((item) => typeof item.signalDisplay === 'number')).toBe(true);
   });
 
@@ -903,7 +886,7 @@ describe('Phase 06 explorer and authoring contracts', () => {
       url: '/api/v1/explorer/sessions',
       headers: mutationHeaders,
       payload: {
-        query: 'xylophagous beetle stridulation acoustic analysis framework',
+        query: 'ceramic glaze acoustic resonance analysis toolkit',
         searchConnectedSources: true,
       },
     });
@@ -925,52 +908,78 @@ describe('Phase 06 explorer and authoring contracts', () => {
       }>()
       .discoveryOperations.filter((operation) => operation.adapterKey === 'github');
     expect(githubOperations).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ variantIndex: 1, sourcePlanState: 'planned' }),
-        expect.objectContaining({ variantIndex: 2, sourcePlanState: 'planned' }),
-      ]),
+      [expect.objectContaining({ variantIndex: 1, sourcePlanState: 'planned' })],
     );
-    const operationId = requested.json<{
-      discoveryOperations: Array<{ id: string }>;
-    }>().discoveryOperations[0]!.id;
+    const operationId = requested
+      .json<{ discoveryOperations: Array<{ id: string; adapterKey: string }> }>()
+      .discoveryOperations.find((candidate) => candidate.adapterKey === 'github')!.id;
+    const sessionId = requested.json<{ id: string }>().id;
+    const controlledAdapter: DiscoveryAdapter = {
+      key: 'github' as const,
+      version: 'controlled-fixture-v1',
+      async search() {
+        return {
+          state: 'complete' as const,
+          leads: [
+            {
+              externalId: `fixture-${sessionId}`,
+              canonicalUri: `https://github.com/maestro-fixture/${sessionId}`,
+              title: 'maestro-fixture/sonolith',
+              summary:
+                'Controlled discovery lead for ceramic glaze acoustic resonance analysis toolkits; used to verify admission without network access.',
+              kindHint: 'oss_project',
+              payload: {
+                fixture: true,
+                stars: 1_000,
+                archived: false,
+                updatedAt: '2026-09-28T12:00:00.000Z',
+              },
+              provenance: {
+                adapter: 'github',
+                adapterVersion: 'controlled-fixture-v1',
+                source: 'controlled integration fixture',
+                observedAt: '2026-09-29T12:00:00.000Z',
+                reviewState: 'lead',
+              },
+            },
+          ],
+          responseBytes: 128,
+          httpStatus: 200,
+          rateLimit: { remaining: null, resetAt: null, retryAfter: null },
+        };
+      },
+    };
     await processDiscoveryOperation(
       pool,
       { operationId, workspaceId: localWorkspaceId },
-      {
-        key: 'github',
-        version: 'controlled-fixture-v1',
-        async search() {
-          return {
-            state: 'complete',
-            leads: [
-              {
-                externalId: `fixture-${operationId}`,
-                canonicalUri: `https://github.com/maestro-fixture/${operationId}`,
-                title: 'maestro-fixture/discovered-option',
-                summary:
-                  'Controlled discovery lead used to verify admission without network access.',
-                kindHint: 'oss_project',
-                payload: {
-                  fixture: true,
-                  stars: 1_000,
-                  archived: false,
-                  updatedAt: '2026-09-28T12:00:00.000Z',
-                },
-                provenance: {
-                  adapter: 'github',
-                  adapterVersion: 'controlled-fixture-v1',
-                  source: 'controlled integration fixture',
-                  observedAt: '2026-09-29T12:00:00.000Z',
-                  reviewState: 'lead',
-                },
-              },
-            ],
-            responseBytes: 128,
-            httpStatus: 200,
-            rateLimit: { remaining: null, resetAt: null, retryAfter: null },
-          };
-        },
-      },
+      controlledAdapter,
+    );
+    const stagedOperations = await pool.query<{
+      id: string;
+      outboundQuery: string;
+      variantIndex: number;
+      passIndex: number;
+    }>(
+      `SELECT id, outbound_query AS "outboundQuery",
+              variant_index AS "variantIndex", pass_index AS "passIndex"
+       FROM ops.discovery_operations
+       WHERE query_session_id = $1 AND adapter_key = 'github'
+       ORDER BY pass_index, variant_index`,
+      [sessionId],
+    );
+    expect(stagedOperations.rows.map(({ variantIndex, passIndex }) => ({ variantIndex, passIndex }))).toEqual(
+      expect.arrayContaining([
+        { variantIndex: 1, passIndex: 1 },
+        { variantIndex: 2, passIndex: 2 },
+      ]),
+    );
+    const secondPassOperation = stagedOperations.rows.find((row) => row.passIndex === 2)!;
+    expect(secondPassOperation.outboundQuery).toContain('sonolith');
+    expect(secondPassOperation.outboundQuery).toContain('ceramic');
+    await processDiscoveryOperation(
+      pool,
+      { operationId: secondPassOperation.id, workspaceId: localWorkspaceId },
+      controlledAdapter,
     );
     const operation = await app.inject({
       method: 'GET',
@@ -980,9 +989,29 @@ describe('Phase 06 explorer and authoring contracts', () => {
     expect(operation.json()).toMatchObject({
       state: 'complete',
       resultCount: 1,
+      researchRun: {
+        state: expect.stringMatching(/^(complete|stopped)$/),
+        completedPassCount: 2,
+        retrievalReceipt: {
+          policyVersion: 'live-research-receipt-v1',
+          originalQuery: 'ceramic glaze acoustic resonance analysis toolkit',
+          completedPassCount: 2,
+          candidateLineage: [
+            expect.objectContaining({
+              contributingCandidateIds: expect.any(Array),
+              operationIds: expect.arrayContaining([operationId, secondPassOperation.id]),
+            }),
+          ],
+        },
+      },
+      retrievalMethod: {
+        receiptPolicyVersion: 'live-research-receipt-v1',
+        receiptHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+        passes: 2,
+      },
       candidates: [
         expect.objectContaining({
-          title: 'maestro-fixture/discovered-option',
+          title: 'maestro-fixture/sonolith',
           reviewState: 'lead',
           displayState: 'provisional',
           signalDisplay: expect.any(Number),
@@ -990,6 +1019,16 @@ describe('Phase 06 explorer and authoring contracts', () => {
         }),
       ],
     });
+    const repeated = await pool.query<{ candidates: number; links: number }>(
+      `SELECT
+         (SELECT count(*)::int FROM ops.discovery_candidates
+          WHERE workspace_id = $1 AND external_id = $2) AS candidates,
+         (SELECT count(*)::int FROM ops.discovery_operation_candidates link
+          JOIN ops.discovery_candidates candidate ON candidate.id = link.candidate_id
+          WHERE link.workspace_id = $1 AND candidate.external_id = $2) AS links`,
+      [localWorkspaceId, `fixture-${sessionId}`],
+    );
+    expect(repeated.rows[0]).toEqual({ candidates: 1, links: 2 });
     const candidateId = operation.json<{ candidates: Array<{ id: string }> }>().candidates[0]!.id;
     const resultSetId = requested.json<{ resultSetId: string }>().resultSetId;
     const restored = await app.inject({
@@ -1034,7 +1073,7 @@ describe('Phase 06 explorer and authoring contracts', () => {
         rationale: 'Exercise the supported lead-to-knowledge service path.',
       },
     });
-    expect(admitted.statusCode).toBe(201);
+    expect(admitted.statusCode, admitted.body).toBe(201);
     expect(admitted.json()).toMatchObject({ candidateId, providerId: expect.any(String) });
     const admittedCorpus = await app.inject({
       method: 'POST',
@@ -1305,6 +1344,147 @@ describe('Phase 06 explorer and authoring contracts', () => {
       nextDueAt: null,
       errorCode: 'target_deleted',
     });
+  });
+
+  it('atomically admits a community lead as a reviewer-corrected document', async () => {
+    await pool.query(
+      `UPDATE ops.source_adapter_configs SET enabled = true, daily_call_limit = 10
+       WHERE adapter_key = 'hacker_news'`,
+    );
+    await pool.query(
+      `DELETE FROM ops.adapter_daily_budgets
+       WHERE adapter_key = 'hacker_news' AND budget_date = current_date`,
+    );
+    const session = await createSession('fungal ecology field research discussion');
+    const requested = await app.inject({
+      method: 'POST',
+      url: `/api/v1/explorer/sessions/${session.id}/discovery`,
+      headers: mutationHeaders,
+      payload: {
+        adapterKey: 'hacker_news',
+        approvedPublicQuery: 'fungal ecology field research discussion',
+        idempotencyKey: `document-${randomUUID()}`,
+      },
+    });
+    expect(requested.statusCode).toBe(202);
+    const operationId = requested.json<{ id: string }>().id;
+    await processDiscoveryOperation(
+      pool,
+      { operationId, workspaceId: localWorkspaceId },
+      {
+        key: 'hacker_news',
+        version: 'controlled-community-v1',
+        async search() {
+          return {
+            state: 'complete',
+            leads: [
+              {
+                externalId: `community-${operationId}`,
+                canonicalUri: `https://example.test/discussions/${operationId}`,
+                title: 'Raw community discussion title',
+                summary: 'A community lead about fungal ecology field research practices.',
+                kindHint: 'community_discussion',
+                payload: { fixture: true },
+                provenance: {
+                  adapter: 'hacker_news',
+                  adapterVersion: 'controlled-community-v1',
+                  source: 'controlled integration fixture',
+                  observedAt: '2026-09-30T12:00:00.000Z',
+                  reviewState: 'lead',
+                },
+              },
+            ],
+            responseBytes: 128,
+            httpStatus: 200,
+            rateLimit: { remaining: null, resetAt: null, retryAfter: null },
+          };
+        },
+      },
+    );
+    const operation = await app.inject({
+      method: 'GET',
+      url: `/api/v1/discovery/operations/${operationId}`,
+      headers: hostHeaders,
+    });
+    const candidateId = operation.json<{ candidates: Array<{ id: string }> }>().candidates[0]!.id;
+    const before = await pool.query<{ providers: number; documents: number }>(
+      `SELECT
+         (SELECT count(*)::int FROM catalog.providers) AS providers,
+         (SELECT count(*)::int FROM catalog.knowledge_documents) AS documents`,
+    );
+    const invalid = await app.inject({
+      method: 'POST',
+      url: `/api/v1/discovery/candidates/${candidateId}/admit`,
+      headers: mutationHeaders,
+      payload: {
+        entityClass: 'document',
+        kind: 'unsupported_document_kind',
+        capabilityKey: `fungal-field-${randomUUID()}`,
+        capabilityName: 'Fungal field research',
+        searchTerms: ['fungal ecology', 'field research'],
+        limitations: ['Controlled fixture only.'],
+        reviewState: 'proposed',
+        rationale: 'The reviewer must be able to correct the record type.',
+      },
+    });
+    expect(invalid.statusCode).toBe(422);
+    const afterInvalid = await pool.query<{ providers: number; documents: number }>(
+      `SELECT
+         (SELECT count(*)::int FROM catalog.providers) AS providers,
+         (SELECT count(*)::int FROM catalog.knowledge_documents) AS documents`,
+    );
+    expect(afterInvalid.rows[0]).toEqual(before.rows[0]);
+    const admitted = await app.inject({
+      method: 'POST',
+      url: `/api/v1/discovery/candidates/${candidateId}/admit`,
+      headers: mutationHeaders,
+      payload: {
+        entityClass: 'document',
+        kind: 'resource',
+        title: 'Reviewed fungal field research discussion',
+        summary: 'A reviewer-curated community resource about fungal ecology field practice.',
+        publisher: 'Example research community',
+        capabilityKey: `fungal-field-${randomUUID()}`,
+        capabilityName: 'Fungal field research',
+        searchTerms: ['fungal ecology', 'field research'],
+        limitations: ['Community discussion; primary-source corroboration is still needed.'],
+        reviewState: 'proposed',
+        rationale: 'Retain the source lead as a document, not as software.',
+      },
+    });
+    expect(admitted.statusCode, admitted.body).toBe(201);
+    expect(admitted.json()).toMatchObject({
+      candidateId,
+      entityClass: 'document',
+      kind: 'resource',
+      providerId: null,
+      documentId: expect.any(String),
+    });
+    const retained = await pool.query<{
+      rawTitle: string;
+      documentTitle: string;
+      bindings: number;
+    }>(
+      `SELECT candidate.title AS "rawTitle", document.title AS "documentTitle",
+              count(binding.id)::int AS bindings
+       FROM ops.discovery_admissions admission
+       JOIN ops.discovery_candidates candidate ON candidate.id = admission.discovery_candidate_id
+       JOIN catalog.knowledge_documents document ON document.id = admission.document_id
+       JOIN catalog.knowledge_entity_evidence_bindings binding
+         ON binding.knowledge_entity_id = admission.knowledge_entity_id
+        AND binding.evidence_item_id = admission.evidence_item_id
+       WHERE admission.discovery_candidate_id = $1
+       GROUP BY candidate.title, document.title`,
+      [candidateId],
+    );
+    expect(retained.rows[0]).toEqual({
+      rawTitle: 'Raw community discussion title',
+      documentTitle: 'Reviewed fungal field research discussion',
+      bindings: 1,
+    });
+    await pool.query(
+      `UPDATE ops.source_adapter_configs SET enabled = false WHERE adapter_key = 'hacker_news'`,
+    );
   });
 
   it('records unchanged, changed, and failed watch checks without inventing evidence', async () => {

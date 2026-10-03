@@ -73,6 +73,12 @@ describe('reviewed PostgreSQL contract', () => {
       '0021_history_chain_integrity.sql',
       '0022_current_knowledge_views.sql',
       '0023_ai_development_tools_domain.sql',
+      '0024_shared_match_and_discovery_links.sql',
+      '0025_typed_signal_normalization.sql',
+      '0026_evidence_bound_corroboration.sql',
+      '0027_live_research_runs.sql',
+      '0028_typed_discovery_admission.sql',
+      '0029_discovery_operation_leases.sql',
     ]);
     expect(migrations.rows.every((row) => /^[a-f0-9]{64}$/.test(row.sha256))).toBe(true);
   });
@@ -306,7 +312,7 @@ describe('reviewed PostgreSQL contract', () => {
   });
 
   it('keeps reviewed SQL and Drizzle table/column declarations aligned', async () => {
-    expect(await checkSchemaDefinitions(pool)).toEqual({ checkedTables: 96, errors: [] });
+    expect(await checkSchemaDefinitions(pool)).toEqual({ checkedTables: 102, errors: [] });
   });
 
   it('projects every historical provider and document into the faceted knowledge model', async () => {
@@ -376,37 +382,79 @@ describe('reviewed PostgreSQL contract', () => {
       reliabilityScore: 0.8,
       evidenceBasis: { basis: 'integration fixture, not a live source claim' },
       sourceObservationIds: [item.observationId],
-      observedAt: new Date('2026-09-01T00:00:00.000Z'),
+      observedAt: new Date('2030-01-01T00:00:00.000Z'),
     });
     await recordEntityMetricObservation(pool, {
       knowledgeEntityId: item.entityId,
       metricKey: 'attention',
+      intrinsicDimension: 'reach',
+      direction: 'higher_is_better',
       rawValue: 10,
       rawUnit: 'mentions',
-      normalizedValue: 35,
-      cohortKey: 'fixture:implementations',
-      normalizationPolicyVersion: 'fixture-percentile-v1',
-      normalizationDetail: { method: 'fixture' },
-      windowStart: new Date('2026-07-01T00:00:00.000Z'),
-      windowEnd: new Date('2026-08-01T00:00:00.000Z'),
-      independenceGroup: 'fixture-primary',
+      aggregation: 'snapshot',
+      windowStart: new Date('2030-01-01T00:00:00.000Z'),
+      windowEnd: new Date('2030-02-01T00:00:00.000Z'),
       sourceObservationId: item.observationId,
-      observedAt: new Date('2026-08-01T00:00:00.000Z'),
+      observedAt: new Date('2030-02-01T00:00:00.000Z'),
     });
     await recordEntityMetricObservation(pool, {
       knowledgeEntityId: item.entityId,
       metricKey: 'attention',
+      intrinsicDimension: 'reach',
+      direction: 'higher_is_better',
       rawValue: 20,
       rawUnit: 'mentions',
-      normalizedValue: 65,
-      cohortKey: 'fixture:implementations',
-      normalizationPolicyVersion: 'fixture-percentile-v1',
-      normalizationDetail: { method: 'fixture' },
-      windowStart: new Date('2026-08-01T00:00:00.000Z'),
-      windowEnd: new Date('2026-09-01T00:00:00.000Z'),
-      independenceGroup: 'fixture-primary',
+      aggregation: 'snapshot',
+      windowStart: new Date('2030-02-01T00:00:00.000Z'),
+      windowEnd: new Date('2030-03-01T00:00:00.000Z'),
       sourceObservationId: item.observationId,
-      observedAt: new Date('2026-09-01T00:00:00.000Z'),
+      observedAt: new Date('2030-03-01T00:00:00.000Z'),
+    });
+    const independentSourceId = randomUUID();
+    const independentObservationId = randomUUID();
+    const independentEvidenceId = randomUUID();
+    await pool.query(
+      `INSERT INTO catalog.sources
+         (id, canonical_uri, title, owner, source_type, authority_scope)
+       VALUES ($1, $2, 'Independent integration source', 'Independent integration lab',
+               'test_fixture', 'integration fixture only')`,
+      [independentSourceId, `https://example.invalid/${independentSourceId}`],
+    );
+    await pool.query(
+      `INSERT INTO catalog.source_observations
+         (id, source_id, requested_uri, final_uri, observed_at, retrieval_method,
+          adapter_version, content_digest, trust_boundary, handling_status)
+       VALUES ($1, $2, $3, $3, $4, 'integration_fixture', 'v1', $5,
+               'curated', 'reviewed')`,
+      [
+        independentObservationId,
+        independentSourceId,
+        `https://example.invalid/${independentSourceId}`,
+        new Date('2030-02-01T00:00:00.000Z'),
+        'c'.repeat(64),
+      ],
+    );
+    await pool.query(
+      `INSERT INTO catalog.evidence_items
+         (id, source_observation_id, evidence_type, producer, method_version, result,
+          independence, applicability_scope, observed_at)
+       VALUES ($1, $2, 'integration_fixture', 'Independent integration lab', 'v1',
+               '{"supports":true}', 'independent', 'integration fixture only', $3)`,
+      [
+        independentEvidenceId,
+        independentObservationId,
+        new Date('2030-02-01T00:00:00.000Z'),
+      ],
+    );
+    await recordSourceReliability(pool, {
+      sourceId: independentSourceId,
+      authorityClass: 'independent',
+      availabilityState: 'available',
+      rightsState: 'allowed',
+      reliabilityScore: 0.8,
+      evidenceBasis: { basis: 'independent integration fixture' },
+      sourceObservationIds: [independentObservationId],
+      observedAt: new Date('2030-02-02T00:00:00.000Z'),
     });
     const corroboration = await recordCorroboration(pool, {
       knowledgeEntityId: item.entityId,
@@ -414,21 +462,17 @@ describe('reviewed PostgreSQL contract', () => {
       applicabilityScope: 'integration fixture only',
       evidence: [
         {
-          sourceId: item.sourceId,
-          independenceGroup: 'publisher',
-          role: 'primary',
+          sourceObservationId: item.observationId,
+          evidenceItemId: item.evidenceId,
           direction: 'supports',
         },
         {
-          sourceId: 'fixture-independent',
-          independenceGroup: 'independent-lab',
-          role: 'independent',
+          sourceObservationId: independentObservationId,
+          evidenceItemId: independentEvidenceId,
           direction: 'supports',
         },
       ],
-      sourceObservationIds: [item.observationId],
-      evidenceItemIds: [item.evidenceId],
-      observedAt: new Date('2026-09-01T00:00:01.000Z'),
+      observedAt: new Date('2030-04-01T00:00:00.000Z'),
     });
     expect(corroboration.state).toBe('corroborated');
     const intelligence = (await getEntityCorpusIntelligence(pool, item.entityId)) as {
@@ -590,6 +634,7 @@ describe('reviewed PostgreSQL contract', () => {
         routes: Array<{ adapterKey: string; state: string; reason: string }>;
         secondPass: { state: string; routes: unknown[] };
       };
+      retrieval: { passes: 1 | 2 };
     };
     expect(session.interpretation).toMatchObject({
       interpretationMethod: 'deterministic-v4',
@@ -597,15 +642,15 @@ describe('reviewed PostgreSQL contract', () => {
       resolvedConcepts: [],
     });
     expect(session.plan).toMatchObject({
-      policyVersion: 'research-plan-v3',
-      stopReason: 'second_pass_exhausted',
+      policyVersion: 'research-plan-v5',
+      stopReason: 'external_sources_disabled_after_local_pass',
       budgets: { maximumPasses: 2, maximumExternalCalls: 6 },
     });
     expect(session.plan.routes.find((route) => route.adapterKey === 'searxng')).toMatchObject({
       state: 'planned',
       reason: expect.any(String),
     });
-    expect(session.plan.secondPass).toMatchObject({ state: 'completed' });
+    expect(session.plan.secondPass).toMatchObject({ state: 'contingent' });
 
     const persisted = await pool.query<{
       stopReason: string;
@@ -619,10 +664,10 @@ describe('reviewed PostgreSQL contract', () => {
       [session.id],
     );
     expect(persisted.rows[0]).toEqual({
-      stopReason: 'second_pass_exhausted',
-      plannedPasses: 2,
+      stopReason: 'external_sources_disabled_after_local_pass',
+      plannedPasses: session.retrieval.passes,
       budgets: expect.objectContaining({ maximumPasses: 2 }),
-      coverage: expect.objectContaining({ needsSecondPass: true }),
+      coverage: {},
     });
   });
 
@@ -640,7 +685,7 @@ describe('reviewed PostgreSQL contract', () => {
     };
     expect(session).toMatchObject({
       interpretation: { coverageState: 'outside_maintained_coverage' },
-      plan: { secondPass: { state: 'completed' } },
+      plan: { secondPass: { state: 'contingent' } },
       retrieval: {
         passes: 2,
         stopReason: 'second_pass_exhausted',
@@ -665,7 +710,7 @@ describe('reviewed PostgreSQL contract', () => {
     expect(session.retrieval).toMatchObject({
       candidatePoolHash: expect.stringMatching(/^[a-f0-9]{64}$/),
       fusionPolicy: 'normalized-weighted-fusion-v1',
-      rerankPolicy: 'structured-rerank-v1',
+      rerankPolicy: 'structured-rerank-v2',
     });
     expect(session.retrieval.retrievers.length).toBeGreaterThanOrEqual(2);
 

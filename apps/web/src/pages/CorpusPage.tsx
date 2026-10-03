@@ -18,6 +18,10 @@ interface CorpusItem {
   observedAt: string;
   matchedTerms: string[];
   relevanceOrdinal: string | null;
+  matchScore: number | null;
+  matchBand: string | null;
+  matchReasons: string[];
+  matchPolicyVersion: string | null;
   signalDisplay: number | null;
   evidenceCoverage: number | null;
   evidenceConfidence: number | null;
@@ -300,8 +304,8 @@ export function CorpusPage() {
                       </small>
                       {item.matchedTerms.length ? (
                         <p className="matched-terms">
-                          {item.relevanceOrdinal
-                            ? `${label(item.relevanceOrdinal)} Match`
+                          {item.matchBand
+                            ? `${item.matchBand} Match`
                             : 'Matched'}
                           : {item.matchedTerms.slice(0, 8).join(', ')}
                         </p>
@@ -314,7 +318,7 @@ export function CorpusPage() {
                       <div className="query-signal live-lead-score">
                         <strong>Lead score {item.signalDisplay}</strong>
                         <span>
-                          {item.relevanceOrdinal ? `${label(item.relevanceOrdinal)} Match` : ''} ·{' '}
+                          {item.matchBand ? `${item.matchBand} Match` : ''} ·{' '}
                           {evidenceLabel(item.displayState)}
                         </span>
                         <small>

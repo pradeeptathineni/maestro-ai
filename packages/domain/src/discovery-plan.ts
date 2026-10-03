@@ -47,8 +47,28 @@ export interface ResearchCandidateSummary {
   group: string | null;
 }
 
+export interface ResearchVocabularyCandidate {
+  candidateId: string;
+  adapterKey: string;
+  canonicalUri: string;
+  title: string;
+  summary: string;
+  matchBand: 'Direct' | 'Strong' | 'Related' | 'Peripheral';
+  matchScore: number;
+  rerankPosition: number;
+}
+
+export interface LearnedResearchTerm {
+  term: string;
+  score: number;
+  sourceCandidateIds: string[];
+  sourceAdapters: string[];
+  sourceUris: string[];
+  reason: string;
+}
+
 export interface DiscoveryPlan {
-  policyVersion: 'research-plan-v2' | 'research-plan-v3';
+  policyVersion: 'research-plan-v2' | 'research-plan-v3' | 'research-plan-v4' | 'research-plan-v5';
   interpretationVersion: QueryInterpretation['interpretationMethod'];
   intentMode: QueryInterpretation['intentMode'];
   requiredCoverage: {
@@ -74,6 +94,7 @@ export interface DiscoveryPlan {
   secondPass: {
     state: 'contingent' | 'planned' | 'completed' | 'not_needed';
     trigger: string;
+    learnedVocabulary: LearnedResearchTerm[];
     routes: DiscoveryPlanRoute[];
   };
   coverageAssessment: ResearchCoverageAssessment | null;
@@ -89,6 +110,39 @@ function normalizeForComparison(value: string): string {
   return value.normalize('NFKC').trim().toLocaleLowerCase('en-US').replace(/\s+/g, ' ');
 }
 
+const VOCABULARY_STOP_WORDS = new Set([
+  'a',
+  'an',
+  'and',
+  'are',
+  'as',
+  'at',
+  'be',
+  'by',
+  'for',
+  'from',
+  'in',
+  'is',
+  'it',
+  'of',
+  'on',
+  'or',
+  'that',
+  'the',
+  'this',
+  'to',
+  'with',
+]);
+
+const VOCABULARY_NOISE_WORDS = new Set([
+  'documentation',
+  'github',
+  'homepage',
+  'official',
+  'project',
+  'repository',
+]);
+
 function variantWords(value: string): string[] {
   return (
     value
@@ -97,6 +151,140 @@ function variantWords(value: string): string[] {
       ?.map((word) => word.replace(/^[.-]+|[.-]+$/g, ''))
       .filter(Boolean) ?? []
   );
+}
+
+function vocabularyWords(value: string): string[] {
+  return variantWords(value)
+    .map(normalizeForComparison)
+    .filter(
+      (word) =>
+        word.length >= 3 &&
+        !VOCABULARY_STOP_WORDS.has(word) &&
+        !VOCABULARY_NOISE_WORDS.has(word) &&
+        !/^\d+$/.test(word),
+    );
+}
+
+function candidateTitlePhrase(title: string): string | null {
+  const withoutOwner = title.includes('/') ? title.slice(title.lastIndexOf('/') + 1) : title;
+  const primary = withoutOwner.split(/\s(?:[|:\u2013\u2014])\s/u, 1)[0] ?? withoutOwner;
+  const words = vocabularyWords(primary).slice(0, 5);
+  return words.length ? words.join(' ') : null;
+}
+
+/**
+ * Proposes bounded follow-up vocabulary from relevant first-pass leads. The proposal is not
+ * evidence and never replaces the original query: every term retains the public lead identities
+ * from which it was derived so the observed research plan remains reviewable.
+ */
+export function learnResearchVocabulary(
+  interpretation: QueryInterpretation,
+  candidates: ResearchVocabularyCandidate[],
+): LearnedResearchTerm[] {
+  const originalTerms = new Set([
+    ...querySubjectTerms(interpretation).flatMap(vocabularyWords),
+    ...querySubjectConcepts(interpretation).flatMap((concept) =>
+      vocabularyWords(concept.preferredLabel),
+    ),
+  ]);
+  const relevant = candidates
+    .filter(
+      (candidate) =>
+        candidate.rerankPosition <= 12 &&
+        candidate.matchBand !== 'Peripheral' &&
+        candidate.matchScore >= 25,
+    )
+    .sort(
+      (left, right) =>
+        left.rerankPosition - right.rerankPosition ||
+        left.candidateId.localeCompare(right.candidateId),
+    );
+  const proposals = new Map<
+    string,
+    {
+      term: string;
+      score: number;
+      titleSupport: number;
+      candidateIds: Set<string>;
+      adapters: Set<string>;
+      uris: Set<string>;
+    }
+  >();
+  const record = (
+    term: string,
+    candidate: ResearchVocabularyCandidate,
+    weight: number,
+    titleSupport: boolean,
+  ): void => {
+    const normalized = normalizeForComparison(term);
+    const terms = vocabularyWords(normalized);
+    if (!terms.length || terms.every((word) => originalTerms.has(word))) return;
+    const current = proposals.get(normalized) ?? {
+      term: normalized,
+      score: 0,
+      titleSupport: 0,
+      candidateIds: new Set<string>(),
+      adapters: new Set<string>(),
+      uris: new Set<string>(),
+    };
+    if (!current.candidateIds.has(candidate.candidateId)) {
+      current.score += weight;
+      if (titleSupport) current.titleSupport += 1;
+    }
+    current.candidateIds.add(candidate.candidateId);
+    current.adapters.add(candidate.adapterKey);
+    current.uris.add(candidate.canonicalUri);
+    proposals.set(normalized, current);
+  };
+  for (const candidate of relevant) {
+    const rankWeight = Math.max(1, 13 - candidate.rerankPosition);
+    const phrase = candidateTitlePhrase(candidate.title);
+    if (phrase) {
+      record(phrase, candidate, 20 + candidate.matchScore + rankWeight, true);
+      for (const word of vocabularyWords(phrase)) {
+        record(word, candidate, 8 + candidate.matchScore / 4 + rankWeight, true);
+      }
+    }
+    for (const word of new Set(vocabularyWords(candidate.summary))) {
+      record(word, candidate, 2 + rankWeight / 4, false);
+    }
+  }
+  return [...proposals.values()]
+    .filter(
+      (proposal) =>
+        proposal.titleSupport > 0 ||
+        proposal.candidateIds.size >= 2 ||
+        proposal.adapters.size >= 2,
+    )
+    .sort(
+      (left, right) =>
+        right.adapters.size - left.adapters.size ||
+        right.candidateIds.size - left.candidateIds.size ||
+        right.titleSupport - left.titleSupport ||
+        right.score - left.score ||
+        left.term.localeCompare(right.term),
+    )
+    .filter((proposal, index, all) => {
+      const words = new Set(vocabularyWords(proposal.term));
+      return !all.slice(0, index).some((selected) => {
+        const selectedWords = new Set(vocabularyWords(selected.term));
+        return selectedWords.size > words.size && [...words].every((word) => selectedWords.has(word));
+      });
+    })
+    .slice(0, 4)
+    .map((proposal) => ({
+      term: proposal.term,
+      score: Number(proposal.score.toFixed(4)),
+      sourceCandidateIds: [...proposal.candidateIds].sort(),
+      sourceAdapters: [...proposal.adapters].sort(),
+      sourceUris: [...proposal.uris].sort(),
+      reason:
+        proposal.adapters.size >= 2
+          ? 'Relevant first-pass leads from independent adapters used this terminology.'
+          : proposal.candidateIds.size >= 2
+            ? 'Multiple relevant first-pass leads used this terminology.'
+            : 'A highly ranked relevant first-pass lead used this title terminology.',
+    }));
 }
 
 function compactSourceVariant(interpretation: QueryInterpretation, maximumTerms: number): string {
@@ -241,7 +429,9 @@ export function assessResearchCoverage(
 }
 
 function firstPassRoutes(interpretation: QueryInterpretation): DiscoveryPlanRoute[] {
-  const exactLabel = interpretation.exactEntities[0]?.preferredLabel;
+  const exactLabel = interpretation.exactEntities.find(
+    (entity) => entity.matchMethod === 'exact',
+  )?.preferredLabel;
   const identityVariant = exactLabel
     ? boundedVariant(`"${exactLabel}"`)
     : compactSourceVariant(interpretation, 3);
@@ -314,13 +504,18 @@ function firstPassRoutes(interpretation: QueryInterpretation): DiscoveryPlanRout
 function secondPassRoutes(
   interpretation: QueryInterpretation,
   coverage: ResearchCoverageAssessment | null,
+  learnedVocabulary: LearnedResearchTerm[],
 ): DiscoveryPlanRoute[] {
-  const gapTerms = coverage?.missingBranches.length
-    ? coverage.missingBranches.slice(0, 3)
-    : interpretation.mechanismTerms.slice(0, 3);
+  const gapTerms = [
+    ...learnedVocabulary.slice(0, 2).map((proposal) => proposal.term),
+    ...(coverage?.missingBranches ?? []).slice(0, 2),
+    ...interpretation.mechanismTerms.slice(0, 2),
+  ];
   if (!gapTerms.length) return [];
-  const targetedVariant = targetedSourceVariant(interpretation, gapTerms, 5);
-  const exactLabel = interpretation.exactEntities[0]?.preferredLabel;
+  const targetedVariant = targetedSourceVariant(interpretation, gapTerms, 8);
+  const exactLabel = interpretation.exactEntities.find(
+    (entity) => entity.matchMethod === 'exact',
+  )?.preferredLabel;
   const firstWebVariant = exactLabel
     ? boundedVariant(`"${exactLabel}"`)
     : compactSourceVariant(interpretation, 5);
@@ -372,13 +567,15 @@ export function buildDiscoveryPlan(
     coverageAssessment?: ResearchCoverageAssessment;
     externalSourcesEnabled?: boolean;
     secondPassExecuted?: boolean;
+    learnedVocabulary?: LearnedResearchTerm[];
   } = {},
 ): DiscoveryPlan {
   const normalized = boundedVariant(publicQuery);
   if (!normalized) throw new TypeError('A public discovery query is required.');
   const coverageAssessment = options.coverageAssessment ?? null;
   const routes = firstPassRoutes(interpretation);
-  const secondRoutes = secondPassRoutes(interpretation, coverageAssessment);
+  const learnedVocabulary = options.learnedVocabulary ?? [];
+  const secondRoutes = secondPassRoutes(interpretation, coverageAssessment, learnedVocabulary);
   const secondPassExhaustedWithoutDistinctRoute = Boolean(
     coverageAssessment?.needsSecondPass && secondRoutes.length === 0,
   );
@@ -404,7 +601,7 @@ export function buildDiscoveryPlan(
               ? 'sufficient_local_coverage'
               : 'planning_complete';
   const withoutHash = {
-    policyVersion: 'research-plan-v3' as const,
+    policyVersion: 'research-plan-v5' as const,
     interpretationVersion: interpretation.interpretationMethod,
     intentMode: interpretation.intentMode,
     requiredCoverage: {
@@ -441,6 +638,7 @@ export function buildDiscoveryPlan(
             : secondPassState === 'not_needed'
               ? 'The first-pass coverage policy found no targeted follow-up requirement.'
               : 'Run only after the first pass records a coverage gap.',
+      learnedVocabulary,
       routes: secondRoutes,
     },
     coverageAssessment,

@@ -9,19 +9,14 @@ import {
   assessResearchCoverage,
   buildDiscoveryPlan,
   createVerificationBundle,
-  diversifyBroadRetrieval,
-  fuseRetrievalRankings,
   hashCanonical,
   interpretQuery,
   lexicalRelevance,
   newOpaqueId,
   querySubjectConcepts,
   querySubjectTerms,
-  resolveRetrievalDuplicates,
-  retrieveFirstPass,
-  retrieveSecondPass,
+  runRetrievalPipeline,
   stableUuid,
-  structuredRerank,
   type DuplicateResolution,
   type FusedRetrievalCandidate,
   type QueryInterpretation,
@@ -32,7 +27,6 @@ import {
   type RetrievalRanking,
 } from '../../domain/src/index.js';
 import {
-  calculateCompatibilityIntrinsicSignal,
   calculateQuerySignalV2,
   intrinsicSignalPolicyV3,
   querySignalKindProfile,
@@ -43,12 +37,13 @@ import {
 } from '../../scoring/src/index.js';
 import { postgresPrefixTsQuery, uniqueCandidateTerms } from './candidate-search.js';
 import { DomainValidationError, NotFoundError } from './errors.js';
+import { loadIntrinsicSignals } from './intrinsic-signal-repository.js';
 import { loadQueryKnowledge } from './taxonomy-repository.js';
 import { inTransaction } from './transaction.js';
 
 type JsonRow = Record<string, unknown>;
 
-const retrievalPolicyVersion = 'retrieval-fabric-v6';
+const retrievalPolicyVersion = 'retrieval-fabric-v7';
 const defaultFusionPolicy: RetrievalFusionPolicy = 'normalized-weighted-fusion-v1';
 
 interface ProjectionRow {
@@ -148,6 +143,7 @@ interface ResultItemRow extends JsonRow {
   entityClass: string;
   matchScore: number | null;
   matchBand: 'Direct' | 'Strong' | 'Related' | 'Peripheral' | null;
+  signalBasis: 'typed_cohort_metrics' | 'legacy_compatibility_projection' | 'historical_query_signal';
 }
 
 function json(value: unknown): string {
@@ -174,39 +170,9 @@ function explanationFor(
   return `An indexed field mentions part of this request; inspect scope before treating it as an option.`;
 }
 
-function kindMatchesTarget(kind: string, target: string | null): boolean {
-  if (!target) return true;
-  if (target === 'model') return kind === 'model';
-  if (target === 'provider') return ['service', 'platform', 'api'].includes(kind);
-  if (target === 'standard') return ['standard', 'protocol'].includes(kind);
-  if (target === 'practice') return ['practice', 'technique', 'concept', 'workflow'].includes(kind);
-  if (target === 'implementation') {
-    return !['article', 'research', 'resource', 'specification', 'standard'].includes(kind);
-  }
-  if (target === 'article') return false;
-  return true;
-}
-
 function validateValueProfile(value: unknown): QueryValueInput[] {
   if (!Array.isArray(value)) throw new DomainValidationError('Knowledge value profile is invalid.');
   return value as QueryValueInput[];
-}
-
-function intrinsicFromCompatibilityProfile(input: {
-  kind: string;
-  valueProfile: QueryValueInput[];
-  publicationState: string;
-  observedAt: Date;
-  evidenceSourceGroups: string[];
-}): IntrinsicSignalResult {
-  return calculateCompatibilityIntrinsicSignal({
-    kind: input.kind,
-    valueProfile: input.valueProfile,
-    observedAt: input.observedAt.toISOString(),
-    evidenceSourceGroups: input.evidenceSourceGroups,
-    freshness: ['stale', 'withdrawn'].includes(input.publicationState) ? 0.2 : 0.8,
-    provisional: ['lead', 'proposed'].includes(input.publicationState),
-  });
 }
 
 function retrievalRelevance(
@@ -324,7 +290,15 @@ async function loadRetrievalIndex(
                kp.preferred_label || ' ' || kp.summary || ' ' || kp.search_text
              ) @@ to_tsquery('simple'::regconfig, NULLIF($2, ''))
         )
-      ORDER BY kp.id
+      ORDER BY
+        ts_rank_cd(
+          to_tsvector(
+            'simple'::regconfig,
+            kp.preferred_label || ' ' || kp.summary || ' ' || kp.search_text
+          ),
+          to_tsquery('simple'::regconfig, NULLIF($2, ''))
+        ) DESC,
+        kp.preferred_label, kp.id
       LIMIT $7
     ), all_projection_ids AS (
       SELECT kp.id, 2 AS selection_priority
@@ -627,6 +601,7 @@ function materialize(
   projection: ProjectionRow,
   interpretation: QueryInterpretation,
   retrieval: RerankedRetrievalCandidate,
+  intrinsic: IntrinsicSignalResult,
 ): MaterializedResult | null {
   const requestedKind = interpretation.explicitFacets.find(
     (facet) => facet.key === 'candidate_kind',
@@ -648,13 +623,6 @@ function materialize(
     kindProfile: querySignalKindProfile(projection.kind),
     provisional:
       projection.publicationState === 'lead' || projection.publicationState === 'proposed',
-  });
-  const intrinsic = intrinsicFromCompatibilityProfile({
-    kind: projection.kind,
-    valueProfile: projection.valueProfile,
-    publicationState: projection.publicationState,
-    observedAt: projection.indexedAt,
-    evidenceSourceGroups: projection.evidenceSourceGroups,
   });
   const missing = signal.dimensions.flatMap((dimension) => dimension.missing);
   const caveats = [
@@ -715,6 +683,7 @@ function materializeDocument(
   document: DocumentRow,
   interpretation: QueryInterpretation,
   retrieval: RerankedRetrievalCandidate,
+  intrinsic: IntrinsicSignalResult,
 ): MaterializedDocument | null {
   const relevance = retrievalRelevance(
     lexicalRelevance(interpretation, {
@@ -731,13 +700,6 @@ function materializeDocument(
     dimensions: document.valueProfile,
     kindProfile: 'knowledge_document',
     provisional: document.publicationState !== 'reviewed',
-  });
-  const intrinsic = intrinsicFromCompatibilityProfile({
-    kind: document.kind,
-    valueProfile: document.valueProfile,
-    publicationState: document.publicationState,
-    observedAt: document.observedAt,
-    evidenceSourceGroups: [document.publisher],
   });
   return {
     document,
@@ -800,27 +762,6 @@ function retrievalStopReason(prepared: PreparedSnapshot): string {
     : 'sufficient_local_coverage';
 }
 
-function compatibleRetrievalDocument(
-  document: RetrievalDocument,
-  interpretation: QueryInterpretation,
-): boolean {
-  const requestedKind = interpretation.explicitFacets.find(
-    (facet) => facet.key === 'candidate_kind',
-  )?.value;
-  if (requestedKind && document.kind !== requestedKind) return false;
-  if (document.subjectType === 'document') {
-    if (!interpretation.typedTarget) return true;
-    if (interpretation.typedTarget === 'article') {
-      return ['article', 'research', 'resource'].includes(document.kind);
-    }
-    if (interpretation.typedTarget === 'standard') {
-      return ['standard', 'specification'].includes(document.kind);
-    }
-    return false;
-  }
-  return kindMatchesTarget(document.kind, interpretation.typedTarget);
-}
-
 function summaryForCoverage(document: RetrievalDocument): {
   entityClass: string;
   group: string | null;
@@ -859,51 +800,44 @@ function supportsOpenWorldPromotion(
 async function prepareSnapshot(
   client: PoolClient,
   interpretation: QueryInterpretation,
+  asOf: Date,
   fusionPolicy: RetrievalFusionPolicy = defaultFusionPolicy,
 ): Promise<PreparedSnapshot> {
   const index = await loadRetrievalIndex(client, interpretation);
-  const compatible = index.documents.filter((document) =>
-    compatibleRetrievalDocument(document, interpretation),
-  );
-  const resolved = resolveRetrievalDuplicates(compatible);
-  const firstPass = retrieveFirstPass(resolved.documents, interpretation);
-  const firstFused = fuseRetrievalRankings(firstPass.rankings, fusionPolicy);
-  const firstReranked = diversifyBroadRetrieval(
-    structuredRerank(firstFused, resolved.documents, interpretation),
-    resolved.documents,
-    interpretation,
-  );
+  let firstPassCoverage: ResearchCoverageAssessment | null = null;
+  const pipeline = runRetrievalPipeline(index.documents, interpretation, {
+    fusionPolicy,
+    maximumCandidates: 200,
+    shouldRunSecondPass: (firstPassCandidates, resolvedDocuments) => {
+      const documentsByCandidate = new Map(
+        resolvedDocuments.map((document) => [document.candidateKey, document]),
+      );
+      firstPassCoverage = assessResearchCoverage(
+        interpretation,
+        firstPassCandidates
+          .filter((candidate) => supportsCoverageAssessment(candidate, interpretation))
+          .slice(0, 100)
+          .map((candidate) => documentsByCandidate.get(candidate.candidateKey))
+          .filter((document): document is RetrievalDocument => Boolean(document))
+          .map(summaryForCoverage),
+      );
+      return firstPassCoverage.needsSecondPass;
+    },
+  });
+  const resolved = {
+    documents: pipeline.documents,
+    resolutions: pipeline.duplicateResolutions,
+  };
   const byCandidate = new Map(
-    resolved.documents.map((document) => [document.candidateKey, document]),
+    pipeline.documents.map((document) => [document.candidateKey, document]),
   );
-  const firstPassCoverage = assessResearchCoverage(
-    interpretation,
-    firstReranked
-      .filter((candidate) => supportsCoverageAssessment(candidate, interpretation))
-      .slice(0, 100)
-      .map((candidate) => byCandidate.get(candidate.candidateKey))
-      .filter((document): document is RetrievalDocument => Boolean(document))
-      .map(summaryForCoverage),
-  );
-  const secondPass = firstPassCoverage.needsSecondPass
-    ? retrieveSecondPass(resolved.documents, interpretation, firstPass)
-    : { rankings: [], hits: [] };
-  const rankings = [...firstPass.rankings, ...secondPass.rankings];
-  const rrf = fuseRetrievalRankings(rankings, 'reciprocal-rank-fusion-v1');
-  const weighted = fuseRetrievalRankings(rankings, 'normalized-weighted-fusion-v1');
-  const rrfReranked = diversifyBroadRetrieval(
-    structuredRerank(rrf, resolved.documents, interpretation),
-    resolved.documents,
-    interpretation,
-  );
-  const weightedReranked = diversifyBroadRetrieval(
-    structuredRerank(weighted, resolved.documents, interpretation),
-    resolved.documents,
-    interpretation,
-  );
-  const selected = (
-    fusionPolicy === 'reciprocal-rank-fusion-v1' ? rrfReranked : weightedReranked
-  ).slice(0, 200);
+  firstPassCoverage ??= assessResearchCoverage(interpretation, []);
+  const rankings = pipeline.rankings;
+  const rrf = pipeline.reciprocalRankFusion;
+  const weighted = pipeline.normalizedWeightedFusion;
+  const rrfReranked = pipeline.reciprocalRankReranked;
+  const weightedReranked = pipeline.normalizedWeightedReranked;
+  const selected = pipeline.selected;
   const finalCoverage = assessResearchCoverage(
     interpretation,
     selected
@@ -930,18 +864,46 @@ async function prepareSnapshot(
   const documentRows = await loadDocumentCandidates(client, documentIds);
   const providerById = new Map(providerRows.map((row) => [row.providerId, row]));
   const documentById = new Map(documentRows.map((row) => [row.documentId, row]));
+  const intrinsicByEntity = await loadIntrinsicSignals(client, [
+    ...providerRows.map((row) => ({
+      entityId: row.entityId,
+      kind: row.kind,
+      valueProfile: row.valueProfile,
+      observedAt: row.indexedAt,
+      asOf,
+      evidenceSourceGroups: row.evidenceSourceGroups,
+      freshness: row.publicationState === 'stale' ? 0.2 : 0.8,
+      provisional: ['lead', 'proposed'].includes(row.publicationState),
+    })),
+    ...documentRows.map((row) => ({
+      entityId: row.entityId,
+      kind: row.kind,
+      valueProfile: row.valueProfile,
+      observedAt: row.observedAt,
+      asOf,
+      evidenceSourceGroups: [row.publisher],
+      freshness: row.publicationState === 'stale' ? 0.2 : 0.8,
+      provisional: row.publicationState !== 'reviewed',
+    })),
+  ]);
   const ranked = selectedTop.flatMap((retrieval): RankedMaterial[] => {
     const document = byCandidate.get(retrieval.candidateKey);
     if (!document) return [];
     if (document.subjectType === 'implementation') {
       const providerId = retrieval.candidateKey.replace(/^implementation:/, '');
       const projection = providerById.get(providerId);
-      const item = projection ? materialize(projection, interpretation, retrieval) : null;
+      const intrinsic = projection ? intrinsicByEntity.get(projection.entityId) : null;
+      const item =
+        projection && intrinsic
+          ? materialize(projection, interpretation, retrieval, intrinsic)
+          : null;
       return item ? [{ subjectType: 'implementation', item }] : [];
     }
     const documentId = retrieval.candidateKey.replace(/^document:/, '');
     const row = documentById.get(documentId);
-    const item = row ? materializeDocument(row, interpretation, retrieval) : null;
+    const intrinsic = row ? intrinsicByEntity.get(row.entityId) : null;
+    const item =
+      row && intrinsic ? materializeDocument(row, interpretation, retrieval, intrinsic) : null;
     return item ? [{ subjectType: 'document', item }] : [];
   });
   const bounded = ranked
@@ -1002,7 +964,7 @@ async function prepareSnapshot(
     retrievalDocuments: resolved.documents,
     firstPassCoverage,
     finalCoverage,
-    retrievalPasses: firstPassCoverage.needsSecondPass ? 2 : 1,
+    retrievalPasses: pipeline.retrievalPasses,
   };
 }
 
@@ -1247,7 +1209,7 @@ async function insertResultSetRevision(
         rerank_policy_version, candidate_pool_hash, retrieval_passes, stop_reason,
         coverage_assessment, result_hash, created_at, expires_at)
      VALUES ($1, $2, $3, $4, $5, 'complete', $6, $7, $8, $9, $10, $11,
-             $12, $13, 'structured-rerank-v1', $14, $15, $16, $17, $18,
+             $12, $13, 'structured-rerank-v2', $14, $15, $16, $17, $18,
              $19, $20)`,
     [
       resultSetId,
@@ -1311,9 +1273,10 @@ async function insertResultSetRevision(
       dimensions: subject.intrinsic.dimensions,
       evidenceConfidence: subject.intrinsic.evidenceConfidence,
       trend: subject.intrinsic.trend,
+      inputReferences: subject.intrinsic.inputReferences,
     });
     return {
-      id: stableUuid('signals-ai:intrinsic-signal-v3', `${subject.entityRevisionId}:${inputHash}`),
+      id: stableUuid('maestro:intrinsic-signal-v3', `${subject.entityRevisionId}:${inputHash}`),
       candidate_key: subject.candidateKey,
       knowledge_entity_id: subject.entityId,
       entity_revision_id: subject.entityRevisionId,
@@ -1336,7 +1299,8 @@ async function insertResultSetRevision(
       trend_window_end: subject.intrinsic.trend.windowEnd,
       trend_detail: subject.intrinsic.trend,
       evidence_ids: subject.intrinsic.inputEvidenceIds,
-      generated_at: subject.intrinsic.trend.windowEnd,
+      input_references: subject.intrinsic.inputReferences,
+      generated_at: subject.intrinsic.inputReferences.asOf,
     };
   });
   if (intrinsicRows.length) {
@@ -1346,7 +1310,7 @@ async function insertResultSetRevision(
           input_hash, dimension_inputs, central, uncertainty, conservative, signal_display,
           display_state, band, evidence_confidence, evidence_confidence_detail,
           trend_policy_version, trend_state, trend_window_start, trend_window_end, trend_detail,
-          evidence_ids, generated_at)
+          evidence_ids, input_references, generated_at)
        SELECT record.id, record.knowledge_entity_id, record.entity_revision_id, record.policy_id,
               record.policy_version, record.profile, record.input_hash, record.dimension_inputs,
               record.central, record.uncertainty, record.conservative, record.signal_display,
@@ -1354,7 +1318,7 @@ async function insertResultSetRevision(
               record.evidence_confidence_detail, record.trend_policy_version, record.trend_state,
               record.trend_window_start, record.trend_window_end, record.trend_detail,
               ARRAY(SELECT jsonb_array_elements_text(record.evidence_ids))::uuid[],
-              record.generated_at
+              record.input_references, record.generated_at
        FROM jsonb_to_recordset($1::jsonb) AS record(
          id uuid, candidate_key text, knowledge_entity_id uuid, entity_revision_id uuid,
          policy_id uuid, policy_version text, profile text, input_hash text,
@@ -1362,7 +1326,7 @@ async function insertResultSetRevision(
          signal_display integer, display_state text, band text, evidence_confidence numeric,
          evidence_confidence_detail jsonb, trend_policy_version text, trend_state text,
          trend_window_start timestamptz, trend_window_end timestamptz, trend_detail jsonb,
-         evidence_ids jsonb, generated_at timestamptz
+         evidence_ids jsonb, input_references jsonb, generated_at timestamptz
        )
        ON CONFLICT (knowledge_entity_id, entity_revision_id, policy_id, input_hash) DO NOTHING`,
       [json(intrinsicRows)],
@@ -1628,9 +1592,11 @@ export async function createExplorerSession(
       input.explicitFacets ?? {},
       knowledge,
     );
+    const createdAt = new Date();
     const prepared = await prepareSnapshot(
       client,
       initialInterpretation,
+      createdAt,
       options.fusionPolicy ?? defaultFusionPolicy,
     );
     const forcedPartial =
@@ -1672,12 +1638,9 @@ export async function createExplorerSession(
     };
     const coverageAssessment = prepared.finalCoverage;
     const plan = buildDiscoveryPlan(input.query, interpretation, {
-      coverageAssessment,
       externalSourcesEnabled: input.searchConnectedSources ?? false,
-      secondPassExecuted: prepared.retrievalPasses === 2,
     });
     const sessionId = newOpaqueId();
-    const createdAt = new Date();
     const retentionUntil = new Date(createdAt.getTime() + 30 * 24 * 60 * 60 * 1000);
     await client.query(
       `INSERT INTO workspace.query_sessions
@@ -1751,7 +1714,7 @@ export async function createExplorerSession(
         policyVersion: retrievalPolicyVersion,
         candidatePoolHash: prepared.candidatePoolHash,
         fusionPolicy: prepared.fusionPolicy,
-        rerankPolicy: 'structured-rerank-v1',
+        rerankPolicy: 'structured-rerank-v2',
         passes: prepared.retrievalPasses,
         stopReason: retrievalStopReason(prepared),
         firstPassCoverage: prepared.firstPassCoverage,
@@ -1814,9 +1777,11 @@ export async function refreshExplorerSession(
     if (!current.rowCount) throw new NotFoundError('Query result set not found.');
     const row = session.rows[0]!;
     const previous = current.rows[0]!;
+    const createdAt = new Date();
     const prepared = await prepareSnapshot(
       client,
       row.interpretation,
+      createdAt,
       previous.fusionPolicy ?? defaultFusionPolicy,
     );
     if (
@@ -1830,7 +1795,6 @@ export async function refreshExplorerSession(
         predecessorId: null,
       };
     }
-    const createdAt = new Date();
     const resultSetId = await insertResultSetRevision(client, {
       workspaceId,
       sessionId,
@@ -1985,13 +1949,24 @@ async function resultRows(
             COALESCE(isr.central, qsr.value_central)::float8 AS "valueCentral",
             COALESCE(isr.uncertainty, qsr.value_uncertainty)::float8 AS "valueUncertainty",
             COALESCE(isr.conservative, qsr.value_conservative)::float8 AS "valueConservative",
-            qsr.evidence_coverage::float8 AS "evidenceCoverage",
+            COALESCE(
+              (isr.evidence_confidence_detail->>'coverage')::float8,
+              qsr.evidence_coverage::float8
+            ) AS "evidenceCoverage",
             COALESCE(isr.evidence_confidence, qsr.evidence_coverage)::float8
               AS "evidenceConfidence",
             COALESCE(isr.conservative, qsr.signal_unrounded)::float8 AS "signalUnrounded",
             COALESCE(isr.signal_display, qsr.signal_display) AS "signalDisplay",
             COALESCE(isr.display_state, qsr.display_state) AS "displayState",
             qsr.missing, COALESCE(isr.policy_version, qsr.policy_version) AS "policyVersion",
+            CASE
+              WHEN isr.id IS NULL THEN 'historical_query_signal'
+              WHEN EXISTS (
+                SELECT 1 FROM jsonb_array_elements(isr.dimension_inputs) dimension
+                WHERE dimension->'normalization'->>'method' = 'cohort_percentile'
+              ) THEN 'typed_cohort_metrics'
+              ELSE 'legacy_compatibility_projection'
+            END AS "signalBasis",
             isr.band AS "signalBand", isr.evidence_confidence_detail AS "evidenceConfidenceDetail",
             isr.trend_state AS "trendState", isr.trend_detail AS "trend",
             qcf.match_score AS "matchScore", qcf.match_band AS "matchBand",
@@ -2047,13 +2022,24 @@ async function resultRows(
             COALESCE(isr.central, qdr.value_conservative)::float8 AS "valueCentral",
             COALESCE(isr.uncertainty, 0)::float8 AS "valueUncertainty",
             COALESCE(isr.conservative, qdr.value_conservative)::float8 AS "valueConservative",
-            qdr.evidence_coverage::float8 AS "evidenceCoverage",
+            COALESCE(
+              (isr.evidence_confidence_detail->>'coverage')::float8,
+              qdr.evidence_coverage::float8
+            ) AS "evidenceCoverage",
             COALESCE(isr.evidence_confidence, qdr.evidence_coverage)::float8
               AS "evidenceConfidence",
             COALESCE(isr.conservative, qdr.signal_unrounded)::float8 AS "signalUnrounded",
             COALESCE(isr.signal_display, qdr.signal_display) AS "signalDisplay",
             COALESCE(isr.display_state, qdr.display_state) AS "displayState",
             qdr.missing, COALESCE(isr.policy_version, qdr.signal_policy_version) AS "policyVersion",
+            CASE
+              WHEN isr.id IS NULL THEN 'historical_query_signal'
+              WHEN EXISTS (
+                SELECT 1 FROM jsonb_array_elements(isr.dimension_inputs) dimension
+                WHERE dimension->'normalization'->>'method' = 'cohort_percentile'
+              ) THEN 'typed_cohort_metrics'
+              ELSE 'legacy_compatibility_projection'
+            END AS "signalBasis",
             isr.band AS "signalBand", isr.evidence_confidence_detail AS "evidenceConfidenceDetail",
             isr.trend_state AS "trendState", isr.trend_detail AS "trend",
             kd.publisher, kd.canonical_uri AS "canonicalUri",
@@ -2140,13 +2126,24 @@ export async function getExplorerItem(
             COALESCE(isr.central, qsr.value_central)::float8 AS "valueCentral",
             COALESCE(isr.uncertainty, qsr.value_uncertainty)::float8 AS "valueUncertainty",
             COALESCE(isr.conservative, qsr.value_conservative)::float8 AS "valueConservative",
-            qsr.evidence_coverage::float8 AS "evidenceCoverage",
+            COALESCE(
+              (isr.evidence_confidence_detail->>'coverage')::float8,
+              qsr.evidence_coverage::float8
+            ) AS "evidenceCoverage",
             COALESCE(isr.evidence_confidence, qsr.evidence_coverage)::float8
               AS "evidenceConfidence",
             COALESCE(isr.conservative, qsr.signal_unrounded)::float8 AS "signalUnrounded",
             COALESCE(isr.signal_display, qsr.signal_display) AS "signalDisplay",
             COALESCE(isr.display_state, qsr.display_state) AS "displayState",
             qsr.missing, COALESCE(isr.policy_version, qsr.policy_version) AS "policyVersion",
+            CASE
+              WHEN isr.id IS NULL THEN 'historical_query_signal'
+              WHEN EXISTS (
+                SELECT 1 FROM jsonb_array_elements(isr.dimension_inputs) dimension
+                WHERE dimension->'normalization'->>'method' = 'cohort_percentile'
+              ) THEN 'typed_cohort_metrics'
+              ELSE 'legacy_compatibility_projection'
+            END AS "signalBasis",
             COALESCE(isr.input_hash, qsr.input_hash) AS "inputHash",
             COALESCE(isr.generated_at, qsr.generated_at) AS "generatedAt",
             isr.band AS "signalBand", isr.evidence_confidence_detail AS "evidenceConfidenceDetail",
@@ -2204,13 +2201,24 @@ export async function getExplorerItem(
               COALESCE(isr.central, qdr.value_conservative)::float8 AS "valueCentral",
               COALESCE(isr.uncertainty, 0)::float8 AS "valueUncertainty",
               COALESCE(isr.conservative, qdr.value_conservative)::float8 AS "valueConservative",
-              qdr.evidence_coverage::float8 AS "evidenceCoverage",
+              COALESCE(
+                (isr.evidence_confidence_detail->>'coverage')::float8,
+                qdr.evidence_coverage::float8
+              ) AS "evidenceCoverage",
               COALESCE(isr.evidence_confidence, qdr.evidence_coverage)::float8
                 AS "evidenceConfidence",
               COALESCE(isr.conservative, qdr.signal_unrounded)::float8 AS "signalUnrounded",
               COALESCE(isr.signal_display, qdr.signal_display) AS "signalDisplay",
               COALESCE(isr.display_state, qdr.display_state) AS "displayState",
               qdr.missing, COALESCE(isr.policy_version, qdr.signal_policy_version) AS "policyVersion",
+              CASE
+                WHEN isr.id IS NULL THEN 'historical_query_signal'
+                WHEN EXISTS (
+                  SELECT 1 FROM jsonb_array_elements(isr.dimension_inputs) dimension
+                  WHERE dimension->'normalization'->>'method' = 'cohort_percentile'
+                ) THEN 'typed_cohort_metrics'
+                ELSE 'legacy_compatibility_projection'
+              END AS "signalBasis",
               COALESCE(isr.input_hash, qdr.input_hash) AS "inputHash",
               COALESCE(isr.generated_at, qdr.created_at) AS "generatedAt",
               isr.band AS "signalBand", isr.evidence_confidence_detail AS "evidenceConfidenceDetail",

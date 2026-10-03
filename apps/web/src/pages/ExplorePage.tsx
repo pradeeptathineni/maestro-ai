@@ -57,10 +57,16 @@ interface DiscoveryCandidate {
   reviewState: string;
   matchedTerms: string[];
   relevanceOrdinal: string;
+  matchScore: number;
+  matchBand: string | null;
+  matchReasons: string[];
+  matchPolicyVersion: string;
   signalDisplay: number;
   evidenceCoverage: number;
   displayState: string;
   signalExplanation: string;
+  rerankPosition: number;
+  sourceAdapters: string[];
 }
 
 interface DiscoveryOperation {
@@ -69,6 +75,19 @@ interface DiscoveryOperation {
   state: string;
   safeDetail: string;
   candidates: DiscoveryCandidate[];
+  candidateScope: 'query_session_fused';
+  researchRun: {
+    id: string;
+    state: 'first_pass' | 'second_pass' | 'complete' | 'stopped';
+    stopReason: string | null;
+  } | null;
+  researchOperations: Array<{
+    id: string;
+    adapterKey: string;
+    state: string;
+    passIndex: 1 | 2;
+    variantIndex: number;
+  }>;
 }
 
 interface SearchSession extends ExplorerSession {
@@ -155,6 +174,32 @@ function saveJson(filename: string, value: unknown): void {
   URL.revokeObjectURL(url);
 }
 
+function suggestedCapabilityKey(title: string): string {
+  return (
+    title
+      .normalize('NFKC')
+      .toLocaleLowerCase('en-US')
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 100) || 'reviewed-discovery'
+  );
+}
+
+function suggestedAdmissionType(candidate: DiscoveryCandidate): string {
+  if (candidate.adapterKey === 'github' || candidate.adapterKey === 'mcp_registry') {
+    const kind = candidate.kindHint === 'repository' ? 'oss_project' : candidate.kindHint;
+    return `implementation:${kind ?? 'other'}`;
+  }
+  if (candidate.kindHint === 'article') return 'document:article';
+  if (candidate.kindHint === 'paper' || candidate.kindHint === 'research') {
+    return 'document:research';
+  }
+  if (candidate.kindHint === 'specification' || candidate.kindHint === 'standard') {
+    return `document:${candidate.kindHint}`;
+  }
+  return 'document:resource';
+}
+
 export function ExplorePage() {
   const client = useQueryClient();
   const [parameters, setParameters] = useSearchParams();
@@ -201,7 +246,10 @@ export function ExplorePage() {
       queryKey: ['discovery-operation', operationId],
       queryFn: () => api<DiscoveryOperation>(`/api/v1/discovery/operations/${operationId}`),
       refetchInterval: (query: { state: { data?: DiscoveryOperation } }) =>
-        ['queued', 'running'].includes(query.state.data?.state ?? '') ? 1_000 : false,
+        ['queued', 'running'].includes(query.state.data?.state ?? '') ||
+        ['first_pass', 'second_pass'].includes(query.state.data?.researchRun?.state ?? '')
+          ? 1_000
+          : false,
     })),
   });
 
@@ -296,10 +344,10 @@ export function ExplorePage() {
       ).length;
       setNotice(
         activeOperationCount
-          ? `${session.counts.assessed} indexed results are ready. ${activeOperationCount} connected source search${activeOperationCount === 1 ? ' is' : 'es are'} running.`
+          ? `Live research is running across ${activeOperationCount} connected route${activeOperationCount === 1 ? '' : 's'}. ${session.counts.assessed} Corpus matches are ready for cross-checking.`
           : session.discoveryOperations.length
-            ? `${session.counts.assessed} indexed results are ready. The source plan was recorded; no connected source request was queued.`
-            : `${session.counts.assessed} indexed results are ready. No connected source is enabled.`,
+            ? `The live source plan was recorded, but no connected request was queued. ${session.counts.assessed} Corpus matches are available.`
+            : `No connected source is enabled. ${session.counts.assessed} Corpus matches are available.`,
       );
       void client.invalidateQueries({ queryKey: ['explorer-history'] });
     },
@@ -388,6 +436,37 @@ export function ExplorePage() {
       void client.invalidateQueries({ queryKey: ['watches'] });
     },
   });
+  const admitLead = useMutation({
+    mutationFn: (input: {
+      candidateId: string;
+      body: {
+        entityClass: 'implementation' | 'document';
+        kind: string;
+        title: string;
+        summary: string;
+        publisher: string;
+        capabilityKey: string;
+        capabilityName: string;
+        searchTerms: string[];
+        limitations: string[];
+        reviewState: 'proposed' | 'reviewed';
+        rationale: string;
+      };
+    }) =>
+      api<{ candidateId: string; providerId: string | null; documentId: string | null }>(
+        `/api/v1/discovery/candidates/${input.candidateId}/admit`,
+        { method: 'POST', body: JSON.stringify(input.body) },
+      ),
+    onSuccess: (_, input) => {
+      setNotice('The reviewed lead was added to Corpus as durable indexed knowledge.');
+      void client.invalidateQueries({ queryKey: ['discovery-operation'] });
+      void client.invalidateQueries({ queryKey: ['corpus'] });
+      setDiscoveryOperationIds((ids) => [...ids]);
+      document
+        .querySelector<HTMLDetailsElement>(`#admit-${CSS.escape(input.candidateId)}`)
+        ?.removeAttribute('open');
+    },
+  });
 
   const inspect = useCallback((id: string) => {
     detailTrigger.current =
@@ -434,6 +513,7 @@ export function ExplorePage() {
     watch.error,
     loadMore.error,
     taxonomy.error,
+    admitLead.error,
   ].filter(Boolean);
   const entityClassOptions =
     taxonomy.data?.facets
@@ -451,22 +531,36 @@ export function ExplorePage() {
   const enabledDiscoveryCount = discoveryIntegrations.filter(
     (integration) => integration.enabled,
   ).length;
-  const connectedCandidatesByUri = new Map<string, DiscoveryCandidate>();
-  for (const candidate of discoveryOperations.flatMap(
-    (operation) => operation.data?.candidates ?? [],
-  )) {
-    const current = connectedCandidatesByUri.get(candidate.canonicalUri);
-    if (!current || candidate.signalDisplay > current.signalDisplay) {
-      connectedCandidatesByUri.set(candidate.canonicalUri, candidate);
-    }
-  }
-  const connectedCandidates = [...connectedCandidatesByUri.values()].sort(
-    (left, right) =>
-      right.signalDisplay - left.signalDisplay || left.title.localeCompare(right.title),
-  );
+  const connectedSnapshot = discoveryOperations
+    .map((operation) => operation.data)
+    .filter((operation): operation is DiscoveryOperation => Boolean(operation))
+    .sort(
+      (left, right) =>
+        right.candidates.length - left.candidates.length ||
+        Number(right.researchRun?.state === 'complete') -
+          Number(left.researchRun?.state === 'complete'),
+    )[0];
+  const connectedCandidates = connectedSnapshot?.candidates ?? [];
+  const connectedRouteStatuses =
+    connectedSnapshot?.researchOperations ??
+    discoveryOperations.flatMap((operation) =>
+      operation.data
+        ? [
+            {
+              id: operation.data.id,
+              adapterKey: operation.data.adapterKey,
+              state: operation.data.state,
+              passIndex: 1 as const,
+              variantIndex: 1,
+            },
+          ]
+        : [],
+    );
   const connectedSearchesPending = discoveryOperations.some(
     (operation) =>
-      operation.isPending || ['queued', 'running'].includes(operation.data?.state ?? ''),
+      operation.isPending ||
+      ['queued', 'running'].includes(operation.data?.state ?? '') ||
+      ['first_pass', 'second_pass'].includes(operation.data?.researchRun?.state ?? ''),
   );
   const detailMissing = detail.data
     ? [
@@ -498,8 +592,9 @@ export function ExplorePage() {
         <p className="eyebrow">Technology search</p>
         <h1 id="explorer-heading">Find existing tools for what you need</h1>
         <p>
-          Describe what you need. Maestro searches its local index and every source you have
-          enabled, then keeps query Match separate from intrinsic Signal, confidence, and evidence.
+          Describe what you need. Search researches every source you have enabled now, then
+          cross-checks the durable Corpus with the same Match method. Signal, confidence, and
+          evidence remain separate from query relevance.
         </p>
         <form
           className="explorer-query"
@@ -720,31 +815,40 @@ export function ExplorePage() {
             </form>
           </details>
 
-          <details className="source-results">
-            <summary>
+          <section className="source-results live-search-results" aria-labelledby="live-results-heading">
+            <div className="live-results-heading">
               <div>
-                <p className="eyebrow">Connected sources</p>
-                <strong>Source plan and live leads</strong>
+                <p className="eyebrow">Live research</p>
+                <h2 id="live-results-heading">Live results</h2>
               </div>
-              <span>{discoveryOperationIds.length} planned route states</span>
-            </summary>
+              <span>
+                {connectedCandidates.length} lead{connectedCandidates.length === 1 ? '' : 's'} ·{' '}
+                {connectedSearchesPending ? 'research in progress' : 'research stopped'}
+              </span>
+            </div>
             <div className="source-results-body">
               <p className="hint">
-                Live leads receive a preliminary query score from source metadata. It is not the
-                intrinsic Signal assigned only after evidence-backed corpus admission.
+                These are the primary results of this live query. They use the same Match pipeline
+                as Corpus; their preliminary Signal is source metadata, not yet evidence-backed
+                Corpus knowledge.
               </p>
               {discoveryOperationIds.length ? (
                 <>
-                  <div className="source-status-row" aria-live="polite">
-                    {discoveryOperations.map((operation, index) => (
-                      <span key={discoveryOperationIds[index]}>
-                        <strong>
-                          {label(operation.data?.adapterKey ?? `source ${index + 1}`)}
-                        </strong>
-                        <StateBadge state={operation.data?.state ?? 'running'} />
-                      </span>
-                    ))}
-                  </div>
+                  <details className="live-route-status">
+                    <summary>
+                      Research route status ({connectedRouteStatuses.length})
+                    </summary>
+                    <div className="source-status-row" aria-live="polite">
+                      {connectedRouteStatuses.map((operation) => (
+                        <span key={operation.id}>
+                          <strong>
+                            {label(operation.adapterKey)} · pass {operation.passIndex}
+                          </strong>
+                          <StateBadge state={operation.state} />
+                        </span>
+                      ))}
+                    </div>
+                  </details>
                   {connectedCandidates.length ? (
                     <div className="source-result-list">
                       {connectedCandidates.map((candidate) => (
@@ -760,21 +864,180 @@ export function ExplorePage() {
                           <div className="query-signal live-lead-score">
                             <strong>Lead score {candidate.signalDisplay}</strong>
                             <span>
-                              {label(candidate.relevanceOrdinal)} relevance ·{' '}
+                              {candidate.matchBand ?? label(candidate.relevanceOrdinal)} Match ·{' '}
                               {signalStateLabel(candidate.displayState)}
                             </span>
                             <small>
                               {formatFractionPercent(candidate.evidenceCoverage)} metadata coverage
                             </small>
+                            {candidate.sourceAdapters.length > 1 ? (
+                              <small>
+                                Found through {candidate.sourceAdapters.map(label).join(', ')}
+                              </small>
+                            ) : null}
                           </div>
-                          <a
-                            className="button secondary compact"
-                            href={candidate.canonicalUri}
-                            rel="noreferrer"
-                            target="_blank"
-                          >
-                            Open source
-                          </a>
+                          <div className="source-result-actions">
+                            <a
+                              className="button secondary compact"
+                              href={candidate.canonicalUri}
+                              rel="noreferrer"
+                              target="_blank"
+                            >
+                              Open source
+                            </a>
+                            <details id={`admit-${candidate.id}`} className="lead-admission">
+                              <summary>Review and add to Corpus</summary>
+                              <form
+                                onSubmit={(event) => {
+                                  event.preventDefault();
+                                  const data = new FormData(event.currentTarget);
+                                  const searchTerms = String(data.get('searchTerms') ?? '')
+                                    .split(',')
+                                    .map((term) => term.trim())
+                                    .filter(Boolean);
+                                  const limitations = String(data.get('limitations') ?? '')
+                                    .split('\n')
+                                    .map((item) => item.trim())
+                                    .filter(Boolean);
+                                  const [entityClass, kind] = String(
+                                    data.get('admissionType') ?? 'document:resource',
+                                  ).split(':', 2) as ['implementation' | 'document', string];
+                                  admitLead.mutate({
+                                    candidateId: candidate.id,
+                                    body: {
+                                      entityClass,
+                                      kind,
+                                      title: String(data.get('title') ?? ''),
+                                      summary: String(data.get('summary') ?? ''),
+                                      publisher: String(data.get('publisher') ?? ''),
+                                      capabilityKey: String(data.get('capabilityKey') ?? ''),
+                                      capabilityName: String(data.get('capabilityName') ?? ''),
+                                      searchTerms,
+                                      limitations,
+                                      reviewState:
+                                        data.get('reviewState') === 'reviewed'
+                                          ? 'reviewed'
+                                          : 'proposed',
+                                      rationale: String(data.get('rationale') ?? ''),
+                                    },
+                                  });
+                                }}
+                              >
+                                <label>
+                                  Corpus record type
+                                  <select
+                                    defaultValue={suggestedAdmissionType(candidate)}
+                                    name="admissionType"
+                                  >
+                                    <optgroup label="Implementations">
+                                      <option value="implementation:oss_project">
+                                        Open-source project
+                                      </option>
+                                      <option value="implementation:service">Service</option>
+                                      <option value="implementation:api">API</option>
+                                      <option value="implementation:mcp_server">MCP server</option>
+                                      <option value="implementation:plugin">Plugin</option>
+                                      <option value="implementation:model">Model</option>
+                                      <option value="implementation:framework">Framework</option>
+                                      <option value="implementation:library">Library</option>
+                                      <option value="implementation:language">Language</option>
+                                      <option value="implementation:other">
+                                        Other implementation
+                                      </option>
+                                    </optgroup>
+                                    <optgroup label="Documents and knowledge">
+                                      <option value="document:article">Article</option>
+                                      <option value="document:research">Research</option>
+                                      <option value="document:resource">Resource or discussion</option>
+                                      <option value="document:specification">Specification</option>
+                                      <option value="document:standard">Standard</option>
+                                    </optgroup>
+                                  </select>
+                                </label>
+                                <label>
+                                  Corpus title
+                                  <input
+                                    defaultValue={candidate.title}
+                                    maxLength={500}
+                                    name="title"
+                                    required
+                                  />
+                                </label>
+                                <label>
+                                  Summary
+                                  <textarea
+                                    defaultValue={candidate.summary}
+                                    maxLength={2000}
+                                    name="summary"
+                                    required
+                                    rows={3}
+                                  />
+                                </label>
+                                <label>
+                                  Publisher or source owner
+                                  <input
+                                    defaultValue={new URL(candidate.canonicalUri).hostname}
+                                    maxLength={240}
+                                    name="publisher"
+                                    required
+                                  />
+                                </label>
+                                <label>
+                                  Capability name
+                                  <input
+                                    defaultValue={candidate.title}
+                                    maxLength={240}
+                                    name="capabilityName"
+                                    required
+                                  />
+                                </label>
+                                <label>
+                                  Stable capability key
+                                  <input
+                                    defaultValue={suggestedCapabilityKey(candidate.title)}
+                                    maxLength={120}
+                                    name="capabilityKey"
+                                    required
+                                  />
+                                </label>
+                                <label>
+                                  Search terms, comma separated
+                                  <input
+                                    defaultValue={candidate.matchedTerms.join(', ')}
+                                    name="searchTerms"
+                                    required
+                                  />
+                                </label>
+                                <label>
+                                  Known limitations, one per line
+                                  <textarea name="limitations" rows={2} />
+                                </label>
+                                <label>
+                                  Review state
+                                  <select defaultValue="proposed" name="reviewState">
+                                    <option value="proposed">Proposed — needs deeper review</option>
+                                    <option value="reviewed">Reviewed — evidence checked</option>
+                                  </select>
+                                </label>
+                                <label>
+                                  Admission rationale
+                                  <textarea
+                                    maxLength={2000}
+                                    name="rationale"
+                                    required
+                                    rows={3}
+                                  />
+                                </label>
+                                <button
+                                  className="button primary compact"
+                                  disabled={admitLead.isPending}
+                                  type="submit"
+                                >
+                                  {admitLead.isPending ? 'Adding…' : 'Add reviewed lead'}
+                                </button>
+                              </form>
+                            </details>
+                          </div>
                         </article>
                       ))}
                     </div>
@@ -793,13 +1056,13 @@ export function ExplorePage() {
                 </p>
               )}
             </div>
-          </details>
+          </section>
 
           <section className="explorer-workbench" aria-labelledby="results-heading">
             <div className="workbench-toolbar">
               <div>
-                <p className="eyebrow">Local index</p>
-                <h2 id="results-heading">Results</h2>
+                <p className="eyebrow">Corpus cross-check</p>
+                <h2 id="results-heading">Indexed Corpus matches</h2>
               </div>
               <div className="segmented" aria-label="Result view">
                 <button

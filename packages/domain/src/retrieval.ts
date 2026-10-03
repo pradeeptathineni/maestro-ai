@@ -68,7 +68,7 @@ export interface FusedRetrievalCandidate {
 }
 
 export interface RerankedRetrievalCandidate extends FusedRetrievalCandidate {
-  rerankPolicy: 'structured-rerank-v1';
+  rerankPolicy: 'structured-rerank-v2';
   rerankPosition: number;
   rerankScore: number;
   matchScore: number;
@@ -76,9 +76,37 @@ export interface RerankedRetrievalCandidate extends FusedRetrievalCandidate {
   reasons: string[];
 }
 
+export const retrievalMatchPolicyVersion = 'retrieval-match-v1' as const;
+
+export interface RetrievalMatchAssessment {
+  policyVersion: typeof retrievalMatchPolicyVersion;
+  score: number;
+  band: 'Direct' | 'Strong' | 'Related' | 'Peripheral';
+  matchedTerms: string[];
+  matchedConceptIds: string[];
+  reasons: string[];
+  typeCompatible: boolean;
+  typeCompatibility: 'compatible' | 'unknown' | 'incompatible';
+}
+
 export interface RetrievalPassResult {
   rankings: RetrievalRanking[];
   hits: RetrievalHit[];
+}
+
+export interface RetrievalPipelineResult {
+  documents: RetrievalDocument[];
+  duplicateResolutions: DuplicateResolution[];
+  firstPass: RetrievalPassResult;
+  secondPass: RetrievalPassResult;
+  rankings: RetrievalRanking[];
+  reciprocalRankFusion: FusedRetrievalCandidate[];
+  normalizedWeightedFusion: FusedRetrievalCandidate[];
+  reciprocalRankReranked: RerankedRetrievalCandidate[];
+  normalizedWeightedReranked: RerankedRetrievalCandidate[];
+  selected: RerankedRetrievalCandidate[];
+  fusionPolicy: RetrievalFusionPolicy;
+  retrievalPasses: 1 | 2;
 }
 
 const RETRIEVAL_STOP_WORDS = new Set([
@@ -89,24 +117,17 @@ const RETRIEVAL_STOP_WORDS = new Set([
   'as',
   'at',
   'be',
-  'behind',
   'by',
   'for',
   'from',
   'in',
   'is',
   'it',
-  'less',
-  'make',
   'me',
   'my',
   'of',
   'on',
-  'one',
   'or',
-  'separate',
-  'several',
-  'sound',
   'that',
   'the',
   'this',
@@ -230,6 +251,107 @@ function bestFieldMatch(
     }
   }
   return best;
+}
+
+function matchBand(score: number): RetrievalMatchAssessment['band'] {
+  return score >= 70 ? 'Direct' : score >= 45 ? 'Strong' : score >= 25 ? 'Related' : 'Peripheral';
+}
+
+/**
+ * Canonical Match policy shared by Search, live leads, and Corpus. Candidate acquisition and
+ * surface ordering may differ, but the same query/material pair receives the same assessment.
+ */
+export function assessRetrievalMatch(
+  document: RetrievalDocument,
+  interpretation: QueryInterpretation,
+): RetrievalMatchAssessment | null {
+  const queryTerms = searchableQueryTerms(interpretation);
+  const fields = tokenSet(document);
+  const matchedTerms = queryTerms.filter((term) => bestFieldMatch(term, fields).score > 0);
+  const exactEntityIds = new Set(interpretation.exactEntities.map((entity) => entity.entityId));
+  const normalizedQuery = words(interpretation.normalizedText).join(' ');
+  const exactIdentity =
+    exactEntityIds.has(document.entityId) ||
+    [document.name, ...document.aliases].some(
+      (label) => words(label).join(' ') === normalizedQuery && normalizedQuery.length > 0,
+    );
+  const subjectConcepts = querySubjectConcepts(interpretation);
+  const directIds = new Set(subjectConcepts.map((concept) => concept.conceptId));
+  const relatedIds = new Set(
+    subjectConcepts.flatMap((concept) => concept.relations.map((relation) => relation.conceptId)),
+  );
+  const directConcepts = document.concepts.filter((concept) => directIds.has(concept.conceptId));
+  const relatedConcepts = document.concepts.filter((concept) => relatedIds.has(concept.conceptId));
+  const requestedClass = interpretation.requestedEntityClasses.some(
+    (entityClass) =>
+      entityClass === document.entityClass ||
+      entityClass === document.kind ||
+      (entityClass === 'implementation' && document.subjectType === 'implementation') ||
+      (entityClass === 'document' && document.subjectType === 'document'),
+  );
+  const entityClassKnown = !['', 'lead', 'other', 'unknown'].includes(document.entityClass);
+  const typeCompatibility = !interpretation.requestedEntityClasses.length || requestedClass
+    ? 'compatible'
+    : entityClassKnown
+      ? 'incompatible'
+      : 'unknown';
+  const typeCompatible = typeCompatibility !== 'incompatible';
+  const minimumLexicalMatches = Math.max(1, Math.ceil(queryTerms.length * 0.5));
+  if (
+    !exactIdentity &&
+    !directConcepts.length &&
+    !relatedConcepts.length &&
+    matchedTerms.length < minimumLexicalMatches
+  ) {
+    return null;
+  }
+  const termCoverage = queryTerms.length ? matchedTerms.length / queryTerms.length : 0;
+  const uncappedScore = Math.min(
+    100,
+    Math.round(
+      termCoverage * 45 +
+        Math.min(25, directConcepts.length * 12) +
+        Math.min(18, relatedConcepts.length * 6) +
+        Number(exactIdentity) * 25 +
+        Number(requestedClass) * 5,
+    ),
+  );
+  // An explicit entity-class request is part of Match itself, not a hidden surface-specific
+  // ranking adjustment. A known mismatch may remain related context, but cannot be presented as
+  // a direct or strong answer. Unknown provisional leads are kept honest as unknown rather than
+  // being asserted compatible or incompatible.
+  const score = typeCompatibility === 'incompatible' ? Math.min(44, uncappedScore) : uncappedScore;
+  return {
+    policyVersion: retrievalMatchPolicyVersion,
+    score,
+    band: matchBand(score),
+    matchedTerms,
+    matchedConceptIds: unique([
+      ...directConcepts.map((concept) => concept.conceptId),
+      ...relatedConcepts.map((concept) => concept.conceptId),
+    ]),
+    reasons: [
+      exactIdentity ? 'Exact canonical identity or label.' : '',
+      termCoverage
+        ? `${Math.round(termCoverage * 100)}% of discriminative query terms matched.`
+        : '',
+      directConcepts.length
+        ? `Directly assigned to ${directConcepts.map((concept) => concept.label).join(', ')}.`
+        : '',
+      relatedConcepts.length
+        ? `${relatedConcepts.length} bounded concept-neighborhood path(s).`
+        : '',
+      requestedClass ? `Matches requested ${document.entityClass} entity class.` : '',
+      typeCompatibility === 'incompatible'
+        ? `Known ${document.entityClass} entity class does not match the requested ${interpretation.requestedEntityClasses.join(', ')} class.`
+        : '',
+      typeCompatibility === 'unknown' && interpretation.requestedEntityClasses.length
+        ? 'The provisional source lead does not expose enough type information to assess entity-class compatibility.'
+        : '',
+    ].filter(Boolean),
+    typeCompatible,
+    typeCompatibility,
+  };
 }
 
 function rankHits(
@@ -448,54 +570,106 @@ export function resolveRetrievalDuplicates(documents: RetrievalDocument[]): {
   documents: RetrievalDocument[];
   resolutions: DuplicateResolution[];
 } {
-  const canonicalByEntity = new Map<string, RetrievalDocument>();
-  const canonicalByIdentity = new Map<string, RetrievalDocument>();
+  const ordered = [...documents].sort((left, right) =>
+    left.candidateKey.localeCompare(right.candidateKey),
+  );
+  const parent = ordered.map((_, index) => index);
+  const find = (index: number): number => {
+    let root = index;
+    while (parent[root] !== root) root = parent[root]!;
+    while (parent[index] !== index) {
+      const next = parent[index]!;
+      parent[index] = root;
+      index = next;
+    }
+    return root;
+  };
+  const unite = (left: number, right: number): void => {
+    const leftRoot = find(left);
+    const rightRoot = find(right);
+    if (leftRoot !== rightRoot) parent[Math.max(leftRoot, rightRoot)] = Math.min(leftRoot, rightRoot);
+  };
+  const entityOwner = new Map<string, number>();
+  const identityOwner = new Map<string, number>();
+  ordered.forEach((document, index) => {
+    const entityKey = `${document.subjectType}:${document.entityId}`;
+    const priorEntity = entityOwner.get(entityKey);
+    if (priorEntity !== undefined) unite(index, priorEntity);
+    else entityOwner.set(entityKey, index);
+    for (const identity of document.strongIdentityKeys) {
+      const identityKey = `${document.subjectType}:${identity
+        .normalize('NFKC')
+        .toLocaleLowerCase('en-US')}`;
+      const priorIdentity = identityOwner.get(identityKey);
+      if (priorIdentity !== undefined) unite(index, priorIdentity);
+      else identityOwner.set(identityKey, index);
+    }
+  });
+  const groups = new Map<number, RetrievalDocument[]>();
+  ordered.forEach((document, index) => {
+    const root = find(index);
+    groups.set(root, [...(groups.get(root) ?? []), document]);
+  });
+  const quality = (document: RetrievalDocument): number =>
+    Number(!['', 'lead', 'other', 'unknown'].includes(document.entityClass)) * 1000 +
+    Number(!['', 'other', 'unknown'].includes(document.kind)) * 500 +
+    Math.min(document.concepts.length, 20) * 20 +
+    Math.min(document.strongIdentityKeys.length, 10) * 10 +
+    Math.min(words(document.searchText).length, 200);
   const kept: RetrievalDocument[] = [];
   const resolutions: DuplicateResolution[] = [];
-  for (const document of [...documents].sort((left, right) =>
-    left.candidateKey.localeCompare(right.candidateKey),
-  )) {
-    const entityKey = `${document.subjectType}:${document.entityId}`;
-    const entityCanonical = canonicalByEntity.get(entityKey);
-    const identityCanonical = document.strongIdentityKeys
-      .map((key) =>
-        canonicalByIdentity.get(
-          `${document.subjectType}:${key.normalize('NFKC').toLocaleLowerCase('en-US')}`,
+  for (const group of groups.values()) {
+    const ranked = [...group].sort(
+      (left, right) =>
+        quality(right) - quality(left) || left.candidateKey.localeCompare(right.candidateKey),
+    );
+    const canonical = ranked[0]!;
+    const aliases = unique(
+      group.flatMap((document) => [
+        ...document.aliases,
+        ...(document.candidateKey === canonical.candidateKey ? [] : [document.name]),
+      ]),
+    ).filter((alias) => alias !== canonical.name);
+    const conceptsById = new Map(
+      group.flatMap((document) => document.concepts.map((concept) => [concept.conceptId, concept])),
+    );
+    kept.push({
+      ...canonical,
+      aliases,
+      searchText: unique(group.map((document) => document.searchText)).join(' '),
+      strongIdentityKeys: unique(group.flatMap((document) => document.strongIdentityKeys)),
+      concepts: [...conceptsById.values()].sort(
+        (left, right) =>
+          left.facetKey.localeCompare(right.facetKey) ||
+          left.stableKey.localeCompare(right.stableKey) ||
+          left.conceptId.localeCompare(right.conceptId),
+      ),
+    });
+    for (const document of group) {
+      const matchedIdentityKeys = document.strongIdentityKeys.filter((identity) =>
+        canonical.strongIdentityKeys.some(
+          (candidateIdentity) =>
+            candidateIdentity.normalize('NFKC').toLocaleLowerCase('en-US') ===
+            identity.normalize('NFKC').toLocaleLowerCase('en-US'),
         ),
-      )
-      .find((candidate): candidate is RetrievalDocument => Boolean(candidate));
-    const canonical = entityCanonical ?? identityCanonical;
-    if (canonical) {
+      );
       resolutions.push({
         candidateKey: document.candidateKey,
         canonicalCandidateKey: canonical.candidateKey,
-        method: entityCanonical ? 'canonical_entity' : 'strong_identity',
-        matchedIdentityKeys: document.strongIdentityKeys.filter((key) =>
-          canonical.strongIdentityKeys.some(
-            (candidateKey) =>
-              candidateKey.normalize('NFKC').toLocaleLowerCase('en-US') ===
-              key.normalize('NFKC').toLocaleLowerCase('en-US'),
-          ),
-        ),
+        method:
+          group.length === 1
+            ? 'distinct'
+            : document.entityId === canonical.entityId
+              ? 'canonical_entity'
+              : 'strong_identity',
+        matchedIdentityKeys,
       });
-      continue;
     }
-    kept.push(document);
-    canonicalByEntity.set(entityKey, document);
-    for (const key of document.strongIdentityKeys) {
-      canonicalByIdentity.set(
-        `${document.subjectType}:${key.normalize('NFKC').toLocaleLowerCase('en-US')}`,
-        document,
-      );
-    }
-    resolutions.push({
-      candidateKey: document.candidateKey,
-      canonicalCandidateKey: document.candidateKey,
-      method: 'distinct',
-      matchedIdentityKeys: [],
-    });
   }
-  return { documents: kept, resolutions };
+  return {
+    documents: kept.sort((left, right) => left.candidateKey.localeCompare(right.candidateKey)),
+    resolutions: resolutions.sort((left, right) => left.candidateKey.localeCompare(right.candidateKey)),
+  };
 }
 
 export function retrieveFirstPass(
@@ -605,101 +779,26 @@ export function structuredRerank(
   interpretation: QueryInterpretation,
 ): RerankedRetrievalCandidate[] {
   const byKey = new Map(documents.map((document) => [document.candidateKey, document]));
-  const queryTerms = searchableQueryTerms(interpretation);
-  const exactEntityIds = new Set(interpretation.exactEntities.map((entity) => entity.entityId));
-  const directConceptIds = new Set(
-    querySubjectConcepts(interpretation).map((concept) => concept.conceptId),
-  );
-  const relatedConceptIds = new Set(
-    querySubjectConcepts(interpretation).flatMap((concept) =>
-      concept.relations.map((relation) => relation.conceptId),
-    ),
-  );
   const maximumFused = Math.max(0, ...fused.map((candidate) => candidate.fusedScore));
   return fused
     .flatMap((candidate) => {
       const document = byKey.get(candidate.candidateKey);
       if (!document || exclusionViolation(document, interpretation)) return [];
-      const termCoverage = queryTerms.length
-        ? candidate.matchedTerms.filter((term) => queryTerms.includes(term)).length /
-          queryTerms.length
-        : 0;
-      const exactIdentity = exactEntityIds.has(document.entityId);
-      const directConcepts = document.concepts.filter((concept) =>
-        directConceptIds.has(concept.conceptId),
-      );
-      const relatedConceptCount = candidate.matchedConceptIds.filter((conceptId) =>
-        relatedConceptIds.has(conceptId),
-      ).length;
-      const indirectConceptCount = candidate.matchedConceptIds.filter(
-        (conceptId) => !directConceptIds.has(conceptId),
-      ).length;
-      const matchedQueryTermCount = new Set(
-        candidate.matchedTerms.filter((term) => queryTerms.includes(term)),
-      ).size;
-      const minimumLexicalMatches = Math.max(1, Math.ceil(queryTerms.length * 0.5));
-      const boundedGapPath = candidate.contributions.some(
-        (contribution) => contribution.retrieverKey === 'concept-gap-v1',
-      );
-      if (
-        !exactIdentity &&
-        !directConcepts.length &&
-        !relatedConceptCount &&
-        !boundedGapPath &&
-        matchedQueryTermCount < minimumLexicalMatches
-      ) {
-        return [];
-      }
-      const requestedClass = interpretation.requestedEntityClasses.some(
-        (entityClass) =>
-          entityClass === document.entityClass ||
-          entityClass === document.kind ||
-          (entityClass === 'implementation' && document.subjectType === 'implementation'),
-      );
-      const typeCompatible = !interpretation.requestedEntityClasses.length || requestedClass;
+      const match = assessRetrievalMatch(document, interpretation);
+      if (!match) return [];
       const fusedBase = maximumFused ? (candidate.fusedScore / maximumFused) * 40 : 0;
-      const matchScore = Math.min(
-        100,
-        Math.round(
-          termCoverage * 45 +
-            Math.min(25, directConcepts.length * 12) +
-            Math.min(18, indirectConceptCount * 6) +
-            Number(exactIdentity) * 25 +
-            Number(requestedClass) * 5 +
-            Math.min(10, candidate.contributions.length * 3),
-        ),
-      );
-      const rerankScore = fusedBase + matchScore - Number(!typeCompatible) * 40;
-      const reasons = [
-        exactIdentity ? 'Exact canonical identity.' : '',
-        termCoverage
-          ? `${Math.round(termCoverage * 100)}% of discriminative query terms matched.`
-          : '',
-        directConcepts.length
-          ? `Directly assigned to ${directConcepts.map((concept) => concept.label).join(', ')}.`
-          : '',
-        indirectConceptCount ? `${indirectConceptCount} bounded concept-neighborhood path(s).` : '',
-        candidate.contributions.length > 1
-          ? `Recovered by ${candidate.contributions.length} independent retriever rankings.`
-          : '',
-        requestedClass ? `Matches requested ${document.entityClass} entity class.` : '',
-      ].filter(Boolean);
+      const rerankScore = fusedBase + match.score;
       return [
         {
           ...candidate,
-          rerankPolicy: 'structured-rerank-v1' as const,
+          rerankPolicy: 'structured-rerank-v2' as const,
           rerankPosition: 0,
           rerankScore: precise(rerankScore),
-          matchScore,
-          matchBand:
-            matchScore >= 70
-              ? ('Direct' as const)
-              : matchScore >= 45
-                ? ('Strong' as const)
-                : matchScore >= 25
-                  ? ('Related' as const)
-                  : ('Peripheral' as const),
-          reasons,
+          matchedTerms: match.matchedTerms,
+          matchedConceptIds: match.matchedConceptIds,
+          matchScore: match.score,
+          matchBand: match.band,
+          reasons: match.reasons,
         },
       ];
     })
@@ -743,4 +842,72 @@ export function diversifyBroadRetrieval(
     ...candidate,
     rerankPosition: index + 1,
   }));
+}
+
+/**
+ * Canonical, side-effect-free retrieval fabric used by Search, connected-source research, and
+ * queried Corpus views. Callers may decide whether first-pass coverage warrants the bounded
+ * second pass, but cannot substitute a different dedupe/retrieve/fuse/rerank method.
+ */
+export function runRetrievalPipeline(
+  inputDocuments: RetrievalDocument[],
+  interpretation: QueryInterpretation,
+  options: {
+    fusionPolicy?: RetrievalFusionPolicy;
+    shouldRunSecondPass?: (
+      firstPassCandidates: RerankedRetrievalCandidate[],
+      resolvedDocuments: RetrievalDocument[],
+    ) => boolean;
+    maximumCandidates?: number;
+  } = {},
+): RetrievalPipelineResult {
+  const fusionPolicy = options.fusionPolicy ?? 'normalized-weighted-fusion-v1';
+  const resolved = resolveRetrievalDuplicates(inputDocuments);
+  const firstPass = retrieveFirstPass(resolved.documents, interpretation);
+  const firstFused = fuseRetrievalRankings(firstPass.rankings, fusionPolicy);
+  const firstReranked = diversifyBroadRetrieval(
+    structuredRerank(firstFused, resolved.documents, interpretation),
+    resolved.documents,
+    interpretation,
+  );
+  const includeSecondPass =
+    options.shouldRunSecondPass?.(firstReranked, resolved.documents) ?? false;
+  const secondPass = includeSecondPass
+    ? retrieveSecondPass(resolved.documents, interpretation, firstPass)
+    : { rankings: [], hits: [] };
+  const rankings = [...firstPass.rankings, ...secondPass.rankings];
+  const reciprocalRankFusion = fuseRetrievalRankings(rankings, 'reciprocal-rank-fusion-v1');
+  const normalizedWeightedFusion = fuseRetrievalRankings(
+    rankings,
+    'normalized-weighted-fusion-v1',
+  );
+  const reciprocalRankReranked = diversifyBroadRetrieval(
+    structuredRerank(reciprocalRankFusion, resolved.documents, interpretation),
+    resolved.documents,
+    interpretation,
+  );
+  const normalizedWeightedReranked = diversifyBroadRetrieval(
+    structuredRerank(normalizedWeightedFusion, resolved.documents, interpretation),
+    resolved.documents,
+    interpretation,
+  );
+  const selected = (
+    fusionPolicy === 'reciprocal-rank-fusion-v1'
+      ? reciprocalRankReranked
+      : normalizedWeightedReranked
+  ).slice(0, options.maximumCandidates ?? 200);
+  return {
+    documents: resolved.documents,
+    duplicateResolutions: resolved.resolutions,
+    firstPass,
+    secondPass,
+    rankings,
+    reciprocalRankFusion,
+    normalizedWeightedFusion,
+    reciprocalRankReranked,
+    normalizedWeightedReranked,
+    selected,
+    fusionPolicy,
+    retrievalPasses: includeSecondPass ? 2 : 1,
+  };
 }
